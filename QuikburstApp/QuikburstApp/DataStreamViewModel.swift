@@ -15,17 +15,17 @@ final class DataStreamViewModel: ObservableObject {
     func start() {
         task?.cancel()
         task = Task {
-            for await sample in await manager.samples() {
+            for await sample in manager.sensorSamplesStream() {
+                if Task.isCancelled { break }
                 append(sample)
             }
         }
-        Task { await manager.start() }
     }
 
     func stop() {
         task?.cancel()
+        // Task cancellation will end the stream consumption; listeners are removed on stream termination.
         task = nil
-        Task { await manager.stop() }
     }
 
     private func append(_ sample: SensorSample) {

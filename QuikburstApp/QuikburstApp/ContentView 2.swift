@@ -3,48 +3,96 @@ import SwiftUI
 struct ContentView: View {
     let manager: BluetoothManager
 
+    @State private var showHelp = false
+    @State private var showAbout = false
+    @State private var showExport = false
+
     var body: some View {
         ZStack {
             LinearGradient(colors: [Color.white, Color.blue.opacity(0.15)], startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea()
 
-            VStack(spacing: 16) {
-                Text("Quikburst")
-                    .font(.system(size: 42, weight: .bold, design: .rounded))
-                    .foregroundStyle(Color.blue)
-                    .padding(.top, 8)
-
-                ZStack {
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(.ultraThinMaterial)
-                    TabView {
-                        NavigationStack {
-                            LiveChartView(manager: manager)
+            VStack(spacing: 0) {
+                // App title header
+                HStack {
+                    Text("Quikburst")
+                        .font(.system(size: 36, weight: .bold, design: .rounded))
+                        .foregroundStyle(Color.blue)
+                    Spacer()
+                    HStack(spacing: 12) {
+                        Button {
+                            showExport = true
+                        } label: {
+                            Image(systemName: "square.and.arrow.up")
+                                .font(.system(size: 18))
                         }
-                        .tabItem {
-                            Label("Live", systemImage: "waveform.path.ecg")
-                        }
+                        .buttonStyle(.borderless)
 
-                        SettingsView()
-                            .tabItem {
-                                Label("Settings", systemImage: "gearshape")
-                            }
-                        
-                        StatisticsView()
-                            .tabItem {
-                                Label("Statistics", systemImage: "chart.bar.xaxis")
-                            }
+                        Button {
+                            showHelp = true
+                        } label: {
+                            Image(systemName: "questionmark.circle")
+                                .font(.system(size: 18))
+                        }
+                        .buttonStyle(.borderless)
+
+                        Button {
+                            showAbout = true
+                        } label: {
+                            Image(systemName: "info.circle")
+                                .font(.system(size: 18))
+                        }
+                        .buttonStyle(.borderless)
                     }
-                    .tabViewStyle(.automatic)
-                    .padding()
-                    .transaction { $0.animation = nil }
                 }
-                .frame(maxWidth: 900, maxHeight: 700)
-                .shadow(color: Color.black.opacity(0.08), radius: 12, x: 0, y: 6)
+                .padding(.horizontal, 20)
+                .padding(.top, 8)
+                .padding(.bottom, 12)
+
+                // Main content area
+                TabView {
+                    NavigationStack {
+                        LiveChartView(manager: manager)
+                    }
+                    .tabItem {
+                        Label("Live", systemImage: "waveform.path.ecg")
+                    }
+
+                    NavigationStack {
+                        ProfilesView()
+                    }
+                    .tabItem {
+                        Label("Profiles", systemImage: "chart.line.uptrend.xyaxis")
+                    }
+                    
+                    NavigationStack {
+                        SettingsView()
+                    }
+                    .tabItem {
+                        Label("Settings", systemImage: "gearshape")
+                    }
+                    
+                    NavigationStack {
+                        StatisticsView()
+                    }
+                    .tabItem {
+                        Label("Statistics", systemImage: "chart.bar.xaxis")
+                    }
+                    
+                    NavigationStack {
+                        BluetoothConsoleView(bluetooth: manager)
+                    }
+                    .tabItem {
+                        Label("Bluetooth", systemImage: "dot.radiowaves.left.and.right")
+                    }
+                }
+                .tabViewStyle(.automatic)
             }
-            .padding()
         }
         .tint(.blue)
+        .sheet(isPresented: $showHelp) { HelpView() }
+        .sheet(isPresented: $showAbout) { AboutView() }
+        .sheet(isPresented: $showExport) { ExportView() }
     }
 }
 

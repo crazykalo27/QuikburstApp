@@ -5,6 +5,7 @@ import Combine
 struct QuikburstAppApp: App {
     @StateObject private var session = AppSession()
     @StateObject private var runStore = RunStore()
+    @StateObject private var profileStore = ProfileStore()
     // Keep a single manager instance for the app lifetime
     let manager = BluetoothManager()
 
@@ -19,6 +20,7 @@ struct QuikburstAppApp: App {
             }
             .environmentObject(session)
             .environmentObject(runStore)
+            .environmentObject(profileStore)
         }
     }
 }
