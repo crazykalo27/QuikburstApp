@@ -12,25 +12,51 @@ struct BluetoothConsoleView: View {
     var body: some View {
         VStack(spacing: 0) {
             // Bluetooth state + scan button
-            HStack(spacing: 12) {
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(stateColor)
-                        .frame(width: 8, height: 8)
-                    Text("Bluetooth: \(stateText)")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+            VStack(spacing: 8) {
+                HStack(spacing: 12) {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(stateColor)
+                            .frame(width: 8, height: 8)
+                        Text("Bluetooth: \(stateText)")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
                 }
-                Spacer()
-                if bluetooth.bluetoothState == .poweredOn {
-                    if bluetooth.isScanning {
-                        Button("Stop Scanning", action: bluetooth.stopScanning)
+                
+                HStack {
+                    if bluetooth.bluetoothState == .poweredOn {
+                        if bluetooth.isScanning {
+                            Button {
+                                bluetooth.stopScanning()
+                            } label: {
+                                Label("Stop Scanning", systemImage: "stop.circle.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
                             .buttonStyle(.bordered)
-                            .controlSize(.small)
-                    } else {
-                        Button("Scan", action: bluetooth.startScanning)
+                            .controlSize(.regular)
+                        } else {
+                            Button {
+                                bluetooth.startScanning()
+                            } label: {
+                                Label("Scan for Devices", systemImage: "magnifyingglass")
+                                    .frame(maxWidth: .infinity)
+                            }
                             .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
+                            .controlSize(.regular)
+                        }
+                    } else {
+                        Button {
+                            // Try to start scanning anyway - might prompt user to enable Bluetooth
+                            bluetooth.startScanning()
+                        } label: {
+                            Label("Enable Bluetooth to Scan", systemImage: "exclamationmark.triangle")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
+                        .disabled(true)
                     }
                 }
             }
@@ -42,16 +68,17 @@ struct BluetoothConsoleView: View {
             if bluetooth.connectedPeripheral == nil {
                 if bluetooth.discoveredPeripherals.isEmpty {
                     VStack(spacing: 12) {
-                        Image(systemName: "dot.radiowaves.left.and.right")
+                        Image(systemName: bluetooth.bluetoothState == .poweredOn ? "dot.radiowaves.left.and.right" : "exclamationmark.triangle")
                             .font(.system(size: 48))
                             .foregroundStyle(.secondary.opacity(0.5))
-                        Text("No devices found")
+                        Text(bluetooth.bluetoothState == .poweredOn ? "No devices found" : "Bluetooth Not Available")
                             .font(.headline)
                             .foregroundStyle(.secondary)
-                        Text("Press 'Scan' to search for Quickburst devices")
+                        Text(bluetooth.bluetoothState == .poweredOn ? "Press 'Scan for Devices' to search for Quickburst devices" : "Please enable Bluetooth in Settings to scan for devices")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
+                            .padding(.horizontal)
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 40)

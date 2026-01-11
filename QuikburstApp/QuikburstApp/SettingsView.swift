@@ -4,7 +4,10 @@ struct SettingsView: View {
     @AppStorage("sampleRateHz") private var sampleRateHz: Double = 25
     @AppStorage("unit") private var unit: String = "units"
     @AppStorage("autoReconnect") private var autoReconnect: Bool = true
+    @AppStorage("darkModeEnabled") private var darkModeEnabled: Bool = false
+    @AppStorage("showGridlines") private var showGridlines: Bool = true
     @EnvironmentObject var profileStore: ProfileStore
+    @Environment(\.dismiss) private var dismiss
     @State private var editingUser: User?
     @State private var showingEditSheet = false
     @State private var showingNewUserSheet = false
@@ -87,10 +90,12 @@ struct SettingsView: View {
 
             Section {
                 TextField("Unit label", text: $unit)
-                Toggle("Dark Mode (Placeholder)", isOn: .constant(false))
-                Toggle("Show Gridlines (Placeholder)", isOn: .constant(true))
+                Toggle("Dark Mode", isOn: $darkModeEnabled)
+                Toggle("Show Gridlines", isOn: $showGridlines)
             } header: {
                 Text("Display")
+            } footer: {
+                Text("Dark mode applies a dark color scheme throughout the app.")
             }
 
             Section {

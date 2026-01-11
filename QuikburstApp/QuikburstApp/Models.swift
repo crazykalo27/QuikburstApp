@@ -1,9 +1,15 @@
 import Foundation
 
-struct SensorSample: Identifiable, Hashable {
-    let id = UUID()
+struct SensorSample: Identifiable, Hashable, Codable {
+    let id: UUID
     let timestamp: Date
     let value: Double
+    
+    init(id: UUID = UUID(), timestamp: Date, value: Double) {
+        self.id = id
+        self.timestamp = timestamp
+        self.value = value
+    }
 }
 struct RunRecord: Identifiable, Hashable, Codable {
     let id: UUID
@@ -124,3 +130,168 @@ struct UserProfile: Codable {
         self.age = age
     }
 }
+
+// MARK: - Drill Models
+
+enum DrillCategory: String, CaseIterable, Codable {
+    case speed = "Speed"
+    case force = "Force"
+}
+
+enum DrillType: String, CaseIterable, Codable {
+    case standard = "Standard"
+    case custom = "Custom"
+}
+
+struct Drill: Identifiable, Codable {
+    let id: UUID
+    var name: String
+    var category: DrillCategory
+    var isResistive: Bool
+    var isAssistive: Bool
+    var type: DrillType?
+    var lengthSeconds: Int
+    var isCustom: Bool
+    var isFavorite: Bool
+    var createdAt: Date
+    var updatedAt: Date
+    var torqueProfileId: UUID? // Reference to TorqueProfile if applicable
+    
+    init(
+        id: UUID = UUID(),
+        name: String,
+        category: DrillCategory,
+        isResistive: Bool = false,
+        isAssistive: Bool = false,
+        type: DrillType? = nil,
+        lengthSeconds: Int,
+        isCustom: Bool = false,
+        isFavorite: Bool = false,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date(),
+        torqueProfileId: UUID? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.category = category
+        self.isResistive = isResistive
+        self.isAssistive = isAssistive
+        self.type = type
+        self.lengthSeconds = lengthSeconds
+        self.isCustom = isCustom
+        self.isFavorite = isFavorite
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.torqueProfileId = torqueProfileId
+    }
+}
+
+// MARK: - Workout Models
+
+struct WorkoutItem: Identifiable, Codable {
+    let id: UUID
+    var drillId: UUID
+    var reps: Int
+    var restSeconds: Int
+    var level: Int?
+    
+    init(
+        id: UUID = UUID(),
+        drillId: UUID,
+        reps: Int = 1,
+        restSeconds: Int = 0,
+        level: Int? = nil
+    ) {
+        self.id = id
+        self.drillId = drillId
+        self.reps = reps
+        self.restSeconds = restSeconds
+        self.level = level
+    }
+}
+
+struct Workout: Identifiable, Codable {
+    let id: UUID
+    var name: String
+    var items: [WorkoutItem]
+    var isCustom: Bool
+    var isFavorite: Bool
+    var createdAt: Date
+    var updatedAt: Date
+    
+    init(
+        id: UUID = UUID(),
+        name: String,
+        items: [WorkoutItem] = [],
+        isCustom: Bool = true,
+        isFavorite: Bool = false,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.name = name
+        self.items = items
+        self.isCustom = isCustom
+        self.isFavorite = isFavorite
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+// MARK: - Session Result Models
+
+enum SessionMode: String, Codable {
+    case drill = "Drill"
+    case workout = "Workout"
+}
+
+struct SessionResult: Identifiable, Codable {
+    let id: UUID
+    var date: Date
+    var mode: SessionMode
+    var drillId: UUID?
+    var workoutId: UUID?
+    var levelUsed: Int?
+    var rawESP32Data: [SensorSample] // Store as array of samples
+    var derivedMetrics: SessionMetrics
+    
+    init(
+        id: UUID = UUID(),
+        date: Date = Date(),
+        mode: SessionMode,
+        drillId: UUID? = nil,
+        workoutId: UUID? = nil,
+        levelUsed: Int? = nil,
+        rawESP32Data: [SensorSample] = [],
+        derivedMetrics: SessionMetrics = SessionMetrics()
+    ) {
+        self.id = id
+        self.date = date
+        self.mode = mode
+        self.drillId = drillId
+        self.workoutId = workoutId
+        self.levelUsed = levelUsed
+        self.rawESP32Data = rawESP32Data
+        self.derivedMetrics = derivedMetrics
+    }
+}
+
+struct SessionMetrics: Codable {
+    var peakForce: Double?
+    var averageForce: Double?
+    var duration: TimeInterval?
+    var totalWork: Double?
+    
+    init(
+        peakForce: Double? = nil,
+        averageForce: Double? = nil,
+        duration: TimeInterval? = nil,
+        totalWork: Double? = nil
+    ) {
+        self.peakForce = peakForce
+        self.averageForce = averageForce
+        self.duration = duration
+        self.totalWork = totalWork
+    }
+}
+

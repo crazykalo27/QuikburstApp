@@ -1,6 +1,149 @@
 # QuikburstApp Changelog
 
-## [Latest] - Encoder + Bluetooth Integration
+## [Latest] - Modern Design System & UX Enhancements (2024 Design Guide Implementation)
+
+### Design System & Visual Polish
+- **Enhanced Theme System**: Upgraded `Theme.swift` with modern 2024 design elements
+  - Added adaptive color system with primary/secondary accents
+  - Implemented gradient support (primaryGradient, backgroundGradient)
+  - Added shadow system for depth and layering
+  - Improved typography with Dynamic Type support
+  - Added animation constants for micro-interactions
+- **Button Hierarchy System**: Created `ButtonStyles.swift` with clear visual hierarchy
+  - PrimaryButtonStyle: High-emphasis filled buttons with gradients
+  - SecondaryButtonStyle: Medium-emphasis outlined buttons
+  - TextButtonStyle: Low-emphasis borderless buttons
+  - IconButtonStyle: Quick-action icon buttons
+  - All buttons include proper touch targets (44pt minimum) and press animations
+- **Micro-interactions & Haptics**: Added `HapticFeedback.swift` utility
+  - Light/medium/heavy impact feedback
+  - Success/warning/error notifications
+  - Selection feedback for UI interactions
+  - Convenience methods for common actions (buttonPress, cardTap, workoutComplete)
+- **Accessibility Improvements**: Created `AccessibilityHelpers.swift`
+  - Accessibility label helpers with proper contrast
+  - Minimum touch target enforcement (44x44pt)
+  - Dynamic Type support with minimum readable sizes
+  - High contrast mode support
+  - AccessibleButton component for consistent accessibility
+
+### Gamification & Engagement
+- **Achievement System**: Created `Gamification.swift` with full achievement tracking
+  - Achievement model with requirements (workouts, drills, streaks, personal bests)
+  - UserStats tracking (total workouts, drills, streaks)
+  - Streak calculation and maintenance
+  - AchievementStore for persistence
+  - Default achievements: First Steps, Getting Started, Dedicated, Week Warrior, On Fire
+- **Celebration Views**: Added delightful celebration animations
+  - AchievementUnlocked celebration with animations
+  - Generic success celebrations
+  - Auto-dismissing with smooth animations
+  - Haptic feedback integration
+- **Streak Indicator Component**: Visual streak display
+  - Current streak with flame icon
+  - Longest streak tracking
+  - Accessible labels for screen readers
+
+### Design Principles Applied
+- **Modern High-End Look**: Clean, minimalist aesthetic with bold typography
+- **Progressive Disclosure**: Foundation laid for progressive disclosure patterns
+- **Accessibility First**: WCAG-compliant components with proper contrast and sizing
+- **Micro-interactions**: Smooth animations and haptic feedback throughout
+- **Button Hierarchy**: Clear visual hierarchy following Material Design and iOS HIG
+
+## [Previous] - Bluetooth Pairing Fix, User Selection, Drill Editing Fixes, Connection Indicator, Default Tab
+
+### Navigation & UX
+- **Default Tab on Login**: Changed default tab to Train tab so users land on the Train screen after signing in
+- **Preferences Navigation**: Preferences button in ProfilesTabView now navigates to SettingsView
+- **Dark Mode Support**: Implemented functional dark mode toggle in Settings that applies system-wide dark color scheme
+
+### Bluetooth & Device Management
+- **Fixed Device Pairing Button**: Device Pairing button in ProfilesTabView now properly navigates to BluetoothConsoleView for scanning and connecting to devices
+- **Bluetooth Functionality Verified**: Scanning, connection, and device management functionality confirmed working
+- **Connection Indicator on Train Screen**: Added visual Bluetooth connection indicator in the Train tab navigation bar showing connection status (connected/disconnected/connecting) with device name when connected
+- **Improved Scan Button Visibility**: Made scan button always visible and more prominent in BluetoothConsoleView with better state handling and messaging for when Bluetooth is unavailable
+
+### User Management
+- **Multiple User Support**: Added user selection dropdown in ProfilesTabView allowing users to switch between multiple user profiles
+- **User Selection UI**: Menu-based user selection with visual indicator for currently selected user
+- **Add User**: Quick access to add new users directly from the Profiles tab
+
+### Workout & Drill Management
+- **Fixed Drill Editing in Workouts**: WorkoutItemEditorRow now observes DrillStore to automatically update when drills are edited, ensuring drill changes persist in workouts
+- **Missing Drill Handling**: Added graceful handling for missing drills in workouts (shows placeholder instead of disappearing)
+- **Drill Reference Persistence**: Ensured workout items maintain drill references even when drills are edited
+- **Fixed Button Overlap**: Added proper spacing between edit and delete buttons in workout drill items to prevent overlap
+- **Rest Periods Between Drills**: Added ability to insert rest periods as separate items between drills in workouts, with dedicated UI for adding and editing rest periods
+
+## [Previous] - Major UI Overhaul: Custom Tab Bar, Drill/Workout System, Train State Machine
+
+### Architecture & Design System
+- **Created `Theme.swift`**: Centralized design system with primary colors (Orange #FEA705, Deep Blue #041E34), typography tokens, and spacing constants
+- **Custom Expanding Tab Bar**: Replaced default TabView with custom animated tab bar featuring 4 tabs (Drill, Train, Progress, Profiles) with expanding selected state
+
+### Data Models & Stores
+- **New Models** (`Models.swift`):
+  - `Drill`: Core drill model with category (speed/force), resistive/assistive flags, length, torque profile reference
+  - `Workout`: Collection of workout items with ordering
+  - `WorkoutItem`: Links drills to workouts with reps, rest time, and optional level
+  - `SessionResult`: Stores completed session data with ESP32 samples and derived metrics
+  - `SessionMetrics`: Lightweight computed results (peak force, average force, duration)
+- **New Stores**:
+  - `DrillStore`: Manages drill persistence with seed data ("20 Yard Dash" built-in drill)
+  - `WorkoutStore`: Manages workout persistence
+  - `SessionResultStore`: Manages session history persistence
+
+### Drill Tab (Catalog & Editor)
+- **DrillTabView**: Main catalog interface with segmented control (Drills/Workouts)
+- **Search & Filters**: Text search with filter sheet (placeholder for advanced filtering)
+- **Drill Catalog**: List view showing name, category badge, favorite/custom indicators, length
+- **Workout Catalog**: List view showing name, item count, custom/favorite indicators
+- **Drill Detail View**: Shows drill properties with "Start in Train" and "Edit" actions
+- **Workout Detail View**: Shows workout items with drill details, reps, rest times
+- **Drill Editor**: Multi-step form with name, category, length, resistive/assistive toggles, torque curve selection
+- **Torque Curve Integration**: Links to torque profile editor (reuses existing ProfileEditorView pattern)
+- **Workout Builder**: Create/edit workouts with drill picker, reorderable items, reps/rest/level configuration
+
+### Train Tab (State Machine)
+- **TrainTabView**: Complete state machine implementation with 10 states:
+  - `idle` → `selectingMode` → `selectingItem` → `selectingLevel` (drills only) → `readyHold` → `countdown` → `measuring` → `resting` (workouts) → `results` / `aborted`
+- **Mode Selection**: Choose Single Drill or Workout
+- **Item Selection**: Pick drill or workout from catalog
+- **Level Selection**: 1-5 level picker for drills (segmented control)
+- **Hold-to-Start**: 3-second press-and-hold with progress ring and haptic feedback
+- **Countdown**: 5-4-3-2-1 countdown with audio beeps (placeholder for audio implementation)
+- **Measuring Screen**: Live chart display using ESP32 data stream, duration timer, large RED ABORT button
+- **Workout Execution**: Drill-by-drill with automatic rest timers, skip rest option, auto-progression
+- **Results Screen**: Shows session metrics (peak force, average force, duration), "Done" and "Start Again" options
+- **Abort Handling**: Graceful abort with return to Train root
+
+### Progress Tab
+- **ProgressTabView**: History and trend visualization
+- **Filters**: By type (All/Drills/Workouts), by drill/workout, by date range (All/Week/Month/Year)
+- **Charts**: Line charts showing peak force trends over time (using Swift Charts)
+- **History List**: Grouped by date with drill/workout name, time, level, peak force metrics
+- **Empty State**: Helpful message when no progress data exists
+
+### Profiles Tab
+- **ProfilesTabView**: Simplified placeholder with user profile card
+- Shows selected user name, height, weight, age
+- "Edit Profile" button linking to existing UserEditView
+- Future hooks: Device pairing, preferences (placeholder rows)
+
+### Integration
+- **ESP32 Data Stream**: Wrapped in protocol interface - Train tab subscribes to live samples via DataStreamViewModel
+- **BluetoothManager**: Existing implementation preserved, used by Train tab for START/STOP commands
+- **MainContentView**: New root view using custom tab bar container
+- **Navigation**: NavigationStack within each tab root for drill/workout detail flows
+
+### Technical Notes
+- All stores use UserDefaults for persistence (can be swapped for Core Data/Realm later)
+- State machines are deterministic and testable
+- UI components are modular and reusable
+- Design system ensures consistent theming throughout app
+
+## [Previous] - Encoder + Bluetooth Integration
 
 ### Arduino Changes
 - **Created `bluetooth_encoder.ino`**: Combined encoder reading and BLE communication
