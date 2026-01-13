@@ -24,45 +24,62 @@ struct DrillEditorView: View {
         self.editingDrill = editingDrill
     }
     
+    @State private var showingAdvanced = false
+    @State private var showingTorqueCurveEditor = false
+    
     var body: some View {
         NavigationStack {
             Form {
-                Section("Basic Information") {
+                // Basics section (always visible)
+                Section("Basics") {
                     TextField("Drill Name", text: $name)
+                        .accessibilityLabel("Drill name")
                     
                     Picker("Category", selection: $category) {
                         ForEach(DrillCategory.allCases, id: \.self) { cat in
                             Text(cat.rawValue).tag(cat)
                         }
                     }
+                    .accessibilityLabel("Category")
                     
                     Stepper("Length: \(lengthSeconds) seconds", value: $lengthSeconds, in: 1...60)
+                        .accessibilityLabel("Length")
+                        .accessibilityValue("\(lengthSeconds) seconds")
                 }
                 
-                Section("Properties") {
-                    Toggle("Resistive", isOn: $isResistive)
-                    Toggle("Assistive", isOn: $isAssistive)
-                }
-                
-                Section("Torque Curve") {
-                    NavigationLink {
-                        TorqueCurveSelectionView(
-                            selectedProfileId: $selectedTorqueProfileId,
-                            profileStore: profileStore
-                        )
-                    } label: {
-                        HStack {
-                            Text("Torque Curve")
-                            Spacer()
-                            if let profileId = selectedTorqueProfileId,
-                               let profile = profileStore.profiles.first(where: { $0.id == profileId }) {
-                                Text(profile.name)
-                                    .foregroundColor(.secondary)
-                            } else {
-                                Text("None")
+                // Advanced section (collapsible)
+                Section {
+                    DisclosureGroup(isExpanded: $showingAdvanced) {
+                        Toggle("Resistive", isOn: $isResistive)
+                            .accessibilityLabel("Resistive")
+                        
+                        Toggle("Assistive", isOn: $isAssistive)
+                            .accessibilityLabel("Assistive")
+                        
+                        Button {
+                            showingTorqueCurveEditor = true
+                        } label: {
+                            HStack {
+                                Text("Torque Curve")
+                                Spacer()
+                                if let profileId = selectedTorqueProfileId,
+                                   let profile = profileStore.profiles.first(where: { $0.id == profileId }) {
+                                    Text(profile.name)
+                                        .foregroundColor(.secondary)
+                                } else {
+                                    Text("None")
+                                        .foregroundColor(.secondary)
+                                }
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 12))
                                     .foregroundColor(.secondary)
                             }
                         }
+                        .accessibilityLabel("Torque Curve")
+                        .accessibilityHint("Opens torque curve editor")
+                    } label: {
+                        Text("Advanced")
+                            .font(.headline)
                     }
                 }
             }
@@ -85,6 +102,12 @@ struct DrillEditorView: View {
                 if let drill = editingDrill {
                     loadDrill(drill)
                 }
+            }
+            .sheet(isPresented: $showingTorqueCurveEditor) {
+                TorqueCurveSelectionView(
+                    selectedProfileId: $selectedTorqueProfileId,
+                    profileStore: profileStore
+                )
             }
         }
     }
@@ -221,6 +244,7 @@ struct TorqueCurveEditorView: View {
     
     @State private var draggedPoint: Int? = nil
     @State private var selectedPointIndex: Int? = nil
+    @State private var showingAccessibilityEditor = false
     private let maxTorque: Double = 100
     
     var body: some View {
@@ -358,6 +382,35 @@ struct TorqueCurveEditorView: View {
                         }
                     }
                     .padding(.top, Theme.Spacing.md)
+                    
+                    // Accessibility-friendly editor option
+                    VStack(spacing: Theme.Spacing.md) {
+                        Button {
+                            showingAccessibilityEditor.toggle()
+                        } label: {
+                            HStack {
+                                Image(systemName: "slider.horizontal.3")
+                                Text("Accessibility-friendly edit")
+                                Spacer()
+                                Image(systemName: showingAccessibilityEditor ? "chevron.up" : "chevron.down")
+                            }
+                            .font(.system(size: 16, weight: .medium, design: .rounded))
+                            .foregroundColor(Theme.orange)
+                            .padding(Theme.Spacing.md)
+                            .background(Theme.orange.opacity(0.1))
+                            .cornerRadius(Theme.CornerRadius.small)
+                        }
+                        .accessibilityLabel("Accessibility-friendly edit")
+                        .accessibilityHint("Opens numeric editor for all torque points")
+                        
+                        if showingAccessibilityEditor {
+                            AccessibilityTorqueEditor(
+                                profile: $profile,
+                                maxTorque: maxTorque
+                            )
+                        }
+                    }
+                    .padding(.horizontal, Theme.Spacing.lg)
                 }
                 .padding(.vertical, Theme.Spacing.lg)
             }
@@ -387,6 +440,51 @@ struct TorqueCurveEditorView: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Accessibility-Friendly Torque Editor
+
+struct AccessibilityTorqueEditor: View {
+    @Binding var profile: TorqueProfile
+    let maxTorque: Double
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.md) {
+            Text("Edit torque values (0-\(Int(maxTorque)))")
+                .font(.system(size: 14, weight: .semibold, design: .rounded))
+                .foregroundColor(.primary)
+            
+            ForEach(0..<11, id: \.self) { index in
+                HStack(spacing: Theme.Spacing.md) {
+                    Text("\(index)s")
+                        .font(.system(size: 14, weight: .medium, design: .rounded))
+                        .foregroundColor(.secondary)
+                        .frame(width: 32, alignment: .leading)
+                        .accessibilityLabel("Time \(index) seconds")
+                    
+                    Slider(
+                        value: Binding(
+                            get: { profile.torquePoints[index] },
+                            set: { profile.torquePoints[index] = $0 }
+                        ),
+                        in: 0...maxTorque
+                    )
+                    .accessibilityLabel("Torque at \(index) seconds")
+                    .accessibilityValue("\(Int(profile.torquePoints[index]))")
+                    
+                    Text("\(Int(profile.torquePoints[index]))")
+                        .font(.system(size: 14, weight: .semibold, design: .rounded))
+                        .foregroundColor(.primary)
+                        .frame(width: 40, alignment: .trailing)
+                        .accessibilityHidden(true)
+                }
+                .padding(.vertical, Theme.Spacing.xs)
+            }
+        }
+        .padding(Theme.Spacing.md)
+        .background(Color(.systemGray6))
+        .cornerRadius(Theme.CornerRadius.medium)
     }
 }
 

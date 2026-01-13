@@ -123,7 +123,7 @@ struct ProfilesTabView: View {
                     }
                 }
             }
-            .navigationTitle("Profiles")
+            .drukNavigationTitle("Profiles")
             .sheet(isPresented: $showingUserEdit) {
                 if let user = profileStore.selectedUser {
                     UserEditView(
@@ -149,7 +149,6 @@ struct ProfilesTabView: View {
             .sheet(isPresented: $showingPreferences) {
                 NavigationStack {
                     SettingsView()
-                        .environmentObject(profileStore)
                 }
             }
             .sheet(isPresented: $showingNewUserSheet) {

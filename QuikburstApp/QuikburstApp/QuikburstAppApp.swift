@@ -6,6 +6,7 @@ struct QuikburstAppApp: App {
     @StateObject private var session = AppSession()
     @StateObject private var runStore = RunStore()
     @StateObject private var profileStore = ProfileStore()
+    @StateObject private var navigationCoordinator = AppNavigationCoordinator()
     @AppStorage("darkModeEnabled") private var darkModeEnabled: Bool = false
     // Keep a single manager instance for the app lifetime
     let manager = BluetoothManager()
@@ -18,6 +19,7 @@ struct QuikburstAppApp: App {
                         .environmentObject(session)
                         .environmentObject(runStore)
                         .environmentObject(profileStore)
+                        .environmentObject(navigationCoordinator)
                 } else {
                     LoginView()
                         .environmentObject(session)

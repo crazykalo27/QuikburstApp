@@ -1,5 +1,64 @@
 # QuikburstApp Changelog
 
+## [Latest] - Live Variation Bounds Enforcement
+
+### Training View Improvements
+- **Robust Live Variation Bounds**: Live variation selector slider now properly enforces bounds set during drill creation
+  - Bounds are validated during initialization (min <= max)
+  - Slider values are clamped to bounds using a clamped binding
+  - Default values (midpoint) calculated from validated bounds
+  - Works for both constant force (N) and percentile (%) force types
+
+## [Previous] - Multi-Phase Drill Support
+
+### Drill Creation Flow
+- **Refactored Drill Creation Wizard**: Two-step process
+  - Step 1: Basics (name, description, video attachment)
+  - Step 2: Phase configuration (minimum 1 phase, can add unlimited phases)
+- **Phase Configuration**: Each phase can be independently configured with:
+  - Drill type (Force or Speed)
+  - Motor behavior (Resist/Assist toggles)
+  - Target (time for force drills, distance for speed drills)
+  - Force type (Constant or Percentile)
+  - Torque curve settings
+- **Multi-Phase Support**: Users can create drills with multiple sequential phases
+  - Each phase can have different drill type, motor behavior, and targets
+  - Example: 10-second force drill followed by 40-meter speed drill
+  - Phases execute sequentially during drill runs
+
+### Data Model Updates
+- **Added `DrillPhase` Structure**: New model for phase configuration
+  - Contains all phase-specific settings (type, resist/assist, distance/time, force settings)
+  - Each phase has unique ID for tracking
+- **Updated `DrillTemplate`**: Now supports both legacy single-phase and new multi-phase formats
+  - `phases` array for multi-phase drills
+  - Legacy fields maintained for backward compatibility
+  - `effectivePhases` computed property handles both formats seamlessly
+
+### Drill Execution
+- **Multi-Phase Execution**: MeasuringView now handles phase transitions
+  - Tracks current phase index
+  - Automatically transitions to next phase when current phase completes
+  - Shows phase progress (e.g., "Phase 1 of 3")
+  - Displays phase-specific targets and timers
+  - Collects samples from all phases for complete drill results
+- **Phase Completion Logic**: Each phase completes based on its own criteria
+  - Speed drills: Complete when target distance reached or 5 seconds without data
+  - Force drills: Complete when target time reached
+  - Seamless transition between phases with no user intervention required
+
+### Backward Compatibility
+- **Legacy Drill Support**: Existing single-phase drills continue to work
+  - Automatically converted to single-phase format using `effectivePhases`
+  - No migration required for existing drills
+  - All existing functionality preserved
+
+## [Previous] - Progress Tracking Overhaul
+- Consolidated drill/workout data stores as shared environment objects so Train, Progress, and Drill tabs stay in sync.
+- Session history now records every drill completion (including drills inside workouts) with workout grouping and name snapshots.
+- Progress history UI rebuilt with drill rows and grouped workout entries; drill details open the analysis sheet with recorded samples.
+- Workout runs add per-drill session results while still saving drill runs for drill-level progress views.
+
 ## [Latest] - Modern Design System & UX Enhancements (2024 Design Guide Implementation)
 
 ### Design System & Visual Polish

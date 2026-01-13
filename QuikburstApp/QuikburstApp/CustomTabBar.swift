@@ -63,8 +63,9 @@ struct TabButton: View {
                     .foregroundColor(isSelected ? Theme.orange : Color.white.opacity(0.55))
                     .scaleEffect(isSelected ? 1.05 : 1.0)
                 
-                Text(tab.rawValue)
-                    .font(.system(size: isSelected ? 11 : 10, weight: isSelected ? .semibold : .regular, design: .rounded))
+                Text(tab.rawValue.uppercased())
+                    .font(Theme.Typography.exo2Caption)
+                    .fontWeight(isSelected ? .semibold : .regular)
                     .foregroundColor(isSelected ? Theme.orange : Color.white.opacity(0.55))
             }
             .frame(maxWidth: .infinity)
@@ -87,6 +88,7 @@ struct TabButton: View {
 
 struct TabBarContainer<Content: View>: View {
     @Binding var selectedTab: Tab
+    @EnvironmentObject var navigationCoordinator: AppNavigationCoordinator
     let content: Content
     
     init(selectedTab: Binding<Tab>, @ViewBuilder content: () -> Content) {
@@ -99,7 +101,9 @@ struct TabBarContainer<Content: View>: View {
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             
-            CustomTabBar(selectedTab: $selectedTab)
+            if !navigationCoordinator.isSessionActive {
+                CustomTabBar(selectedTab: $selectedTab)
+            }
         }
         .ignoresSafeArea(.keyboard, edges: .bottom)
     }

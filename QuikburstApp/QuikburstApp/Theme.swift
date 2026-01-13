@@ -55,20 +55,89 @@ struct Theme {
         )
     }
     
-    // MARK: - Typography (Supporting Dynamic Type)
+    // MARK: - Typography
+    // Druk: Energy amplifier for impactful moments (drill names, workout titles, hero headlines, section breaks)
+    // Exo 2: Control layer for clarity and precision (metrics, numbers, labels, navigation, body text)
+    
     struct Typography {
-        // Use system fonts with dynamic type support
-        static let largeTitle = Font.system(.largeTitle, design: .rounded).weight(.bold)
-        static let title = Font.system(.title, design: .rounded).weight(.bold)
-        static let title2 = Font.system(.title2, design: .rounded).weight(.semibold)
-        static let title3 = Font.system(.title3, design: .rounded).weight(.semibold)
-        static let headline = Font.system(.headline, design: .rounded)
-        static let body = Font.system(.body, design: .rounded)
-        static let callout = Font.system(.callout, design: .rounded)
-        static let subheadline = Font.system(.subheadline, design: .rounded)
-        static let footnote = Font.system(.footnote, design: .rounded)
-        static let caption = Font.system(.caption, design: .rounded)
-        static let caption2 = Font.system(.caption2, design: .rounded)
+        // MARK: - Druk (Impact & Motivation)
+        // Use for: Drill names, workout titles, hero headlines, major section breaks
+        // Rules: ALL CAPS, short phrases, large sizes
+        
+        static func druk(size: CGFloat, weight: Font.Weight = .bold) -> Font {
+            // Use Druk font, fallback to system bold rounded if font not available
+            Font.custom("Druk-Bold", size: size)
+        }
+        
+        static let drukHero = druk(size: 42, weight: .bold) // Hero headlines
+        static let drukTitle = druk(size: 32, weight: .bold) // Major titles
+        static let drukSection = druk(size: 24, weight: .bold) // Section breaks
+        static let drukDrillName = druk(size: 22, weight: .bold) // Drill names
+        static let drukWorkoutTitle = druk(size: 20, weight: .bold) // Workout titles
+        
+        // MARK: - Exo 2 (Clarity & Precision)
+        // Use for: Metrics, numbers, labels, navigation, body text, readable content
+        
+        static func exo2(size: CGFloat, weight: Font.Weight = .regular) -> Font {
+            // Use Exo 2 font with appropriate weight variant
+            let fontName: String
+            switch weight {
+            case .bold:
+                fontName = "Exo2-Bold"
+            case .semibold:
+                fontName = "Exo2-SemiBold"
+            case .medium:
+                fontName = "Exo2-Medium"
+            default:
+                fontName = "Exo2-Regular"
+            }
+            return Font.custom(fontName, size: size)
+        }
+        
+        static func exo2Bold(size: CGFloat) -> Font {
+            exo2(size: size, weight: .bold)
+        }
+        
+        static func exo2SemiBold(size: CGFloat) -> Font {
+            exo2(size: size, weight: .semibold)
+        }
+        
+        static func exo2Medium(size: CGFloat) -> Font {
+            exo2(size: size, weight: .medium)
+        }
+        
+        // Exo 2 sizes for different contexts
+        static let exo2LargeTitle = exo2(size: 34, weight: .bold)
+        static let exo2Title = exo2(size: 28, weight: .bold)
+        static let exo2Title2 = exo2SemiBold(size: 22)
+        static let exo2Title3 = exo2SemiBold(size: 20)
+        static let exo2Headline = exo2SemiBold(size: 17)
+        static let exo2Body = exo2(size: 17)
+        static let exo2Callout = exo2(size: 16)
+        static let exo2Subheadline = exo2(size: 15)
+        static let exo2Footnote = exo2(size: 13)
+        static let exo2Caption = exo2(size: 12)
+        static let exo2Caption2 = exo2(size: 11)
+        
+        // Exo 2 for metrics and numbers
+        static let exo2Metric = exo2Bold(size: 32) // Large numbers/metrics
+        static let exo2MetricMedium = exo2Bold(size: 24) // Medium numbers
+        static let exo2MetricSmall = exo2Bold(size: 18) // Small numbers
+        static let exo2Label = exo2Medium(size: 13) // Labels
+        static let exo2Nav = exo2Medium(size: 15) // Navigation
+        
+        // Legacy support (mapped to Exo 2)
+        static let largeTitle = exo2LargeTitle
+        static let title = exo2Title
+        static let title2 = exo2Title2
+        static let title3 = exo2Title3
+        static let headline = exo2Headline
+        static let body = exo2Body
+        static let callout = exo2Callout
+        static let subheadline = exo2Subheadline
+        static let footnote = exo2Footnote
+        static let caption = exo2Caption
+        static let caption2 = exo2Caption2
         
         // Minimum readable sizes (accessibility)
         static let minimumBody: CGFloat = 14
@@ -119,6 +188,21 @@ struct Theme {
     struct TouchTarget {
         static let minimum: CGFloat = 44 // iOS HIG minimum
         static let recommended: CGFloat = 48 // Android Material Design
+    }
+}
+
+// MARK: - View Extensions for Navigation Titles
+extension View {
+    func drukNavigationTitle(_ title: String) -> some View {
+        self.navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    Text(title.uppercased())
+                        .font(Theme.Typography.drukSection)
+                        .foregroundColor(.primary)
+                }
+            }
     }
 }
 

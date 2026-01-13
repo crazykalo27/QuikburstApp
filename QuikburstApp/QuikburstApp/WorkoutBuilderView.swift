@@ -2,7 +2,7 @@ import SwiftUI
 
 struct WorkoutBuilderView: View {
     @ObservedObject var workoutStore: WorkoutStore
-    @ObservedObject var drillStore: DrillStore
+    @ObservedObject var templateStore: DrillTemplateStore
     @Environment(\.dismiss) private var dismiss
     
     var editingWorkout: Workout?
@@ -15,9 +15,9 @@ struct WorkoutBuilderView: View {
         editingWorkout == nil
     }
     
-    init(workoutStore: WorkoutStore, drillStore: DrillStore, editingWorkout: Workout? = nil) {
+    init(workoutStore: WorkoutStore, templateStore: DrillTemplateStore, editingWorkout: Workout? = nil) {
         self.workoutStore = workoutStore
-        self.drillStore = drillStore
+        self.templateStore = templateStore
         self.editingWorkout = editingWorkout
     }
     
@@ -42,10 +42,11 @@ struct WorkoutBuilderView: View {
                                     items.removeAll { $0.id == item.id }
                                 }
                             )
-                        } else if drillStore.getDrill(id: item.drillId) != nil {
+                        } else if let template = templateStore.getTemplate(id: item.drillId) {
                             WorkoutItemEditorRow(
                                 item: item,
-                                drillStore: drillStore,
+                                template: template,
+                                templateStore: templateStore,
                                 onUpdate: { updatedItem in
                                     if let index = items.firstIndex(where: { $0.id == updatedItem.id }) {
                                         items[index] = updatedItem
@@ -81,13 +82,16 @@ struct WorkoutBuilderView: View {
                         items.move(fromOffsets: from, toOffset: to)
                     }
                     
-                    VStack(spacing: Theme.Spacing.sm) {
+                    HStack(spacing: Theme.Spacing.sm) {
                         Button {
                             showingDrillPicker = true
                         } label: {
                             Label("Add Drill", systemImage: "plus.circle")
                                 .frame(maxWidth: .infinity)
+                                .padding(.vertical, Theme.Spacing.sm)
                         }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
                         
                         Button {
                             // Insert a rest period item using a special UUID
@@ -102,8 +106,12 @@ struct WorkoutBuilderView: View {
                         } label: {
                             Label("Add Rest", systemImage: "timer")
                                 .frame(maxWidth: .infinity)
+                                .padding(.vertical, Theme.Spacing.sm)
                         }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
                     }
+                    .padding(.vertical, Theme.Spacing.xs)
                 } header: {
                     Text("Drills")
                 } footer: {
@@ -128,9 +136,9 @@ struct WorkoutBuilderView: View {
                 }
             }
             .sheet(isPresented: $showingDrillPicker) {
-                DrillPickerView(drillStore: drillStore) { drill in
+                DrillTemplatePickerView(templateStore: templateStore) { template in
                     let newItem = WorkoutItem(
-                        drillId: drill.id,
+                        drillId: template.id,
                         reps: 1,
                         restSeconds: 0
                     )
@@ -171,13 +179,14 @@ struct WorkoutBuilderView: View {
     private func isRestPeriod(item: WorkoutItem) -> Bool {
         // Check if this is a rest period (special UUID or reps == 0 with no drill)
         let restUUID = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
-        return item.drillId == restUUID || (item.reps == 0 && drillStore.getDrill(id: item.drillId) == nil)
+        return item.drillId == restUUID || (item.reps == 0 && templateStore.getTemplate(id: item.drillId) == nil)
     }
 }
 
 struct WorkoutItemEditorRow: View {
     let item: WorkoutItem
-    @ObservedObject var drillStore: DrillStore
+    let template: DrillTemplate
+    @ObservedObject var templateStore: DrillTemplateStore
     let onUpdate: (WorkoutItem) -> Void
     let onDelete: () -> Void
     
@@ -186,13 +195,10 @@ struct WorkoutItemEditorRow: View {
     @State private var level: Int?
     @State private var showingEditor = false
     
-    private var drill: Drill? {
-        drillStore.getDrill(id: item.drillId)
-    }
-    
-    init(item: WorkoutItem, drillStore: DrillStore, onUpdate: @escaping (WorkoutItem) -> Void, onDelete: @escaping () -> Void) {
+    init(item: WorkoutItem, template: DrillTemplate, templateStore: DrillTemplateStore, onUpdate: @escaping (WorkoutItem) -> Void, onDelete: @escaping () -> Void) {
         self.item = item
-        self.drillStore = drillStore
+        self.template = template
+        self.templateStore = templateStore
         self.onUpdate = onUpdate
         self.onDelete = onDelete
         _reps = State(initialValue: item.reps)
@@ -203,9 +209,15 @@ struct WorkoutItemEditorRow: View {
     var body: some View {
         HStack(spacing: Theme.Spacing.sm) {
             VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
-                Text(drill?.name ?? "Drill not found")
-                    .font(.subheadline)
-                    .fontWeight(.medium)
+                HStack {
+                    Text(template.name)
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                    
+                    if template.probationStatus == .probationary {
+                        ProbationStatusPill(status: .probationary)
+                    }
+                }
                 
                 HStack(spacing: Theme.Spacing.md) {
                     Text("\(reps) rep\(reps == 1 ? "" : "s")")
@@ -410,17 +422,19 @@ struct RestPeriodEditorSheet: View {
     }
 }
 
-struct DrillPickerView: View {
-    @ObservedObject var drillStore: DrillStore
-    let onSelect: (Drill) -> Void
+struct DrillTemplatePickerView: View {
+    @ObservedObject var templateStore: DrillTemplateStore
+    let onSelect: (DrillTemplate) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var searchText = ""
+    @State private var selectedTemplate: DrillTemplate?
     
-    private var filteredDrills: [Drill] {
+    private var filteredTemplates: [DrillTemplate] {
+        let templates = templateStore.fetchTemplates()
         if searchText.isEmpty {
-            return drillStore.drills.sorted { $0.name < $1.name }
+            return templates.sorted { $0.name < $1.name }
         } else {
-            return drillStore.drills
+            return templates
                 .filter { $0.name.localizedCaseInsensitiveContains(searchText) }
                 .sorted { $0.name < $1.name }
         }
@@ -429,25 +443,39 @@ struct DrillPickerView: View {
     var body: some View {
         NavigationStack {
             List {
-                ForEach(filteredDrills) { drill in
+                ForEach(filteredTemplates) { template in
                     Button {
-                        onSelect(drill)
-                        dismiss()
+                        if template.probationStatus == .baselineCaptured {
+                            onSelect(template)
+                            dismiss()
+                        } else {
+                            selectedTemplate = template
+                        }
                     } label: {
                         HStack {
                             VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
-                                Text(drill.name)
-                                    .foregroundColor(.primary)
+                                Text(template.name)
+                                    .foregroundColor(template.probationStatus == .baselineCaptured ? .primary : .secondary)
+                                
                                 HStack {
-                                    CategoryBadge(category: drill.category)
-                                    Text("\(drill.lengthSeconds)s")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
+                                    ProbationStatusPill(status: template.probationStatus)
+                                    
+                                    if let distance = template.distanceMeters {
+                                        Text(String(format: "%.1fm", distance))
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
                                 }
                             }
                             Spacer()
+                            
+                            if template.probationStatus == .probationary {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.orange)
+                            }
                         }
                     }
+                    .disabled(template.probationStatus == .probationary)
                 }
             }
             .searchable(text: $searchText)
@@ -458,6 +486,22 @@ struct DrillPickerView: View {
                     Button("Cancel") {
                         dismiss()
                     }
+                }
+            }
+            .alert("Drill Needs Baseline", isPresented: Binding(
+                get: { selectedTemplate != nil },
+                set: { if !$0 { selectedTemplate = nil } }
+            )) {
+                Button("Run Baseline") {
+                    // TODO: Navigate to drill detail to run baseline
+                    selectedTemplate = nil
+                }
+                Button("Cancel", role: .cancel) {
+                    selectedTemplate = nil
+                }
+            } message: {
+                if let template = selectedTemplate {
+                    Text("\(template.name) needs a baseline run before it can be added to workouts. Run it once without motor enforcement first.")
                 }
             }
         }

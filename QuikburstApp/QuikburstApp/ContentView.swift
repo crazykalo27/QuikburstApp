@@ -1,7 +1,12 @@
 import SwiftUI
 
-// This file intentionally contains only a preview to avoid duplicating the
-// ContentView type, which is defined in "ContentView 2.swift".
+struct ContentView: View {
+    let manager: BluetoothManager
+
+    var body: some View {
+        MainContentView(bluetoothManager: manager)
+    }
+}
 
 #Preview {
     ContentView(manager: BluetoothManager())

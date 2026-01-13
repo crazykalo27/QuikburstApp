@@ -11,9 +11,28 @@ final class DrillStore: ObservableObject {
     
     init() {
         load()
-        if drills.isEmpty {
-            seedInitialData()
+        seedInitialDataIfNeeded()
+    }
+    
+    private func seedInitialDataIfNeeded() {
+        // Check if "20 Yard Dash" already exists
+        if drills.contains(where: { $0.name == "20 Yard Dash" }) {
+            return
         }
+        
+        // Create the default drill
+        let defaultDrill = Drill(
+            name: "20 Yard Dash",
+            category: .speed,
+            isResistive: false,
+            isAssistive: false,
+            type: .speedDrill,
+            lengthSeconds: 8,
+            isCustom: false,
+            isFavorite: false
+        )
+        
+        drills.append(defaultDrill)
     }
     
     func addDrill(_ drill: Drill) {
@@ -40,18 +59,6 @@ final class DrillStore: ObservableObject {
     
     func getDrill(id: UUID) -> Drill? {
         drills.first { $0.id == id }
-    }
-    
-    private func seedInitialData() {
-        let defaultDrill = Drill(
-            name: "20 Yard Dash",
-            category: .speed,
-            lengthSeconds: 8,
-            isCustom: false,
-            isFavorite: false
-        )
-        drills.append(defaultDrill)
-        save()
     }
     
     private func save() {

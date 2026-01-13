@@ -2,63 +2,21 @@ import SwiftUI
 import Charts
 
 struct ProgressTabView: View {
-    @StateObject private var sessionResultStore = SessionResultStore()
-    @StateObject private var drillStore = DrillStore()
-    @StateObject private var workoutStore = WorkoutStore()
+    @EnvironmentObject var sessionResultStore: SessionResultStore
+    @EnvironmentObject var templateStore: DrillTemplateStore
+    @EnvironmentObject var runStore: DrillRunStore
+    @EnvironmentObject var workoutStore: WorkoutStore
     @EnvironmentObject var profileStore: ProfileStore
     
-    @State private var selectedFilter: FilterType = .all
-    @State private var selectedDrillId: UUID?
-    @State private var selectedWorkoutId: UUID?
-    @State private var dateRange: DateRange = .all
+    @State private var selectedSection: ProgressSection = .history
+    @State private var selectedTemplate: DrillTemplate?
+    @State private var selectedWorkout: Workout?
     @State private var selectedResult: SessionResult?
     
-    enum FilterType {
-        case all
-        case drill
-        case workout
-    }
-    
-    enum DateRange {
-        case all
-        case week
-        case month
-        case year
-    }
-    
-    private var filteredResults: [SessionResult] {
-        var results = sessionResultStore.getAllResults()
-        
-        switch selectedFilter {
-        case .all:
-            break
-        case .drill:
-            results = results.filter { $0.mode == .drill }
-            if let drillId = selectedDrillId {
-                results = results.filter { $0.drillId == drillId }
-            }
-        case .workout:
-            results = results.filter { $0.mode == .workout }
-            if let workoutId = selectedWorkoutId {
-                results = results.filter { $0.workoutId == workoutId }
-            }
-        }
-        
-        switch dateRange {
-        case .all:
-            break
-        case .week:
-            let weekAgo = Calendar.current.date(byAdding: .day, value: -7, to: Date())!
-            results = results.filter { $0.date >= weekAgo }
-        case .month:
-            let monthAgo = Calendar.current.date(byAdding: .month, value: -1, to: Date())!
-            results = results.filter { $0.date >= monthAgo }
-        case .year:
-            let yearAgo = Calendar.current.date(byAdding: .year, value: -1, to: Date())!
-            results = results.filter { $0.date >= yearAgo }
-        }
-        
-        return results
+    enum ProgressSection {
+        case history
+        case drills
+        case workouts
     }
     
     var body: some View {
@@ -73,90 +31,72 @@ struct ProgressTabView: View {
                 .padding(.top, Theme.Spacing.sm)
                 .padding(.bottom, Theme.Spacing.xs)
                 
-                // Filters
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: Theme.Spacing.sm) {
-                        FilterChip(
-                            title: "All",
-                            isSelected: selectedFilter == .all
-                        ) {
-                            selectedFilter = .all
-                        }
-                        
-                        FilterChip(
-                            title: "Drills",
-                            isSelected: selectedFilter == .drill
-                        ) {
-                            selectedFilter = .drill
-                        }
-                        
-                        FilterChip(
-                            title: "Workouts",
-                            isSelected: selectedFilter == .workout
-                        ) {
-                            selectedFilter = .workout
-                        }
+                // Section buttons
+                HStack(spacing: Theme.Spacing.sm) {
+                    SectionButton(
+                        title: "History",
+                        isSelected: selectedSection == .history
+                    ) {
+                        selectedSection = .history
                     }
-                    .padding(.horizontal, Theme.Spacing.md)
-                    .padding(.vertical, Theme.Spacing.sm)
+                    
+                    SectionButton(
+                        title: "Drills",
+                        isSelected: selectedSection == .drills
+                    ) {
+                        selectedSection = .drills
+                    }
+                    
+                    SectionButton(
+                        title: "Workouts",
+                        isSelected: selectedSection == .workouts
+                    ) {
+                        selectedSection = .workouts
+                    }
                 }
-                .background(Color(.systemGray6))
+                .padding(.horizontal, Theme.Spacing.md)
+                .padding(.vertical, Theme.Spacing.sm)
                 
-                if filteredResults.isEmpty {
-                    EmptyProgressView()
-                } else {
-                    ScrollView {
-                        VStack(spacing: Theme.Spacing.lg) {
-                            // Chart section
-                            if selectedFilter == .drill, let drillId = selectedDrillId {
-                                DrillProgressChart(
-                                    results: filteredResults,
-                                    drill: drillStore.getDrill(id: drillId)
-                                )
-                            } else if !filteredResults.isEmpty {
-                                OverallProgressChart(results: filteredResults)
+                // Content
+                Group {
+                    switch selectedSection {
+                    case .history:
+                        HistoryView(
+                            sessionResultStore: sessionResultStore,
+                            templateStore: templateStore,
+                            workoutStore: workoutStore,
+                            runStore: runStore,
+                            onResultTap: { result in
+                                selectedResult = result
                             }
-                            
-                            // History list
-                            VStack(alignment: .leading, spacing: Theme.Spacing.md) {
-                                Text("History")
-                                    .font(.headline)
-                                    .padding(.horizontal, Theme.Spacing.md)
-                                
-                                ForEach(groupedResults.keys.sorted(by: >), id: \.self) { date in
-                                    Section {
-                                        ForEach(groupedResults[date] ?? []) { result in
-                                            ProgressRowView(
-                                                result: result,
-                                                drill: result.drillId.flatMap { drillStore.getDrill(id: $0) },
-                                                workout: result.workoutId.flatMap { workoutStore.getWorkout(id: $0) },
-                                                sessionResultStore: sessionResultStore,
-                                                onTap: {
-                                                    selectedResult = result
-                                                }
-                                            )
-                                        }
-                                    } header: {
-                                        Text(date, style: .date)
-                                            .font(.subheadline)
-                                            .foregroundColor(.secondary)
-                                            .padding(.horizontal, Theme.Spacing.md)
-                                    }
-                                }
+                        )
+                    case .drills:
+                        DrillsProgressView(
+                            templateStore: templateStore,
+                            runStore: runStore,
+                            onTemplateTap: { template in
+                                selectedTemplate = template
                             }
-                        }
-                        .padding(.vertical, Theme.Spacing.md)
+                        )
+                    case .workouts:
+                        WorkoutsProgressView(
+                            workoutStore: workoutStore,
+                            sessionResultStore: sessionResultStore,
+                            onWorkoutTap: { workout in
+                                selectedWorkout = workout
+                            }
+                        )
                     }
                 }
             }
-            .navigationTitle("Progress")
+            .drukNavigationTitle("Progress")
             .sheet(item: $selectedResult) { result in
                 NavigationStack {
                     DrillAnalysisView(
                         sessionResult: result,
-                        drill: result.drillId.flatMap { drillStore.getDrill(id: $0) }
+                        template: result.drillId.flatMap { templateStore.getTemplate(id: $0) }
                     )
-                    .navigationTitle("Drill Analysis")
+                    .drukNavigationTitle("Session Analysis")
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbar {
                         ToolbarItem(placement: .cancellationAction) {
@@ -167,165 +107,198 @@ struct ProgressTabView: View {
                     }
                 }
             }
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Picker("Date Range", selection: $dateRange) {
-                            Text("All Time").tag(DateRange.all)
-                            Text("Last Week").tag(DateRange.week)
-                            Text("Last Month").tag(DateRange.month)
-                            Text("Last Year").tag(DateRange.year)
-                        }
-                        
-                        if selectedFilter == .drill {
-                            Picker("Drill", selection: $selectedDrillId) {
-                                Text("All Drills").tag(nil as UUID?)
-                                ForEach(drillStore.drills) { drill in
-                                    Text(drill.name).tag(drill.id as UUID?)
-                                }
-                            }
-                        }
-                        
-                        if selectedFilter == .workout {
-                            Picker("Workout", selection: $selectedWorkoutId) {
-                                Text("All Workouts").tag(nil as UUID?)
-                                ForEach(workoutStore.workouts) { workout in
-                                    Text(workout.name).tag(workout.id as UUID?)
-                                }
-                            }
-                        }
-                    } label: {
-                        Image(systemName: "line.3.horizontal.decrease.circle")
-                    }
-                }
+            .sheet(item: $selectedTemplate) { template in
+                DrillProgressDetailView(
+                    template: template,
+                    templateStore: templateStore,
+                    runStore: runStore
+                )
             }
-        }
-    }
-    
-    private var groupedResults: [Date: [SessionResult]] {
-        Dictionary(grouping: filteredResults) { result in
-            Calendar.current.startOfDay(for: result.date)
+            .sheet(item: $selectedWorkout) { workout in
+                WorkoutProgressDetailView(
+                    workout: workout,
+                    workoutStore: workoutStore,
+                    sessionResultStore: sessionResultStore
+                )
+            }
         }
     }
 }
 
-struct FilterChip: View {
+struct SectionButton: View {
     let title: String
     let isSelected: Bool
     let action: () -> Void
     
     var body: some View {
         Button(action: action) {
-            Text(title)
-                .font(.subheadline)
-                .padding(.horizontal, Theme.Spacing.md)
+            Text(title.uppercased())
+                .font(Theme.Typography.exo2Callout)
+                .fontWeight(.semibold)
+                .foregroundColor(isSelected ? .white : .primary)
+                .frame(maxWidth: .infinity)
                 .padding(.vertical, Theme.Spacing.sm)
                 .background(isSelected ? Theme.orange : Color(.systemGray5))
-                .foregroundColor(isSelected ? .white : .primary)
                 .cornerRadius(Theme.CornerRadius.medium)
         }
     }
 }
 
-struct EmptyProgressView: View {
-    var body: some View {
-        VStack(spacing: Theme.Spacing.lg) {
-            ZStack {
-                Circle()
-                    .fill(Theme.orange.opacity(0.1))
-                    .frame(width: 100, height: 100)
-                
-                Image(systemName: "chart.line.uptrend.xyaxis")
-                    .font(.system(size: 40, weight: .light))
-                    .foregroundColor(Theme.orange.opacity(0.6))
-            }
-            .padding(.top, Theme.Spacing.xxl)
-            
-            VStack(spacing: 8) {
-                Text("No progress yet")
-                    .font(.system(size: 22, weight: .semibold, design: .rounded))
-                    .foregroundColor(.primary)
-                
-                Text("Complete your first workout to start tracking progress")
-                    .font(.system(size: 15, weight: .regular, design: .rounded))
-                    .foregroundColor(.secondary)
-                    .multilineTextAlignment(.center)
-                    .lineLimit(3)
-                    .padding(.horizontal, Theme.Spacing.xl)
-            }
-            
-            Spacer()
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+struct HistoryEntry: Identifiable {
+    enum Kind {
+        case solo(SessionResult)
+        case workout(sessionId: UUID, workoutName: String?, drills: [SessionResult])
     }
-}
-
-struct DrillProgressChart: View {
-    let results: [SessionResult]
-    let drill: Drill?
     
-    var body: some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-            Text(drill?.name ?? "Drill Progress")
-                .font(.headline)
-                .padding(.horizontal, Theme.Spacing.md)
-            
-            Chart {
-                ForEach(Array(results.enumerated()), id: \.element.id) { index, result in
-                    if let peak = result.derivedMetrics.peakForce {
-                        LineMark(
-                            x: .value("Session", index),
-                            y: .value("Peak Force", peak)
-                        )
-                        .foregroundStyle(Theme.orange)
-                    }
-                }
-            }
-            .frame(height: 200)
-            .padding()
-            .background(Color(.systemGray6))
-            .cornerRadius(Theme.CornerRadius.medium)
-            .padding(.horizontal, Theme.Spacing.md)
-        }
-    }
+    let id: UUID
+    let date: Date
+    let kind: Kind
 }
 
-struct OverallProgressChart: View {
-    let results: [SessionResult]
-    
-    var body: some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-            Text("Overall Progress")
-                .font(.headline)
-                .padding(.horizontal, Theme.Spacing.md)
-            
-            Chart {
-                ForEach(Array(results.enumerated()), id: \.element.id) { index, result in
-                    if let peak = result.derivedMetrics.peakForce {
-                        LineMark(
-                            x: .value("Session", index),
-                            y: .value("Peak Force", peak)
-                        )
-                        .foregroundStyle(Theme.orange)
-                    }
-                }
-            }
-            .frame(height: 200)
-            .padding()
-            .background(Color(.systemGray6))
-            .cornerRadius(Theme.CornerRadius.medium)
-            .padding(.horizontal, Theme.Spacing.md)
-        }
-    }
-}
-
-struct ProgressRowView: View {
-    let result: SessionResult
-    let drill: Drill?
-    let workout: Workout?
+struct HistoryView: View {
     @ObservedObject var sessionResultStore: SessionResultStore
-    let onTap: () -> Void
+    @ObservedObject var templateStore: DrillTemplateStore
+    @ObservedObject var workoutStore: WorkoutStore
+    @ObservedObject var runStore: DrillRunStore
+    let onResultTap: (SessionResult) -> Void
+    
+    @State private var entryToDelete: HistoryEntry?
     @State private var showingDeleteConfirmation = false
+    
+    private var entries: [HistoryEntry] {
+        let drillResults = sessionResultStore.getDrillResults()
+        let grouped = Dictionary(grouping: drillResults, by: { $0.workoutSessionId })
+        
+        var output: [HistoryEntry] = []
+        
+        for (sessionId, results) in grouped {
+            if let sessionId = sessionId {
+                let sorted = results.sorted { $0.date > $1.date }
+                let workoutName = sorted.compactMap { $0.workoutNameSnapshot }.first
+                    ?? sorted.first?.workoutId.flatMap { workoutStore.getWorkout(id: $0)?.name }
+                let date = sorted.first?.date ?? Date()
+                output.append(
+                    HistoryEntry(
+                        id: sessionId,
+                        date: date,
+                        kind: .workout(
+                            sessionId: sessionId,
+                            workoutName: workoutName,
+                            drills: sorted
+                        )
+                    )
+                )
+            } else {
+                let solos = results.map { result in
+                    HistoryEntry(id: result.id, date: result.date, kind: .solo(result))
+                }
+                output.append(contentsOf: solos)
+            }
+        }
+        
+        return output.sorted { $0.date > $1.date }
+    }
+    
+    var body: some View {
+        ScrollView {
+            if entries.isEmpty {
+                EmptyProgressView()
+            } else {
+                VStack(spacing: Theme.Spacing.md) {
+                    ForEach(entries) { entry in
+                        switch entry.kind {
+                        case .solo(let result):
+                            DrillHistoryRowView(
+                                result: result,
+                                template: result.drillId.flatMap { templateStore.getTemplate(id: $0) },
+                                contextWorkoutName: nil,
+                                onTap: { onResultTap(result) },
+                                onDelete: {
+                                    entryToDelete = entry
+                                    showingDeleteConfirmation = true
+                                }
+                            )
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                Button(role: .destructive) {
+                                    entryToDelete = entry
+                                    showingDeleteConfirmation = true
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                            }
+                        case .workout(let sessionId, let workoutName, let drills):
+                            WorkoutHistoryGroupView(
+                                workoutName: workoutName ?? "Workout",
+                                date: entry.date,
+                                drills: drills,
+                                templateStore: templateStore,
+                                onResultTap: onResultTap,
+                                onDelete: {
+                                    entryToDelete = entry
+                                    showingDeleteConfirmation = true
+                                }
+                            )
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                Button(role: .destructive) {
+                                    entryToDelete = entry
+                                    showingDeleteConfirmation = true
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding(Theme.Spacing.md)
+            }
+        }
+        .alert("Delete Session", isPresented: $showingDeleteConfirmation) {
+            Button("Cancel", role: .cancel) {
+                entryToDelete = nil
+            }
+            Button("Delete", role: .destructive) {
+                if let entry = entryToDelete {
+                    deleteEntry(entry)
+                }
+                entryToDelete = nil
+            }
+        } message: {
+            if let entry = entryToDelete {
+                switch entry.kind {
+                case .solo(let result):
+                    if let template = result.drillId.flatMap({ templateStore.getTemplate(id: $0) }) {
+                        Text("Are you sure you want to delete this \(template.name) session? This action cannot be undone.")
+                    } else {
+                        Text("Are you sure you want to delete this session? This action cannot be undone.")
+                    }
+                case .workout(_, let workoutName, let drills):
+                    Text("Are you sure you want to delete this \(workoutName ?? "workout") session with \(drills.count) drill\(drills.count == 1 ? "" : "s")? This action cannot be undone.")
+                }
+            }
+        }
+    }
+    
+    private func deleteEntry(_ entry: HistoryEntry) {
+        switch entry.kind {
+        case .solo(let result):
+            sessionResultStore.deleteResult(result)
+            // Also delete the corresponding DrillRun
+            runStore.deleteRuns(matching: result)
+        case .workout(let sessionId, _, let drills):
+            // Delete all SessionResults for this workout session
+            sessionResultStore.deleteResults(forSessionId: sessionId)
+            // Also delete all corresponding DrillRuns
+            runStore.deleteRuns(matching: drills)
+        }
+    }
+}
+
+struct DrillHistoryRowView: View {
+    let result: SessionResult
+    let template: DrillTemplate?
+    let contextWorkoutName: String?
+    let onTap: () -> Void
+    let onDelete: () -> Void
     
     var body: some View {
         HStack(spacing: Theme.Spacing.sm) {
@@ -334,26 +307,36 @@ struct ProgressRowView: View {
                 onTap()
             }) {
                 HStack(spacing: Theme.Spacing.md) {
+                    // Icon
+                    ZStack {
+                        Circle()
+                            .fill(Theme.orange.opacity(0.15))
+                            .frame(width: 44, height: 44)
+                        
+                        Image(systemName: "figure.run")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundColor(Theme.orange)
+                    }
+                    
                     VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
-                        Text(result.mode == .drill ? (drill?.name ?? "Drill") : (workout?.name ?? "Workout"))
-                            .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        Text(template?.name.uppercased() ?? "DRILL")
+                            .font(Theme.Typography.drukDrillName)
                             .foregroundColor(.primary)
                         
-                        HStack(spacing: Theme.Spacing.md) {
-                            Text(result.date, style: .time)
-                                .font(.system(size: 12, weight: .medium, design: .rounded))
+                        HStack(spacing: Theme.Spacing.sm) {
+                            Text(result.date, style: .date)
+                                .font(Theme.Typography.exo2Label)
                                 .foregroundColor(.secondary)
                             
-                            if let level = result.levelUsed {
-                                Text("Level \(level)")
-                                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                                    .foregroundColor(.secondary)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Theme.orange.opacity(0.15))
-                                    .foregroundColor(Theme.orange)
-                                    .cornerRadius(4)
-                            }
+                            Text(result.date, style: .time)
+                                .font(Theme.Typography.exo2Label)
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        if let workoutName = contextWorkoutName {
+                            Text("Workout: \(workoutName)")
+                                .font(Theme.Typography.exo2Caption2)
+                                .foregroundColor(.secondary)
                         }
                     }
                     
@@ -362,10 +345,11 @@ struct ProgressRowView: View {
                     if let peak = result.derivedMetrics.peakForce {
                         VStack(alignment: .trailing, spacing: 2) {
                             Text(String(format: "%.1f", peak))
-                                .font(.system(size: 18, weight: .bold, design: .rounded))
+                                .font(Theme.Typography.exo2MetricSmall)
                                 .foregroundColor(.primary)
                             Text("Peak")
-                                .font(.system(size: 11, weight: .medium, design: .rounded))
+                                .font(Theme.Typography.exo2Caption2)
+                                .fontWeight(.medium)
                                 .foregroundColor(.secondary)
                         }
                     }
@@ -380,36 +364,336 @@ struct ProgressRowView: View {
             }
             .buttonStyle(.plain)
             
-            Button(role: .destructive) {
-                HapticFeedback.buttonPress()
-                showingDeleteConfirmation = true
-            } label: {
+            Button(action: {
+                HapticFeedback.cardTap()
+                onDelete()
+            }) {
                 Image(systemName: "trash")
-                    .font(.system(size: 14, weight: .medium))
+                    .font(.system(size: 16, weight: .semibold))
                     .foregroundColor(.red)
-                    .frame(width: 36, height: 36)
+                    .frame(width: 44, height: 44)
                     .background(Color.red.opacity(0.1))
-                    .cornerRadius(8)
+                    .cornerRadius(Theme.CornerRadius.medium)
             }
             .buttonStyle(.plain)
-        }
-        .padding(.horizontal, Theme.Spacing.md)
-        .confirmationDialog(
-            "Delete this session?",
-            isPresented: $showingDeleteConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("Delete", role: .destructive) {
-                sessionResultStore.deleteResult(result)
-                HapticFeedback.buttonPress()
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This action cannot be undone.")
         }
     }
 }
 
-#Preview {
-    ProgressTabView()
+struct WorkoutHistoryGroupView: View {
+    let workoutName: String
+    let date: Date
+    let drills: [SessionResult]
+    let templateStore: DrillTemplateStore
+    let onResultTap: (SessionResult) -> Void
+    let onDelete: () -> Void
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+            HStack {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(workoutName.uppercased())
+                        .font(Theme.Typography.drukWorkoutTitle)
+                        .foregroundColor(.primary)
+                    
+                    HStack(spacing: Theme.Spacing.sm) {
+                        Text(date, style: .date)
+                            .font(Theme.Typography.exo2Label)
+                            .foregroundColor(.secondary)
+                        Text(date, style: .time)
+                            .font(Theme.Typography.exo2Label)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                
+                Spacer()
+                
+                Text("\(drills.count) drill\(drills.count == 1 ? "" : "s")")
+                    .font(Theme.Typography.exo2Label)
+                    .foregroundColor(.secondary)
+                
+                Button(action: {
+                    HapticFeedback.cardTap()
+                    onDelete()
+                }) {
+                    Image(systemName: "trash")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(.red)
+                        .frame(width: 44, height: 44)
+                        .background(Color.red.opacity(0.1))
+                        .cornerRadius(Theme.CornerRadius.medium)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.bottom, Theme.Spacing.xs)
+            
+            VStack(spacing: Theme.Spacing.sm) {
+                ForEach(drills.sorted { $0.date > $1.date }) { result in
+                    DrillHistoryRowView(
+                        result: result,
+                        template: result.drillId.flatMap { templateStore.getTemplate(id: $0) },
+                        contextWorkoutName: workoutName,
+                        onTap: { onResultTap(result) },
+                        onDelete: { }
+                    )
+                }
+            }
+        }
+        .padding(Theme.Spacing.md)
+        .background(Color(.systemGray6))
+        .cornerRadius(Theme.CornerRadius.medium)
+    }
+}
+
+struct DrillsProgressView: View {
+    @ObservedObject var templateStore: DrillTemplateStore
+    @ObservedObject var runStore: DrillRunStore
+    let onTemplateTap: (DrillTemplate) -> Void
+    
+    private var completedTemplates: [DrillTemplate] {
+        let allTemplates = templateStore.fetchTemplates()
+        let templatesWithRuns = allTemplates.filter { template in
+            !runStore.fetchRuns(for: template.id).isEmpty
+        }
+        return templatesWithRuns.sorted { $0.name < $1.name }
+    }
+    
+    var body: some View {
+        ScrollView {
+            if completedTemplates.isEmpty {
+                EmptyProgressView(message: "No drills completed yet")
+            } else {
+                VStack(spacing: Theme.Spacing.md) {
+                    ForEach(completedTemplates) { template in
+                        DrillProgressRowView(
+                            template: template,
+                            runStore: runStore,
+                            onTap: {
+                                onTemplateTap(template)
+                            }
+                        )
+                    }
+                }
+                .padding(Theme.Spacing.md)
+            }
+        }
+    }
+}
+
+struct DrillProgressRowView: View {
+    let template: DrillTemplate
+    @ObservedObject var runStore: DrillRunStore
+    let onTap: () -> Void
+    
+    private var allRuns: [DrillRun] {
+        runStore.fetchRuns(for: template.id)
+    }
+    
+    private var mostRecentRun: DrillRun? {
+        allRuns.first
+    }
+    
+    private var allTimeStats: (avgSpeed: Double, peakSpeed: Double, avgTime: Double) {
+        let enforcedRuns = allRuns.filter { $0.runMode == .enforced }
+        guard !enforcedRuns.isEmpty else {
+            return (0, 0, 0)
+        }
+        
+        let avgSpeed = enforcedRuns.map { $0.results.avgSpeedMps }.reduce(0, +) / Double(enforcedRuns.count)
+        let peakSpeed = enforcedRuns.map { $0.results.peakSpeedMps }.max() ?? 0
+        let avgTime = enforcedRuns.map { $0.results.durationSeconds }.reduce(0, +) / Double(enforcedRuns.count)
+        
+        return (avgSpeed, peakSpeed, avgTime)
+    }
+    
+    var body: some View {
+        HStack(spacing: Theme.Spacing.sm) {
+            Button(action: {
+                HapticFeedback.cardTap()
+                onTap()
+            }) {
+                HStack(spacing: Theme.Spacing.md) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(alignment: .top, spacing: Theme.Spacing.xs) {
+                            Text(template.name.uppercased())
+                                .font(Theme.Typography.drukDrillName)
+                                .foregroundColor(.primary)
+                                .lineLimit(2)
+                            
+                            Spacer()
+                        }
+                        
+                        HStack(spacing: Theme.Spacing.sm) {
+                            // Target summary
+                            Text(template.type.rawValue)
+                                .font(Theme.Typography.exo2Label)
+                                .foregroundColor(.secondary)
+                            
+                            if let time = template.targetTimeSeconds {
+                                Text("•")
+                                    .foregroundColor(.secondary)
+                                Text("\(Int(time))s")
+                                    .font(Theme.Typography.exo2Label)
+                                    .foregroundColor(.secondary)
+                            }
+                            
+                            if let distance = template.distanceMeters {
+                                Text("•")
+                                    .foregroundColor(.secondary)
+                                Text(String(format: "%.1fm", distance))
+                                    .font(Theme.Typography.exo2Label)
+                                    .foregroundColor(.secondary)
+                            }
+                            
+                            Text("• \(allRuns.count) run\(allRuns.count == 1 ? "" : "s")")
+                                .font(Theme.Typography.exo2Label)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    
+                    Image(systemName: "chevron.right")
+                        .foregroundColor(.secondary.opacity(0.6))
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .padding(Theme.Spacing.md)
+                .background(
+                    RoundedRectangle(cornerRadius: Theme.CornerRadius.medium)
+                        .fill(Color(.systemGray6))
+                        .shadow(color: .black.opacity(0.03), radius: 2, x: 0, y: 1)
+                )
+            }
+            .buttonStyle(.plain)
+        }
+    }
+}
+
+struct WorkoutsProgressView: View {
+    @ObservedObject var workoutStore: WorkoutStore
+    @ObservedObject var sessionResultStore: SessionResultStore
+    let onWorkoutTap: (Workout) -> Void
+    
+    private var completedWorkouts: [Workout] {
+        let allWorkouts = workoutStore.workouts
+        let workoutsWithResults = allWorkouts.filter { workout in
+            !sessionResultStore.getResults(forWorkoutId: workout.id).isEmpty
+        }
+        return workoutsWithResults.sorted { $0.name < $1.name }
+    }
+    
+    var body: some View {
+        ScrollView {
+            if completedWorkouts.isEmpty {
+                EmptyProgressView(message: "No workouts completed yet")
+            } else {
+                VStack(spacing: Theme.Spacing.md) {
+                    ForEach(completedWorkouts) { workout in
+                        WorkoutProgressRowView(
+                            workout: workout,
+                            sessionResultStore: sessionResultStore,
+                            onTap: {
+                                onWorkoutTap(workout)
+                            }
+                        )
+                    }
+                }
+                .padding(Theme.Spacing.md)
+            }
+        }
+    }
+}
+
+struct WorkoutProgressRowView: View {
+    let workout: Workout
+    @ObservedObject var sessionResultStore: SessionResultStore
+    let onTap: () -> Void
+    
+    private var sessionCompletions: [(id: UUID, result: SessionResult)] {
+        let grouped = Dictionary(grouping: sessionResultStore.getResults(forWorkoutId: workout.id)) { $0.workoutSessionId ?? $0.id }
+        let mapped = grouped.compactMap { (_, results) -> (id: UUID, result: SessionResult)? in
+            guard let latest = results.sorted(by: { $0.date > $1.date }).first else { return nil }
+            let sessionId = latest.workoutSessionId ?? latest.id
+            return (id: sessionId, result: latest)
+        }
+        return mapped.sorted(by: { $0.result.date > $1.result.date })
+    }
+    
+    private var mostRecentResult: SessionResult? {
+        sessionCompletions.first?.result
+    }
+    
+    var body: some View {
+        Button(action: {
+            HapticFeedback.cardTap()
+            onTap()
+        }) {
+            VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+                HStack {
+                    Text(workout.name.uppercased())
+                        .font(Theme.Typography.drukWorkoutTitle)
+                        .foregroundColor(.primary)
+                    
+                    Spacer()
+                    
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.secondary.opacity(0.5))
+                }
+                
+                HStack(spacing: Theme.Spacing.md) {
+                    Text("\(workout.items.count) drill\(workout.items.count == 1 ? "" : "s")")
+                        .font(Theme.Typography.exo2Label)
+                        .foregroundColor(.secondary)
+                    
+                    Text("• \(sessionCompletions.count) completion\(sessionCompletions.count == 1 ? "" : "s")")
+                        .font(Theme.Typography.exo2Label)
+                        .foregroundColor(.secondary)
+                }
+                
+                if let recent = mostRecentResult {
+                    Text("Last completed: \(recent.date, style: .date)")
+                        .font(Theme.Typography.exo2Label)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(Theme.Spacing.md)
+            .background(Color(.systemGray6))
+            .cornerRadius(Theme.CornerRadius.medium)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct EmptyProgressView: View {
+    var message: String = "No progress yet"
+    
+    var body: some View {
+        VStack(spacing: Theme.Spacing.lg) {
+            ZStack {
+                Circle()
+                    .fill(Theme.orange.opacity(0.1))
+                    .frame(width: 100, height: 100)
+                
+                Image(systemName: "chart.line.uptrend.xyaxis")
+                    .font(.system(size: 40, weight: .light))
+                    .foregroundColor(Theme.orange.opacity(0.6))
+            }
+            .padding(.top, Theme.Spacing.xxl)
+            
+            VStack(spacing: 8) {
+                Text(message.uppercased())
+                    .font(Theme.Typography.drukDrillName)
+                    .foregroundColor(.primary)
+                
+                Text("Complete your first session to start tracking progress")
+                    .font(Theme.Typography.exo2Subheadline)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(3)
+                    .padding(.horizontal, Theme.Spacing.xl)
+            }
+            
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
 }

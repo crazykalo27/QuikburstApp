@@ -41,5 +41,15 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<key>UIAppFonts</key>
+	<array>
+		<string>Druk-Bold.otf</string>
+		<string>Druk-Medium.otf</string>
+		<string>Druk-Regular.otf</string>
+		<string>Exo2-Regular.otf</string>
+		<string>Exo2-Medium.otf</string>
+		<string>Exo2-SemiBold.otf</string>
+		<string>Exo2-Bold.otf</string>
+	</array>
 </dict>
 </plist>
