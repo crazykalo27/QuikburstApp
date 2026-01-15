@@ -124,6 +124,61 @@ final class BluetoothManager: NSObject, ObservableObject {
             self.updateOnMain { self.txLog.append(text) }
         }
     }
+    
+    // MARK: - JSON Drill Command Support
+    
+    func sendDrillStart(_ command: DrillStartCommand) {
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            let jsonData = try encoder.encode(command)
+            if let jsonString = String(data: jsonData, encoding: .utf8) {
+                send(jsonString + "\n")
+            } else {
+                updateOnMain { self.lastError = "Could not convert JSON to string." }
+            }
+        } catch {
+            updateOnMain { self.lastError = "Could not encode drill command: \(error.localizedDescription)" }
+        }
+    }
+    
+    func sendDrillAbort() {
+        let command = DrillAbortCommand()
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            let jsonData = try encoder.encode(command)
+            if let jsonString = String(data: jsonData, encoding: .utf8) {
+                send(jsonString + "\n")
+            } else {
+                updateOnMain { self.lastError = "Could not convert JSON to string." }
+            }
+        } catch {
+            updateOnMain { self.lastError = "Could not encode drill abort command: \(error.localizedDescription)" }
+        }
+    }
+    
+    /// Parse JSON telemetry from ESP32
+    func parseTelemetry(_ jsonString: String) -> DrillTelemetry? {
+        guard let data = jsonString.data(using: .utf8) else { return nil }
+        do {
+            let decoder = JSONDecoder()
+            return try decoder.decode(DrillTelemetry.self, from: data)
+        } catch {
+            return nil
+        }
+    }
+    
+    /// Parse JSON ACK from ESP32
+    func parseAck(_ jsonString: String) -> DrillAck? {
+        guard let data = jsonString.data(using: .utf8) else { return nil }
+        do {
+            let decoder = JSONDecoder()
+            return try decoder.decode(DrillAck.self, from: data)
+        } catch {
+            return nil
+        }
+    }
 
     func clearLogs() {
         updateOnMain {

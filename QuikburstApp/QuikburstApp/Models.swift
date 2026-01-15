@@ -719,3 +719,52 @@ struct SessionMetrics: Codable {
     }
 }
 
+// MARK: - ESP32 Drill Command Models (JSON Protocol)
+
+struct DrillStartCommand: Codable {
+    let type: String
+    let id: UInt32
+    let targetSpeed: Double // m/s
+    let durationMs: UInt32? // 0 if unused
+    let targetDistance: Double? // meters, 0 if unused
+    let forcePercent: Double // 0-100, maps to max PWM duty
+    let rampMs: UInt32 // ramp time in ms
+    let direction: Int // +1 forward, -1 reverse
+    
+    init(id: UInt32, targetSpeed: Double, durationMs: UInt32? = nil, targetDistance: Double? = nil, forcePercent: Double, rampMs: UInt32, direction: Int) {
+        self.type = "drillStart"
+        self.id = id
+        self.targetSpeed = targetSpeed
+        self.durationMs = durationMs
+        self.targetDistance = targetDistance
+        self.forcePercent = max(0, min(100, forcePercent)) // Clamp to 0-100
+        self.rampMs = rampMs
+        self.direction = direction > 0 ? 1 : -1
+    }
+}
+
+struct DrillAbortCommand: Codable {
+    let type: String
+    
+    init() {
+        self.type = "drillAbort"
+    }
+}
+
+struct DrillTelemetry: Codable {
+    let type: String
+    let id: UInt32
+    let t: UInt32 // elapsed time in ms
+    let speed: Double // m/s
+    let position: Int32 // encoder position
+    let distance: Double // meters from start
+    let duty: Double // PWM duty (0-1)
+    let state: String // "RAMP", "HOLD", "DONE", "IDLE", "ABORT"
+}
+
+struct DrillAck: Codable {
+    let type: String
+    let id: UInt32?
+    let status: String
+}
+

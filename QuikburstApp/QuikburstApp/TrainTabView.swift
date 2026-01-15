@@ -428,9 +428,70 @@ struct TrainTabView: View {
         }
         sessionStartTime = Date()
         sessionSamples = []
-        bluetoothManager.send("START")
+        
+        // Send JSON drillStart command if template is available
+        if let template = selectedTemplate {
+            let command = buildDrillStartCommand(from: template)
+            bluetoothManager.sendDrillStart(command)
+        } else {
+            // Fallback to legacy START command
+            bluetoothManager.send("START")
+        }
+        
         dataStreamVM.start()
         sessionState = .measuring
+    }
+    
+    // Helper to build DrillStartCommand from DrillTemplate
+    private func buildDrillStartCommand(from template: DrillTemplate) -> DrillStartCommand {
+        let phases = template.effectivePhases
+        let firstPhase = phases.first ?? DrillPhase()
+        
+        // Determine target speed (m/s) - use template's targetSpeedMps or default
+        let targetSpeed = template.targetSpeedMps ?? 3.5 // Default 3.5 m/s
+        
+        // Determine duration or distance
+        var durationMs: UInt32? = nil
+        var targetDistance: Double? = nil
+        
+        if template.type == .speedDrill || firstPhase.drillType == .speedDrill {
+            // Speed drill: use distance
+            if let distance = firstPhase.distanceMeters ?? template.distanceMeters {
+                targetDistance = distance
+            }
+        } else {
+            // Force drill: use time
+            if let timeSeconds = firstPhase.targetTimeSeconds ?? template.targetTimeSeconds {
+                durationMs = UInt32(timeSeconds * 1000)
+            }
+        }
+        
+        // Determine force percent (0-100) - use constantForceN or default to 60%
+        var forcePercent: Double = 60.0
+        if let forceN = firstPhase.constantForceN ?? template.constantForceN {
+            // Simple mapping: assume max force of ~200N maps to 100%
+            forcePercent = min(100.0, max(0.0, (forceN / 200.0) * 100.0))
+        }
+        
+        // Determine ramp time (ms)
+        let rampSeconds = firstPhase.rampupTimeSeconds ?? template.rampupTimeSeconds ?? 1.0
+        let rampMs = UInt32(rampSeconds * 1000)
+        
+        // Determine direction: +1 for resist (forward), -1 for assist (reverse)
+        let direction: Int = (firstPhase.quikburstMode == .resist || template.isResist) ? 1 : -1
+        
+        // Use template ID hash as command ID (convert UUID to UInt32)
+        let commandId = UInt32(template.id.hashValue) & 0xFFFFFFFF
+        
+        return DrillStartCommand(
+            id: commandId,
+            targetSpeed: targetSpeed,
+            durationMs: durationMs,
+            targetDistance: targetDistance,
+            forcePercent: forcePercent,
+            rampMs: rampMs,
+            direction: direction
+        )
     }
     
     private func handleWorkoutDrillComplete() {
@@ -514,7 +575,7 @@ struct TrainTabView: View {
     }
     
     private func completeSession() {
-        bluetoothManager.send("STOP")
+        bluetoothManager.sendDrillAbort()
         dataStreamVM.stop()
         
         if let result = currentSessionResult {
@@ -828,7 +889,7 @@ struct TrainTabView: View {
     }
     
     private func abortSession() {
-        bluetoothManager.send("STOP")
+        bluetoothManager.sendDrillAbort()
         dataStreamVM.stop()
         currentWorkoutSessionId = nil
         sessionState = .aborted
@@ -3613,25 +3674,50 @@ struct LiveModeView: View {
     
     private func startLiveMode() {
         isRunning = true
-        bluetoothManager.send("START")
+        
+        // Send JSON drillStart command with force value
+        // For live mode: use forceValue (0-100) as forcePercent, default target speed 3.5 m/s
+        let commandId = UInt32(UUID().hashValue) & 0xFFFFFFFF
+        let command = DrillStartCommand(
+            id: commandId,
+            targetSpeed: 3.5, // Default target speed for live mode
+            durationMs: nil, // No time limit in live mode
+            targetDistance: nil, // No distance limit in live mode
+            forcePercent: forceValue, // Use slider value (0-100)
+            rampMs: 500, // 500ms ramp time
+            direction: 1 // Forward (resist mode)
+        )
+        bluetoothManager.sendDrillStart(command)
+        
         dataStreamVM.start()
-        // Send initial force value
-        sendForceValue(forceValue)
     }
     
     private func stopLiveMode() {
         isRunning = false
-        bluetoothManager.send("STOP")
+        bluetoothManager.sendDrillAbort()
         dataStreamVM.stop()
         // Don't reset force or navigate away - just stop and stay on page
         // Force value stays at current setting for next run
     }
     
     private func sendForceValue(_ value: Double) {
-        // Send force value as command to device
-        // Format: "FORCE:50.0" for example
-        let command = String(format: "FORCE:%.1f", value)
-        bluetoothManager.send(command)
+        // For live mode with motor control, we need to send a new drillStart command
+        // with updated forcePercent. The ESP32 will handle the transition.
+        // Note: This is a simplified approach - in a full implementation, you might
+        // want to send drillAbort first, then drillStart with new force value
+        if isRunning {
+            let commandId = UInt32(UUID().hashValue) & 0xFFFFFFFF
+            let command = DrillStartCommand(
+                id: commandId,
+                targetSpeed: 3.5,
+                durationMs: nil,
+                targetDistance: nil,
+                forcePercent: value,
+                rampMs: 200, // Quick ramp for live updates
+                direction: 1
+            )
+            bluetoothManager.sendDrillStart(command)
+        }
     }
 }
 
