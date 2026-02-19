@@ -73,17 +73,17 @@ final class DrillTemplateStore: ObservableObject {
             merged.torqueCurve = template.torqueCurve
             merged.speedPercentOfBaseline = template.speedPercentOfBaseline
             merged.forcePercentOfBaseline = template.forcePercentOfBaseline
-            // Keep existing probationStatus and ID
+            // Update probationStatus from template (may have changed if drill configuration changed)
+            merged.probationStatus = template.probationStatus
+            // Keep existing ID
             if let index = templates.firstIndex(where: { $0.id == existing.id }) {
                 templates[index] = merged
             }
             return merged
         } else {
-            // New template
-            var newTemplate = template
-            newTemplate.probationStatus = .probationary // Always start as probationary
-            templates.append(newTemplate)
-            return newTemplate
+            // New template - use the probationStatus from the template (already calculated correctly in CreateDrillWizardView)
+            templates.append(template)
+            return template
         }
     }
     

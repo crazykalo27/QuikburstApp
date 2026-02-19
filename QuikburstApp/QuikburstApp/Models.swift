@@ -12,6 +12,27 @@ struct SensorSample: Identifiable, Hashable, Codable {
         self.value = value
     }
 }
+
+// Encoder data with all metrics
+struct EncoderData: Identifiable, Hashable, Codable {
+    let id: UUID
+    let timestamp: Date
+    let position: Double // meters
+    let velocity: Double // m/s
+    let rpm: Double // RPM
+    let acceleration: Double // m/s²
+    let counts: Int32 // raw encoder counts
+    
+    init(id: UUID = UUID(), timestamp: Date, position: Double, velocity: Double, rpm: Double, acceleration: Double, counts: Int32) {
+        self.id = id
+        self.timestamp = timestamp
+        self.position = position
+        self.velocity = velocity
+        self.rpm = rpm
+        self.acceleration = acceleration
+        self.counts = counts
+    }
+}
 struct RunRecord: Identifiable, Hashable, Codable {
     let id: UUID
     let date: Date
@@ -672,7 +693,8 @@ struct SessionResult: Identifiable, Codable {
     /// Snapshot of workout name at completion time for display even if workout changes later
     var workoutNameSnapshot: String?
     var levelUsed: Int?
-    var rawESP32Data: [SensorSample] // Store as array of samples
+    var rawESP32Data: [SensorSample] // Store as array of samples (legacy, for backward compatibility)
+    var encoderData: [EncoderData]? // Full encoder data with position, velocity, rpm, acceleration (for 4 graphs)
     var derivedMetrics: SessionMetrics
     
     init(
@@ -685,6 +707,7 @@ struct SessionResult: Identifiable, Codable {
         workoutNameSnapshot: String? = nil,
         levelUsed: Int? = nil,
         rawESP32Data: [SensorSample] = [],
+        encoderData: [EncoderData]? = nil,
         derivedMetrics: SessionMetrics = SessionMetrics()
     ) {
         self.id = id
@@ -696,6 +719,7 @@ struct SessionResult: Identifiable, Codable {
         self.workoutNameSnapshot = workoutNameSnapshot
         self.levelUsed = levelUsed
         self.rawESP32Data = rawESP32Data
+        self.encoderData = encoderData
         self.derivedMetrics = derivedMetrics
     }
 }
@@ -719,52 +743,184 @@ struct SessionMetrics: Codable {
     }
 }
 
-// MARK: - ESP32 Drill Command Models (JSON Protocol)
+// MARK: - ESP32 Communication Protocol (Redesigned)
 
-struct DrillStartCommand: Codable {
+// Live Mode Start: App requests synchronized start with countdown
+struct LiveStartCommand: Codable {
     let type: String
     let id: UInt32
-    let targetSpeed: Double // m/s
-    let durationMs: UInt32? // 0 if unused
-    let targetDistance: Double? // meters, 0 if unused
-    let forcePercent: Double // 0-100, maps to max PWM duty
-    let rampMs: UInt32 // ramp time in ms
-    let direction: Int // +1 forward, -1 reverse
+    let dutyPercent: Double // 0-100% requested response
+    let direction: Int // +1 resist, -1 assist
+    let countdownMs: UInt32
     
-    init(id: UInt32, targetSpeed: Double, durationMs: UInt32? = nil, targetDistance: Double? = nil, forcePercent: Double, rampMs: UInt32, direction: Int) {
-        self.type = "drillStart"
+    init(id: UInt32, dutyPercent: Double, direction: Int = 1, countdownMs: UInt32 = 3000) {
+        self.type = "liveStart"
         self.id = id
-        self.targetSpeed = targetSpeed
-        self.durationMs = durationMs
-        self.targetDistance = targetDistance
-        self.forcePercent = max(0, min(100, forcePercent)) // Clamp to 0-100
-        self.rampMs = rampMs
+        self.dutyPercent = max(0, min(100, dutyPercent))
+        self.direction = direction > 0 ? 1 : -1
+        self.countdownMs = countdownMs
+    }
+}
+
+// Live Mode Update: App sends duty updates while live mode is active
+struct LiveModeCommand: Codable {
+    let type: String
+    let dutyPercent: Double // 0-100% requested response
+    let direction: Int // +1 resist, -1 assist
+    
+    init(dutyPercent: Double, direction: Int = 1) {
+        self.type = "liveMode"
+        self.dutyPercent = max(0, min(100, dutyPercent))
         self.direction = direction > 0 ? 1 : -1
     }
 }
 
-struct DrillAbortCommand: Codable {
+// Constant Force: App sends specification (time + force OR distance + force)
+// ESP32 executes and sends encoder data back, ESP32 determines completion
+struct ConstantForceCommand: Codable {
     let type: String
+    let id: UInt32
+    let forcePercent: Double // 0-100% duty cycle
+    let direction: Int // +1 resist, -1 assist
+    let durationMs: UInt32? // For time-based drills (nil if distance-based)
+    let targetDistance: Double? // For distance-based drills (nil if time-based)
     
-    init() {
-        self.type = "drillAbort"
+    init(
+        id: UInt32,
+        forcePercent: Double,
+        direction: Int = 1,
+        durationMs: UInt32? = nil,
+        targetDistance: Double? = nil
+    ) {
+        self.type = "constantForce"
+        self.id = id
+        self.forcePercent = max(0, min(100, forcePercent))
+        self.direction = direction > 0 ? 1 : -1
+        self.durationMs = durationMs
+        self.targetDistance = targetDistance
     }
 }
 
+// Percentage Baseline Phase 1: App sends time OR distance (no force)
+// ESP32 reports encoder data until completion, ESP32 sends completion signal
+struct PercentageBaselineCommand: Codable {
+    let type: String
+    let id: UInt32
+    let direction: Int // +1 resist, -1 assist
+    let durationMs: UInt32? // For time-based (nil if distance-based)
+    let targetDistance: Double? // For distance-based (nil if time-based)
+    
+    init(
+        id: UInt32,
+        direction: Int = 1,
+        durationMs: UInt32? = nil,
+        targetDistance: Double? = nil
+    ) {
+        self.type = "percentageBaseline"
+        self.id = id
+        self.direction = direction > 0 ? 1 : -1
+        self.durationMs = durationMs
+        self.targetDistance = targetDistance
+    }
+}
+
+// Percentage Execution Phase 2: App sends calculated force based on percentage
+// ESP32 executes and reports back
+struct PercentageExecutionCommand: Codable {
+    let type: String
+    let id: UInt32
+    let targetPercent: Double // Percentage (e.g., 110.0 = 110%)
+    let forcePercent: Double // 0-100% duty cycle calculated by app
+    let direction: Int // +1 resist, -1 assist
+    
+    init(id: UInt32, targetPercent: Double, forcePercent: Double, direction: Int = 1) {
+        self.type = "percentageExecution"
+        self.id = id
+        self.targetPercent = targetPercent
+        self.forcePercent = max(0, min(100, forcePercent))
+        self.direction = direction > 0 ? 1 : -1
+    }
+}
+
+// Stop command
+struct StopCommand: Codable {
+    let type: String
+    
+    init() {
+        self.type = "stop"
+    }
+}
+
+// Telemetry from ESP32
 struct DrillTelemetry: Codable {
     let type: String
     let id: UInt32
     let t: UInt32 // elapsed time in ms
-    let speed: Double // m/s
-    let position: Int32 // encoder position
-    let distance: Double // meters from start
+    let position: Double // meters (smoothed)
+    let velocity: Double // m/s
+    let rpm: Double // RPM
+    let acceleration: Double // m/s²
+    let counts: Int32 // raw encoder counts
     let duty: Double // PWM duty (0-1)
-    let state: String // "RAMP", "HOLD", "DONE", "IDLE", "ABORT"
+    let state: String // "LIVE_MODE", "CONSTANT_FORCE", "PERCENTAGE_BASELINE", "PERCENTAGE_EXECUTION", "IDLE"
 }
 
-struct DrillAck: Codable {
+// Completion message from ESP32
+struct CompletionMessage: Codable, Equatable {
+    let type: String
+    let id: UInt32
+    let reason: String // "time" or "distance"
+}
+
+// Baseline complete message from ESP32
+struct BaselineCompleteMessage: Codable, Equatable {
+    let type: String
+    let id: UInt32
+    let baselineSpeed: Double // m/s
+    let baselineDistance: Double // meters
+    let baselineTime: Double // seconds
+}
+
+// ACK message from ESP32
+struct DrillAck: Codable, Equatable {
     let type: String
     let id: UInt32?
-    let status: String
+    let status: String // "started", "baselineStarted", "executionStarted", "baselineFailed", "stopped"
+    let countdownMs: UInt32?
+}
+
+// Batch data messages from ESP32
+struct DataStartMessage: Codable {
+    let type: String
+    let id: UInt32
+    let samples: Int
+}
+
+struct MetadataMessage: Codable {
+    let type: String
+    let countsPerRev: Int
+    let spoolRadiusM: Double
+    let sampleIntervalMs: Int
+}
+
+struct DataPoint: Codable {
+    let t: UInt32 // time in ms
+    let counts: Int32
+    let position: Double // meters
+    let velocity: Double // m/s
+    let rpm: Double
+    let acceleration: Double // m/s²
+}
+
+struct DataChunkMessage: Codable {
+    let type: String
+    let id: UInt32
+    let start: Int
+    let data: [DataPoint]
+}
+
+struct DataEndMessage: Codable {
+    let type: String
+    let id: UInt32
 }
 

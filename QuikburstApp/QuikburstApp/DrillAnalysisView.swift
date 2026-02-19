@@ -205,8 +205,20 @@ struct DrillAnalysisView: View {
                 .padding(.top, Theme.Spacing.lg)
                 .padding(.horizontal, Theme.Spacing.lg)
                 
-                // Performance Graph
-                if !sessionResult.rawESP32Data.isEmpty {
+                // Performance Graphs (4 graphs: Position, Velocity, RPM, Acceleration)
+                if let encoderData = sessionResult.encoderData, !encoderData.isEmpty {
+                    // Use LiveEncoderGraphsView to display all 4 graphs
+                    VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+                        Text("Performance Graphs")
+                            .font(.system(size: 18, weight: .semibold, design: .rounded))
+                            .foregroundColor(.primary)
+                            .padding(.horizontal, Theme.Spacing.lg)
+                        
+                        LiveEncoderGraphsView(encoderData: encoderData)
+                            .padding(.horizontal, Theme.Spacing.lg)
+                    }
+                } else if !sessionResult.rawESP32Data.isEmpty {
+                    // Fallback to single graph if encoderData not available
                     VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
                         Text("Performance Graph")
                             .font(.system(size: 18, weight: .semibold, design: .rounded))
@@ -253,17 +265,17 @@ struct DrillAnalysisView: View {
                         .padding(.horizontal, Theme.Spacing.lg)
                     }
                 } else {
+                    // Show message if no data
                     VStack(spacing: Theme.Spacing.md) {
-                        Image(systemName: "chart.line.uptrend.xyaxis")
-                            .font(.system(size: 48))
-                            .foregroundColor(.secondary.opacity(0.5))
-                        
-                        Text("No data available")
-                            .font(.system(size: 16, weight: .medium, design: .rounded))
+                        Text("NO DATA RECEIVED")
+                            .font(.headline)
+                            .foregroundColor(.secondary)
+                        Text("No data was collected during this drill run.")
+                            .font(.subheadline)
                             .foregroundColor(.secondary)
                     }
-                    .frame(height: 300)
                     .frame(maxWidth: .infinity)
+                    .padding(Theme.Spacing.lg)
                     .background(
                         RoundedRectangle(cornerRadius: Theme.CornerRadius.medium)
                             .fill(Color(.systemGray6))

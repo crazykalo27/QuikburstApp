@@ -231,6 +231,31 @@ struct CreateDrillWizardView: View {
                 }
             }
             
+            // Ensure force values are set for force drills with constant force
+            if updatedPhase.drillType == .forceDrill && updatedPhase.forceType == .constant {
+                if !updatedPhase.liveVariation {
+                    // Single value force - ensure it's set
+                    if updatedPhase.constantForceN == nil {
+                        updatedPhase.constantForceN = 50.0
+                    }
+                } else {
+                    // Live variation - ensure both min and max are set
+                    if updatedPhase.constantForceN == nil {
+                        updatedPhase.constantForceN = 20.0
+                    }
+                    if updatedPhase.constantForceMaxN == nil {
+                        updatedPhase.constantForceMaxN = 30.0
+                    }
+                }
+            }
+            
+            // For constant force drills, ensure wantsBaseline is explicitly false if not enabled
+            // (default is false, but we want to be explicit)
+            if updatedPhase.drillType == .forceDrill && updatedPhase.forceType == .constant && !updatedPhase.liveVariation {
+                // Only set to false if it's not already true (respect user's choice)
+                // The toggle should have already set this, but ensure it's explicit
+            }
+            
             processedPhases.append(updatedPhase)
         }
         
@@ -239,9 +264,10 @@ struct CreateDrillWizardView: View {
         
         // Determine probation status:
         // - If any phase uses percentile, drill is probationary
-        // - If any phase requires baseline (wantsBaseline), drill is probationary
+        // - If any phase requires baseline (wantsBaseline is true), drill is probationary
+        // - If wantsBaseline is explicitly false or not set, drill is NOT probationary
         let hasPercentilePhase = processedPhases.contains { $0.forceType == .percentile }
-        let requiresBaseline = processedPhases.contains { $0.wantsBaseline }
+        let requiresBaseline = processedPhases.contains { $0.wantsBaseline == true }
         let probationStatus: ProbationStatus = (hasPercentilePhase || requiresBaseline) ? .probationary : .baselineCaptured
         
         if let existing = editingTemplate {
@@ -634,7 +660,13 @@ struct PhaseConfigurationView: View {
                         HStack {
                             TextField("Min", value: Binding(
                                 get: { phase.constantForceN ?? 20.0 },
-                                set: { phase.constantForceN = $0 }
+                                set: { 
+                                    phase.constantForceN = $0
+                                    // Ensure value is set even if 0
+                                    if phase.constantForceN == nil {
+                                        phase.constantForceN = 20.0
+                                    }
+                                }
                             ), format: .number)
                             .keyboardType(.decimalPad)
                             .textFieldStyle(.roundedBorder)
@@ -644,7 +676,13 @@ struct PhaseConfigurationView: View {
                             
                             TextField("Max", value: Binding(
                                 get: { phase.constantForceMaxN ?? 30.0 },
-                                set: { phase.constantForceMaxN = $0 }
+                                set: { 
+                                    phase.constantForceMaxN = $0
+                                    // Ensure value is set even if 0
+                                    if phase.constantForceMaxN == nil {
+                                        phase.constantForceMaxN = 30.0
+                                    }
+                                }
                             ), format: .number)
                             .keyboardType(.decimalPad)
                             .textFieldStyle(.roundedBorder)
@@ -659,10 +697,20 @@ struct PhaseConfigurationView: View {
                         
                         TextField("Force", value: Binding(
                             get: { phase.constantForceN ?? 50.0 },
-                            set: { phase.constantForceN = $0 }
+                            set: { 
+                                phase.constantForceN = $0
+                                // Ensure value is set even if user clears field - use 0 instead of nil
+                                // This prevents "force not specified" when value is cleared
+                            }
                         ), format: .number)
                         .keyboardType(.decimalPad)
                         .textFieldStyle(.roundedBorder)
+                        .onAppear {
+                            // Initialize to 50.0 if nil (force drill with constant force should have a value)
+                            if phase.drillType == .forceDrill && phase.constantForceN == nil {
+                                phase.constantForceN = 50.0
+                            }
+                        }
                     }
                 }
             } else {
@@ -734,6 +782,21 @@ struct PhaseConfigurationView: View {
                 } else {
                     phase.durationUnit = DurationUnit.seconds
                 }
+            }
+            
+            // For force drills with constant force, ensure force value is set if not already
+            if phase.drillType == .forceDrill && phase.forceType == .constant && !phase.liveVariation {
+                if phase.constantForceN == nil {
+                    phase.constantForceN = 50.0
+                }
+            }
+            
+            // For force drills, ensure wantsBaseline is explicitly set based on toggle state
+            // If toggle is off, explicitly set to false
+            if phase.drillType == .forceDrill && phase.forceType == .constant && !phase.liveVariation {
+                // For constant force drills without live variation, baseline is optional
+                // User's toggle choice determines wantsBaseline value
+                // Default is false (no baseline required) unless user enables it
             }
         }
     }

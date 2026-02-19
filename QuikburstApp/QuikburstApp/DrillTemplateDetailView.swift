@@ -403,6 +403,7 @@ struct PhaseDetailCard: View {
             PropertyRow(label: "Force Type", value: phase.forceType == .constant ? "Constant" : "Percentile")
             
             if phase.forceType == .constant {
+                // Phase should have constantForceN from effectivePhases conversion (legacy or new)
                 if let force = phase.constantForceN {
                     PropertyRow(label: "Force", value: String(format: "%.1f N", force))
                 } else {

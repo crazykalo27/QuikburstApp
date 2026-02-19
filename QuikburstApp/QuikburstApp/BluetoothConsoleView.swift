@@ -107,9 +107,9 @@ struct BluetoothConsoleView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             HStack(spacing: 6) {
                                 Circle()
-                                    .fill(.green)
+                                    .fill(connectionStatusColor)
                                     .frame(width: 8, height: 8)
-                                Text("Connected")
+                                Text(connectionStatusText)
                                     .font(.headline)
                             }
                             Text(connected.name)
@@ -118,6 +118,13 @@ struct BluetoothConsoleView: View {
                             Text("Signal: \(connected.rssi) dBm")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                            // Show live streaming status if available
+                            if bluetooth.isLiveStreaming {
+                                Text("Live Streaming")
+                                    .font(.caption)
+                                    .foregroundStyle(.blue)
+                                    .padding(.top, 2)
+                            }
                         }
                         Spacer()
                         Button("Disconnect", role: .destructive, action: bluetooth.disconnect)
@@ -190,6 +197,14 @@ struct BluetoothConsoleView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     
+                    Button {
+                        copyLogsToClipboard()
+                    } label: {
+                        Label("Copy Log", systemImage: "doc.on.doc")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    
                     Spacer()
                     
                     if let error = bluetooth.lastError {
@@ -216,6 +231,11 @@ struct BluetoothConsoleView: View {
         }
     }
     
+    private func copyLogsToClipboard() {
+        let combinedLogs = (bluetooth.txLog.map { "→ \($0)" } + bluetooth.rxLog.map { "← \($0)" }).joined(separator: "\n")
+        UIPasteboard.general.string = combinedLogs
+    }
+    
     private var stateText: String {
         switch bluetooth.bluetoothState {
         case .poweredOn: return "On"
@@ -233,6 +253,24 @@ struct BluetoothConsoleView: View {
         case .poweredOn: return .green
         case .poweredOff, .unauthorized, .unsupported: return .red
         default: return .orange
+        }
+    }
+    
+    private var connectionStatusColor: Color {
+        switch bluetooth.connectionState {
+        case .connected: return .green
+        case .disconnected: return .red
+        case .connecting: return .orange
+        case .disconnecting: return .orange
+        }
+    }
+    
+    private var connectionStatusText: String {
+        switch bluetooth.connectionState {
+        case .connected: return "Connected"
+        case .disconnected: return "Disconnected"
+        case .connecting: return "Connecting..."
+        case .disconnecting: return "Disconnecting..."
         }
     }
 }
