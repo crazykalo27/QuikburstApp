@@ -376,19 +376,35 @@ def main():
     args = parser.parse_args()
 
     port = args.port or find_serial_port()
-    if not port:
-        print("No serial port found. Specify: python motor_encoder_current_vis.py /dev/cu.usbserial-xxx")
-        sys.exit(1)
 
     if args.duration is None or args.pwm is None or args.direction is None:
+        # Interactive mode: ask for port first (before duration)
+        if sys.platform == "win32":
+            default = port or "COM4"
+            port = input(f"COM port [{default}]: ").strip() or default
+        else:
+            default = port or "/dev/cu.usbserial-0001"
+            port = input(f"Serial port [{default}]: ").strip() or default
+
+        if not port:
+            print("No port specified.")
+            sys.exit(1)
+
         print(f"Using port: {port}")
         duration = int(input("Duration (1-10 sec): ") or "5")
         pwm_duty = int(input("PWM (0-100): ") or "50")
         direction = (input("Direction (F/B): ") or "F").upper()[0]
     else:
+        if not port:
+            print("No serial port found. Specify port: python motor_encoder_current_vis.py COM4 5 50 F")
+            sys.exit(1)
         duration = min(max(args.duration, 1), 10)
         pwm_duty = min(max(args.pwm, 0), 100)
         direction = args.direction.upper()[0]
+
+    if not port:
+        print("No port specified.")
+        sys.exit(1)
 
     print("=" * 60)
     print("Motor + Encoder + Current (Serial)")
