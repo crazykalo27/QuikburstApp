@@ -206,15 +206,13 @@ def parse_float_safe(s: str, default: float = 0.0) -> Optional[float]:
         return None
 
 
-def validate_current_params(duration: int, current_a: float, kp: float, ki: float, kd: float, direction: str) -> Optional[str]:
+def validate_current_params(duration: int, current_a: float, kp: float, ki: float, kd: float) -> Optional[str]:
     if duration == 0:
         return None
     if duration < 0 or duration > DURATION_MAX_CURRENT:
         return f"Duration must be 0-{DURATION_MAX_CURRENT} sec"
     if current_a < 0:
         return "Current must be >= 0"
-    if direction not in ("F", "B"):
-        return "Direction must be F or B"
     # Gains can be any float for now (supporting WIP controller)
     if any(np.isnan(x) for x in (kp, ki, kd, current_a)):
         return "Invalid numeric value"
@@ -584,22 +582,21 @@ def main():
                     continue
                 break
 
-            # CURRENT control (support only)
+            # CURRENT control (support only) — direction is determined by controller sign
             d = parse_int_safe(input(f"Duration (0-{DURATION_MAX_CURRENT} sec) [0=skip]: "), 0)
             cur = parse_float_safe(input("Current setpoint (A) [0 allowed]: "), 0.0)
             kp_ = parse_float_safe(input("Kp [0]: "), 0.0)
             ki_ = parse_float_safe(input("Ki [0]: "), 0.0)
             kd_ = parse_float_safe(input("Kd [0]: "), 0.0)
-            dir_in = (input("Direction (F/B) [F]: ").strip().upper() or "F")[:1]
             if d is None or cur is None or kp_ is None or ki_ is None or kd_ is None:
                 print("Invalid input. Enter numbers only.")
                 continue
-            err = validate_current_params(d, cur, kp_, ki_, kd_, dir_in)
+            err = validate_current_params(d, cur, kp_, ki_, kd_)
             if err:
                 print(f"  {err}")
                 continue
             duration, current_a, kp, ki, kd = d, float(cur), float(kp_), float(ki_), float(kd_)
-            direction = dir_in if dir_in in ("F", "B") else "F"
+            direction = "F"  # placeholder; firmware switches direction based on error sign
             if duration == 0:
                 print("Skipped (duration=0).")
                 continue
@@ -636,7 +633,9 @@ def main():
     else:
         print(f"  Current:  {current_a:.3f} A")
         print(f"  PID:      Kp={kp:.3f}, Ki={ki:.3f}, Kd={kd:.3f}")
-    print(f"  Dir:      {direction}")
+        print("  Dir:      auto (by error sign)")
+    if mode == "DRILL":
+        print(f"  Dir:      {direction}")
     print()
 
     print(f"Connecting to {port}...")
@@ -727,16 +726,15 @@ def main():
                 kp_ = parse_float_safe(input("Kp [0]: "), 0.0)
                 ki_ = parse_float_safe(input("Ki [0]: "), 0.0)
                 kd_ = parse_float_safe(input("Kd [0]: "), 0.0)
-                dir_in = (input("Direction (F/B) [F]: ").strip().upper() or "F")[:1]
                 if d is None or cur is None or kp_ is None or ki_ is None or kd_ is None:
                     print("Invalid input. Enter numbers only.")
                     continue
-                err = validate_current_params(d, cur, kp_, ki_, kd_, dir_in)
+                err = validate_current_params(d, cur, kp_, ki_, kd_)
                 if err:
                     print(f"  {err}")
                     continue
                 duration, current_a, kp, ki, kd = d, float(cur), float(kp_), float(ki_), float(kd_)
-                direction = dir_in if dir_in in ("F", "B") else "F"
+                direction = "F"  # placeholder; firmware switches direction based on error sign
                 if duration == 0:
                     print("Skipped (duration=0).")
                     continue
