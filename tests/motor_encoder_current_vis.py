@@ -64,6 +64,7 @@ class DrillDataCollector:
         self.currents      = []
         self.errors        = []
         self.cmd_duty_pcts = []
+        self.cmd_pwms      = []
         self.dir_signs     = []
 
         self.ready_event   = False
@@ -117,7 +118,7 @@ class DrillDataCollector:
         print(f"  [ESP32] {line}")
 
     def _parse_data_line(self, line: str):
-        """Parse: DATA,index,time_ms,position_m,velocity_mps,accel_mps2,current_A[,error_A,cmd_duty_pct,dir_sign]"""
+        """Parse: DATA,index,time_ms,position_m,velocity_mps,accel_mps2,current_A[,error_A,cmd_duty_pct,cmd_pwm,dir_sign]"""
         parts = line.split(",")
         if len(parts) < 7:
             self.parse_errors += 1
@@ -132,7 +133,13 @@ class DrillDataCollector:
             cur   = float(parts[6])
             err_a = float(parts[7]) if len(parts) > 7 else 0.0
             cmd_d = float(parts[8]) if len(parts) > 8 else 0.0
-            dsgn  = int(parts[9]) if len(parts) > 9 else 0
+            # New format: ...,cmd_duty_pct,cmd_pwm,dir_sign (11 parts); old: ...,cmd_duty_pct,dir_sign (10 parts)
+            if len(parts) >= 11:
+                cmd_p = int(parts[9])
+                dsgn  = int(parts[10])
+            else:
+                cmd_p = 0
+                dsgn  = int(parts[9]) if len(parts) > 9 else 0
         except ValueError:
             self.parse_errors += 1
             return
@@ -145,6 +152,7 @@ class DrillDataCollector:
         self.currents.append(cur)
         self.errors.append(err_a)
         self.cmd_duty_pcts.append(cmd_d)
+        self.cmd_pwms.append(cmd_p)
         self.dir_signs.append(dsgn)
         self.data_count += 1
 
@@ -163,6 +171,7 @@ class DrillDataCollector:
             "current_A":    np.array(self.currents, dtype=np.float64),
             "error_A":      np.array(self.errors, dtype=np.float64),
             "cmd_duty_pct": np.array(self.cmd_duty_pcts, dtype=np.float64),
+            "cmd_pwm":      np.array(self.cmd_pwms, dtype=np.int32),
             "dir_sign":     np.array(self.dir_signs, dtype=np.int8),
         }
 
@@ -438,7 +447,8 @@ def print_summary(data: dict, duration_s: int):
 def save_csv(data: dict, filepath: str):
     """Save drill data to CSV (from newEncoderVis, with current column)."""
     n = len(data["index"])
-    header = "index,time_ms,time_s,position_m,velocity_mps,accel_mps2,current_A,error_A,cmd_duty_pct,dir_sign"
+    header = "index,time_ms,time_s,position_m,velocity_mps,accel_mps2,current_A,error_A,cmd_duty_pct,cmd_pwm,dir_sign"
+    cmd_pwm = data.get("cmd_pwm", np.zeros(n, dtype=np.int32))
 
     rows = np.column_stack([
         data["index"],
@@ -450,6 +460,7 @@ def save_csv(data: dict, filepath: str):
         data["current_A"],
         data["error_A"],
         data["cmd_duty_pct"],
+        cmd_pwm,
         data["dir_sign"],
     ])
 
@@ -459,7 +470,7 @@ def save_csv(data: dict, filepath: str):
         delimiter=",",
         header=header,
         comments="",
-        fmt=["%d", "%d", "%.4f", "%.6f", "%.5f", "%.4f", "%.4f", "%.4f", "%.2f", "%d"]
+        fmt=["%d", "%d", "%.4f", "%.6f", "%.5f", "%.4f", "%.4f", "%.4f", "%.2f", "%d", "%d"]
     )
     print(f"\n  Saved: {filepath} ({n} rows)")
 
@@ -468,8 +479,8 @@ def save_csv(data: dict, filepath: str):
 # GRAPHS (same style as encoder data — position, velocity, accel, current)
 # ============================================================================
 
-def plot_results(data: dict, duration_s: int, pwm_duty: int, direction: str):
-    """Subplots: position, velocity, acceleration, current, error, cmd duty (1s pre, run, 1s post)."""
+def plot_results(data: dict, duration_s: int, pwm_duty: int, direction: str, mode: str = "DRILL", current_a: float = 0.0):
+    """Subplots: position, velocity, acceleration, current, error, cmd duty + PWM (1s pre, run, 1s post)."""
     t   = data["time_s"]
     pos = data["position_m"]
     vel = data["velocity_mps"]
@@ -477,6 +488,7 @@ def plot_results(data: dict, duration_s: int, pwm_duty: int, direction: str):
     cur = data["current_A"]
     err = data.get("error_A", np.zeros_like(t))
     cmd = data.get("cmd_duty_pct", np.zeros_like(t))
+    cmd_pwm = data.get("cmd_pwm", np.zeros_like(t, dtype=np.int32))
     dsgn = data.get("dir_sign", np.zeros_like(t))
 
     # Average current during motor-on phase (for power consumption)
@@ -486,7 +498,10 @@ def plot_results(data: dict, duration_s: int, pwm_duty: int, direction: str):
     avg_current_drill = np.mean(np.abs(cur[mask])) if np.any(mask) else 0.0
 
     fig, axes = plt.subplots(6, 1, sharex=True, figsize=(10, 13))
-    fig.suptitle(f"Drill: {duration_s}s, PWM={pwm_duty}%, {direction} (1s pre/post)")
+    if mode == "CURRENT":
+        fig.suptitle(f"Current control: {duration_s}s, I={current_a:.3f}A (1s pre/post)")
+    else:
+        fig.suptitle(f"Drill: {duration_s}s, PWM={pwm_duty}%, {direction} (1s pre/post)")
 
     for ax in axes:
         ax.axvspan(drill_start, drill_end, alpha=0.15, color="gray", label="motor on")
@@ -515,10 +530,16 @@ def plot_results(data: dict, duration_s: int, pwm_duty: int, direction: str):
     axes[4].set_ylabel("Error (A)")
     axes[4].set_title("Current error (setpoint - measured)")
 
-    axes[5].plot(t, cmd, "c-", linewidth=1.2)
-    axes[5].set_ylabel("Cmd duty (%)")
-    axes[5].set_xlabel("Time (s)")
-    axes[5].set_title("Commanded duty (clamped)")
+    ax5 = axes[5]
+    ax5.plot(t, cmd, "c-", linewidth=1.2, label="cmd_duty_pct (%)")
+    ax5.set_ylabel("Cmd duty (%)", color="c")
+    ax5.tick_params(axis="y", labelcolor="c")
+    ax5_r = ax5.twinx()
+    ax5_r.plot(t, cmd_pwm, "brown", linewidth=1.0, alpha=0.8, label="cmd_pwm (0-1023)")
+    ax5_r.set_ylabel("cmd_pwm (0-1023)", color="brown")
+    ax5_r.tick_params(axis="y", labelcolor="brown")
+    ax5.set_xlabel("Time (s)")
+    ax5.set_title("Commanded duty % and actual PWM sent to motor")
 
     plt.tight_layout()
     plt.show()
@@ -690,7 +711,7 @@ def main():
 
             # Show graph every time (blocks until window closed)
             if not args.no_plot:
-                plot_results(data, duration, pwm_duty if mode == "DRILL" else 0, direction)
+                plot_results(data, duration, pwm_duty if mode == "DRILL" else 0, direction, mode, current_a)
 
             again = input("\nRun another run? (y/n): ").strip().lower()
             if again in ("n", "q", "no", "quit"):

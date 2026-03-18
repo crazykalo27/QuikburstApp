@@ -10,7 +10,7 @@
  *   dir: F (forward) or B (backward)
  *   pwm: 0-100%
  *
- * Output: DATA,index,time_ms,position_m,velocity_mps,accel_mps2,current_A,error_A,cmd_duty_pct,dir_sign
+ * Output: DATA,index,time_ms,position_m,velocity_mps,accel_mps2,current_A,error_A,cmd_duty_pct,cmd_pwm,dir_sign
  */
 
 #include "driver/pcnt.h"
@@ -106,6 +106,7 @@ struct RawSample {
     float    current_A;
     float    error_A;
     float    cmd_duty_pct;
+    int      cmd_pwm;   // actual PWM (0-1023) sent to motor
     int8_t   dir_sign;  // +1 forward, -1 backward
 };
 
@@ -117,6 +118,7 @@ struct ProcessedSample {
     float current_A;
     float error_A;
     float cmd_duty_pct;
+    int   cmd_pwm;
     int8_t dir_sign;
 };
 
@@ -596,6 +598,7 @@ static bool processData() {
         g_processed[i].current_A    = g_rawSamples[i].current_A;
         g_processed[i].error_A      = g_rawSamples[i].error_A;
         g_processed[i].cmd_duty_pct = g_rawSamples[i].cmd_duty_pct;
+        g_processed[i].cmd_pwm      = g_rawSamples[i].cmd_pwm;
         g_processed[i].dir_sign     = g_rawSamples[i].dir_sign;
     }
     g_rawSamples.clear();
@@ -682,6 +685,7 @@ void loop() {
                 s.current_A    = readCurrentAmps();
                 s.error_A      = 0.0f;
                 s.cmd_duty_pct = (float)g_pwm_duty;
+                s.cmd_pwm      = dutyToPwm(g_pwm_duty);
                 s.dir_sign     = (g_direction == Direction::DIR_FORWARD) ? 1 : -1;
                 g_rawSamples.push_back(s);
                 g_nextSampleUs += SAMPLE_INTERVAL_US;
@@ -715,7 +719,7 @@ void loop() {
 
                 // Hard safety clamp (never exceed 10%)
                 if (cmd_duty_pct > PWM_MAX_CURRENT_CONTROL_SAFE) cmd_duty_pct = PWM_MAX_CURRENT_CONTROL_SAFE;
-                if (g_des_current_A == 0.0f) cmd_duty_pct = 0.0f;  // extra-safe: 0A setpoint => no drive
+                // 0A setpoint: use error to cancel back current (e.g. back-EMF when pulling out)
 
                 // Convert duty percent to inverted motor PWM (0-1023) and drive with chosen direction
                 int pwm = dutyToPwm((int)(cmd_duty_pct + 0.5f));
@@ -741,11 +745,11 @@ void loop() {
                 int8_t dir_sign = (cmd_duty_pct >= 0.0f) ? 1 : -1;
                 if (cmd_duty_pct < 0.0f) cmd_duty_pct = -cmd_duty_pct;
                 if (cmd_duty_pct > PWM_MAX_CURRENT_CONTROL_SAFE) cmd_duty_pct = PWM_MAX_CURRENT_CONTROL_SAFE;
-                if (g_des_current_A == 0.0f) cmd_duty_pct = 0.0f;
 
                 s.current_A    = current;
                 s.error_A      = error;
                 s.cmd_duty_pct = cmd_duty_pct;
+                s.cmd_pwm      = (cmd_duty_pct <= 0.0f) ? 0 : dutyToPwm((int)(cmd_duty_pct + 0.5f));
                 s.dir_sign     = dir_sign;
                 g_rawSamples.push_back(s);
                 g_nextSampleUs += SAMPLE_INTERVAL_US;
@@ -772,11 +776,11 @@ void loop() {
                 const ProcessedSample& s = g_processed[g_sendIndex];
                 uint32_t time_ms = (uint32_t)(s.time_s * 1000.0f + 0.5f);
                 char buf[220];
-                // DATA,index,time_ms,position_m,velocity_mps,accel_mps2,current_A,error_A,cmd_duty_pct,dir_sign
-                snprintf(buf, sizeof(buf), "DATA,%u,%u,%.5f,%.4f,%.3f,%.4f,%.4f,%.2f,%d\n",
+                // DATA,index,time_ms,position_m,velocity_mps,accel_mps2,current_A,error_A,cmd_duty_pct,cmd_pwm,dir_sign
+                snprintf(buf, sizeof(buf), "DATA,%u,%u,%.5f,%.4f,%.3f,%.4f,%.4f,%.2f,%d,%d\n",
                     (unsigned)g_sendIndex, time_ms,
                     s.position_m, s.velocity_mps, s.accel_mps2, s.current_A,
-                    s.error_A, s.cmd_duty_pct, (int)s.dir_sign);
+                    s.error_A, s.cmd_duty_pct, s.cmd_pwm, (int)s.dir_sign);
                 serialSend(buf);
                 g_sendIndex++;
                 delay(12);
