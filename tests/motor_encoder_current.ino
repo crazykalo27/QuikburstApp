@@ -74,7 +74,6 @@ static constexpr uint16_t PCNT_FILTER_VAL     = 100;
 #define VREF 3.3
 #define SENSITIVITY_MV_PER_A 66.0
 #define DIVIDER_RATIO 2.0
-#define CURRENT_SENSOR_OUTPUT_DIVIDER 2.0  // 2:1 divider at sensor output; ADC reads 1/2 of sensor output
 #define CURRENT_SAMPLES 8
 
 // ============================================================================
@@ -85,6 +84,7 @@ enum class State : uint8_t {
     IDLE,
     ARMED,
     RUNNING,
+    CURRENT_CONTROL,
     PROCESSING,
     SENDING
 };
@@ -140,6 +140,11 @@ static uint32_t g_lastReadyMs = 0;
 float overrideZeroMV = -1.0;
 bool lastButtonState = true;
 
+// Current PID control
+float c_kp = 1.0f;
+float c_ki = 0.0f;
+float c_kd = 0.0f;
+
 // ============================================================================
 // PCNT ISR (from newEncoderread)
 // ============================================================================
@@ -183,7 +188,7 @@ void setMotorBackward(int pwm) {
     ledcWriteChannel(PWM_CHANNEL_2, 1023);
 }
 
-static int dutyToPwm(int duty) {
+static int dutyToPwm(int duty) { //KALLEN MAKE THIS TAKE FLOATS AS WELL
     duty = constrain(duty, 0, 100);
     return map(100 - duty, 0, 100, 0, 1023);
 }
@@ -198,8 +203,7 @@ static float readCurrentAmps() {
         sum += analogRead(CURRENT_SENSOR_PIN);
         delayMicroseconds(100);
     }
-    float adcMV = ((sum / (float)CURRENT_SAMPLES) / ADC_MAX) * VREF * 1000.0f;
-    float sensorMV = adcMV * CURRENT_SENSOR_OUTPUT_DIVIDER;  // 2:1 divider: actual = adc * 2
+    float sensorMV = ((sum / (float)CURRENT_SAMPLES) / ADC_MAX) * VREF * 1000.0f;
 
     float supplyDivider = 0;
     for (int i = 0; i < 4; i++) {
@@ -207,7 +211,7 @@ static float readCurrentAmps() {
         delayMicroseconds(50);
     }
     float supplyV = ((supplyDivider / 4.0f) / ADC_MAX) * VREF * DIVIDER_RATIO;
-    float zeroMV = (overrideZeroMV >= 0) ? (overrideZeroMV * CURRENT_SENSOR_OUTPUT_DIVIDER) : (supplyV * 1000.0f) / 2.0f;
+    float zeroMV = (overrideZeroMV >= 0) ? overrideZeroMV : (supplyV * 1000.0f) / 2.0f;
     return (sensorMV - zeroMV) / SENSITIVITY_MV_PER_A;
 }
 
@@ -219,7 +223,7 @@ static void checkZeroOverride() {
             sum += analogRead(CURRENT_SENSOR_PIN);
             delayMicroseconds(200);
         }
-        overrideZeroMV = ((sum / 16.0f) / ADC_MAX) * VREF * 1000.0f;  // Store ADC reading (pre-divider)
+        overrideZeroMV = ((sum / 16.0f) / ADC_MAX) * VREF * 1000.0f;
         Serial.print(">>> ZERO OVERRIDE: ");
         Serial.print(overrideZeroMV, 1);
         Serial.println(" mV <<<");
@@ -578,6 +582,50 @@ void loop() {
                 setMotorIdle();
             }
 
+            if ((int32_t)(nowUs - g_nextSampleUs) >= 0) {
+                RawSample s;
+                s.timestamp_us = nowUs;
+                s.count        = readEncoderCount();
+                s.current_A    = readCurrentAmps();
+                g_rawSamples.push_back(s);
+                g_nextSampleUs += SAMPLE_INTERVAL_US;
+                if ((int32_t)(nowUs - g_nextSampleUs) > (int32_t)(2 * SAMPLE_INTERVAL_US))
+                    g_nextSampleUs = nowUs + SAMPLE_INTERVAL_US;
+            }
+            break;
+        }
+
+        case State::CURRENT_CONTROL: {
+            if (nowUs >= g_drillEndUs) {
+                setMotorIdle();
+                g_state = State::PROCESSING;
+                serialSend("DONE\n");
+                break;
+            }
+
+            pollSerialCommands();
+
+            // Motor idle during pre and post phases; run only during drill phase
+            if (nowUs >= g_motorStartUs && nowUs < g_motorEndUs) {
+                float current = readCurrentAmps();
+                float error = g_des_current_A - current;  // KALLEN port this in, we also need to port in the duration and make it be able to be 20 sec
+                float cmd_duty = c_kp*error;
+                bool forward = true; //this is to decide direction based on error sign (+ = F, - = B)
+                if (cmd_duty < 0) { //retard code
+                    forward = false;
+                    cmd_duty = -cmd_duty;
+                }
+                int pwm = dutyToPwm(cmd_duty);
+                //set motor direction and pwm based on current error
+                if (g_direction == Direction::DIR_FORWARD)
+                    setMotorForward(pwm);
+                else
+                    setMotorBackward(pwm);
+            } else {
+                setMotorIdle();
+            }
+
+            // read data to report at the end of control period
             if ((int32_t)(nowUs - g_nextSampleUs) >= 0) {
                 RawSample s;
                 s.timestamp_us = nowUs;
