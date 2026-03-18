@@ -42,6 +42,7 @@ POST_DRILL_SEC = 1
 PWM_MAX = 25
 DURATION_MIN = 1
 DURATION_MAX = 10
+DURATION_MAX_CURRENT = 20
 
 
 # ============================================================================
@@ -61,6 +62,9 @@ class DrillDataCollector:
         self.velocities    = []
         self.accelerations = []
         self.currents      = []
+        self.errors        = []
+        self.cmd_duty_pcts = []
+        self.dir_signs     = []
 
         self.ready_event   = False
         self.running_event = False
@@ -113,9 +117,9 @@ class DrillDataCollector:
         print(f"  [ESP32] {line}")
 
     def _parse_data_line(self, line: str):
-        """Parse: DATA,index,time_ms,position_m,velocity_mps,accel_mps2,current_A"""
+        """Parse: DATA,index,time_ms,position_m,velocity_mps,accel_mps2,current_A[,error_A,cmd_duty_pct,dir_sign]"""
         parts = line.split(",")
-        if len(parts) != 7:
+        if len(parts) < 7:
             self.parse_errors += 1
             return
 
@@ -126,6 +130,9 @@ class DrillDataCollector:
             vel   = float(parts[4])
             acc   = float(parts[5])
             cur   = float(parts[6])
+            err_a = float(parts[7]) if len(parts) > 7 else 0.0
+            cmd_d = float(parts[8]) if len(parts) > 8 else 0.0
+            dsgn  = int(parts[9]) if len(parts) > 9 else 0
         except ValueError:
             self.parse_errors += 1
             return
@@ -136,6 +143,9 @@ class DrillDataCollector:
         self.velocities.append(vel)
         self.accelerations.append(acc)
         self.currents.append(cur)
+        self.errors.append(err_a)
+        self.cmd_duty_pcts.append(cmd_d)
+        self.dir_signs.append(dsgn)
         self.data_count += 1
 
         if self.data_count % 100 == 0:
@@ -151,6 +161,9 @@ class DrillDataCollector:
             "velocity_mps": np.array(self.velocities, dtype=np.float64),
             "accel_mps2":   np.array(self.accelerations, dtype=np.float64),
             "current_A":    np.array(self.currents, dtype=np.float64),
+            "error_A":      np.array(self.errors, dtype=np.float64),
+            "cmd_duty_pct": np.array(self.cmd_duty_pcts, dtype=np.float64),
+            "dir_sign":     np.array(self.dir_signs, dtype=np.int8),
         }
 
 
@@ -196,8 +209,8 @@ def parse_float_safe(s: str, default: float = 0.0) -> Optional[float]:
 def validate_current_params(duration: int, current_a: float, kp: float, ki: float, kd: float, direction: str) -> Optional[str]:
     if duration == 0 or current_a == 0.0:
         return None
-    if duration < DURATION_MIN or duration > DURATION_MAX:
-        return f"Duration must be {DURATION_MIN}-{DURATION_MAX} sec"
+    if duration < 0 or duration > DURATION_MAX_CURRENT:
+        return f"Duration must be 0-{DURATION_MAX_CURRENT} sec"
     if current_a < 0:
         return "Current must be >= 0"
     if direction not in ("F", "B"):
@@ -427,7 +440,7 @@ def print_summary(data: dict, duration_s: int):
 def save_csv(data: dict, filepath: str):
     """Save drill data to CSV (from newEncoderVis, with current column)."""
     n = len(data["index"])
-    header = "index,time_ms,time_s,position_m,velocity_mps,accel_mps2,current_A"
+    header = "index,time_ms,time_s,position_m,velocity_mps,accel_mps2,current_A,error_A,cmd_duty_pct,dir_sign"
 
     rows = np.column_stack([
         data["index"],
@@ -437,6 +450,9 @@ def save_csv(data: dict, filepath: str):
         data["velocity_mps"],
         data["accel_mps2"],
         data["current_A"],
+        data["error_A"],
+        data["cmd_duty_pct"],
+        data["dir_sign"],
     ])
 
     np.savetxt(
@@ -445,7 +461,7 @@ def save_csv(data: dict, filepath: str):
         delimiter=",",
         header=header,
         comments="",
-        fmt=["%d", "%d", "%.4f", "%.6f", "%.5f", "%.4f", "%.4f"]
+        fmt=["%d", "%d", "%.4f", "%.6f", "%.5f", "%.4f", "%.4f", "%.4f", "%.2f", "%d"]
     )
     print(f"\n  Saved: {filepath} ({n} rows)")
 
@@ -455,12 +471,15 @@ def save_csv(data: dict, filepath: str):
 # ============================================================================
 
 def plot_results(data: dict, duration_s: int, pwm_duty: int, direction: str):
-    """Four subplots: position, velocity, acceleration, current (1s pre, drill, 1s post)."""
+    """Subplots: position, velocity, acceleration, current, error, cmd duty (1s pre, run, 1s post)."""
     t   = data["time_s"]
     pos = data["position_m"]
     vel = data["velocity_mps"]
     acc = data["accel_mps2"]
     cur = data["current_A"]
+    err = data.get("error_A", np.zeros_like(t))
+    cmd = data.get("cmd_duty_pct", np.zeros_like(t))
+    dsgn = data.get("dir_sign", np.zeros_like(t))
 
     # Average current during motor-on phase (for power consumption)
     drill_start = PRE_DRILL_SEC
@@ -468,7 +487,7 @@ def plot_results(data: dict, duration_s: int, pwm_duty: int, direction: str):
     mask = (t >= drill_start) & (t <= drill_end)
     avg_current_drill = np.mean(np.abs(cur[mask])) if np.any(mask) else 0.0
 
-    fig, axes = plt.subplots(4, 1, sharex=True, figsize=(10, 10))
+    fig, axes = plt.subplots(6, 1, sharex=True, figsize=(10, 13))
     fig.suptitle(f"Drill: {duration_s}s, PWM={pwm_duty}%, {direction} (1s pre/post)")
 
     for ax in axes:
@@ -491,9 +510,17 @@ def plot_results(data: dict, duration_s: int, pwm_duty: int, direction: str):
     axes[3].axhline(avg_current_drill, color="orange", linestyle="--", linewidth=1.5,
                     label=f"Avg (drill): {avg_current_drill:.3f} A")
     axes[3].set_ylabel("Current (A)")
-    axes[3].set_xlabel("Time (s)")
     axes[3].set_title("Current (1s baseline before/after)")
     axes[3].legend(loc="upper right", fontsize=8)
+
+    axes[4].plot(t, err, "k-", linewidth=1.2)
+    axes[4].set_ylabel("Error (A)")
+    axes[4].set_title("Current error (setpoint - measured)")
+
+    axes[5].plot(t, cmd, "c-", linewidth=1.2)
+    axes[5].set_ylabel("Cmd duty (%)")
+    axes[5].set_xlabel("Time (s)")
+    axes[5].set_title("Commanded duty (clamped)")
 
     plt.tight_layout()
     plt.show()

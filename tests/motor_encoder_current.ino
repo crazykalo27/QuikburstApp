@@ -10,7 +10,7 @@
  *   dir: F (forward) or B (backward)
  *   pwm: 0-100%
  *
- * Output: DATA,index,time_ms,position_m,velocity_mps,accel_mps2,current_A (same as encoder + current)
+ * Output: DATA,index,time_ms,position_m,velocity_mps,accel_mps2,current_A,error_A,cmd_duty_pct,dir_sign
  */
 
 #include "driver/pcnt.h"
@@ -50,6 +50,10 @@ static constexpr uint32_t SAMPLE_INTERVAL_US  = 1000000UL / SAMPLE_HZ;
 #define PWM_MAX_SAFE 25
 #define DURATION_MIN_SAFE 1
 #define DURATION_MAX_SAFE 10
+
+// Current-control safety limits (P-only testing)
+#define DURATION_MAX_CURRENT_SAFE 20
+#define PWM_MAX_CURRENT_CONTROL_SAFE 10  // hard cap: never exceed 10% duty in current-control mode
 
 // Pre/post drill: 1 second of current sampling before and after motor run
 static constexpr uint32_t PRE_DRILL_SEC       = 1;
@@ -100,6 +104,9 @@ struct RawSample {
     uint32_t timestamp_us;
     int32_t  count;
     float    current_A;
+    float    error_A;
+    float    cmd_duty_pct;
+    int8_t   dir_sign;  // +1 forward, -1 backward
 };
 
 struct ProcessedSample {
@@ -108,6 +115,9 @@ struct ProcessedSample {
     float velocity_mps;
     float accel_mps2;
     float current_A;
+    float error_A;
+    float cmd_duty_pct;
+    int8_t dir_sign;
 };
 
 // ============================================================================
@@ -285,16 +295,17 @@ static void processCommand(const String& cmd) {
         durStr.trim();
         g_drill_duration_s = durStr.toInt();
 
-        if (g_drill_duration_s < DURATION_MIN_SAFE || g_drill_duration_s > DURATION_MAX_SAFE) {
-            serialSendFormatted("ERROR,INVALID_DURATION_%d_%d,received:%s\n", DURATION_MIN_SAFE, DURATION_MAX_SAFE, cmd.c_str());
+        if (g_drill_duration_s < 0 || g_drill_duration_s > DURATION_MAX_CURRENT_SAFE) {
+            serialSendFormatted("ERROR,INVALID_DURATION_0_%d,received:%s\n", DURATION_MAX_CURRENT_SAFE, cmd.c_str());
             return;
         }
 
         String curStr = cmd.substring(c1 + 1, c2);
         curStr.trim();
         g_des_current_A = curStr.toFloat();
-        if (g_des_current_A <= 0.0f) {
-            serialSend("ERROR,CURRENT_MUST_BE_GT_0\n");
+        // Allow 0A setpoint for first safety test (motor will not drive)
+        if (g_des_current_A < 0.0f) {
+            serialSend("ERROR,CURRENT_MUST_BE_GTE_0\n");
             return;
         }
 
@@ -313,7 +324,7 @@ static void processCommand(const String& cmd) {
 
         g_useCurrentControl = true;
 
-        size_t totalSec = PRE_DRILL_SEC + g_drill_duration_s + POST_DRILL_SEC;
+        size_t totalSec = PRE_DRILL_SEC + (size_t)g_drill_duration_s + POST_DRILL_SEC;
         size_t expectedSamples = (size_t)totalSec * SAMPLE_HZ + 128;
         g_rawSamples.clear();
         g_processed.clear();
@@ -413,7 +424,7 @@ static void processCommand(const String& cmd) {
         g_countAtGo    = readEncoderCount();
         g_drillStartUs = micros();
         g_motorStartUs = g_drillStartUs + (PRE_DRILL_SEC * 1000000UL);
-        g_motorEndUs   = g_motorStartUs + (g_drill_duration_s * 1000000UL);
+        g_motorEndUs   = g_motorStartUs + ((uint32_t)g_drill_duration_s * 1000000UL);
         g_drillEndUs   = g_motorEndUs + (POST_DRILL_SEC * 1000000UL);
         g_nextSampleUs = g_drillStartUs;
         g_rawSamples.clear();
@@ -583,6 +594,9 @@ static bool processData() {
         g_processed[i].velocity_mps = vel[i];
         g_processed[i].accel_mps2   = acc[i];
         g_processed[i].current_A    = g_rawSamples[i].current_A;
+        g_processed[i].error_A      = g_rawSamples[i].error_A;
+        g_processed[i].cmd_duty_pct = g_rawSamples[i].cmd_duty_pct;
+        g_processed[i].dir_sign     = g_rawSamples[i].dir_sign;
     }
     g_rawSamples.clear();
     g_rawSamples.shrink_to_fit();
@@ -666,6 +680,9 @@ void loop() {
                 s.timestamp_us = nowUs;
                 s.count        = readEncoderCount();
                 s.current_A    = readCurrentAmps();
+                s.error_A      = 0.0f;
+                s.cmd_duty_pct = (float)g_pwm_duty;
+                s.dir_sign     = (g_direction == Direction::DIR_FORWARD) ? 1 : -1;
                 g_rawSamples.push_back(s);
                 g_nextSampleUs += SAMPLE_INTERVAL_US;
                 if ((int32_t)(nowUs - g_nextSampleUs) > (int32_t)(2 * SAMPLE_INTERVAL_US))
@@ -687,19 +704,28 @@ void loop() {
             // Motor idle during pre and post phases; run only during drill phase
             if (nowUs >= g_motorStartUs && nowUs < g_motorEndUs) {
                 float current = readCurrentAmps();
-                float error = g_des_current_A - current;  // KALLEN port this in, we also need to port in the duration and make it be able to be 20 sec
-                float cmd_duty = c_kp*error;
-                bool forward = true; //this is to decide direction based on error sign (+ = F, - = B)
-                if (cmd_duty < 0) { //retard code
-                    forward = false;
-                    cmd_duty = -cmd_duty;
-                }
-                int pwm = dutyToPwm(cmd_duty);
-                //set motor direction and pwm based on current error
-                if (g_direction == Direction::DIR_FORWARD)
+                float error = g_des_current_A - current;
+
+                // P-only controller output interpreted as duty percent
+                float cmd_duty_pct = c_kp * error;
+
+                // Direction chosen by sign of cmd (reversing mid-run is handled)
+                bool forward = (cmd_duty_pct >= 0.0f);
+                if (cmd_duty_pct < 0.0f) cmd_duty_pct = -cmd_duty_pct;
+
+                // Hard safety clamp (never exceed 10%)
+                if (cmd_duty_pct > PWM_MAX_CURRENT_CONTROL_SAFE) cmd_duty_pct = PWM_MAX_CURRENT_CONTROL_SAFE;
+                if (g_des_current_A == 0.0f) cmd_duty_pct = 0.0f;  // extra-safe: 0A setpoint => no drive
+
+                // Convert duty percent to inverted motor PWM (0-1023) and drive with chosen direction
+                int pwm = dutyToPwm((int)(cmd_duty_pct + 0.5f));
+                if (cmd_duty_pct <= 0.0f) {
+                    setMotorIdle();
+                } else if (forward) {
                     setMotorForward(pwm);
-                else
+                } else {
                     setMotorBackward(pwm);
+                }
             } else {
                 setMotorIdle();
             }
@@ -709,7 +735,18 @@ void loop() {
                 RawSample s;
                 s.timestamp_us = nowUs;
                 s.count        = readEncoderCount();
-                s.current_A    = readCurrentAmps();
+                float current = readCurrentAmps();
+                float error = g_des_current_A - current;
+                float cmd_duty_pct = c_kp * error;
+                int8_t dir_sign = (cmd_duty_pct >= 0.0f) ? 1 : -1;
+                if (cmd_duty_pct < 0.0f) cmd_duty_pct = -cmd_duty_pct;
+                if (cmd_duty_pct > PWM_MAX_CURRENT_CONTROL_SAFE) cmd_duty_pct = PWM_MAX_CURRENT_CONTROL_SAFE;
+                if (g_des_current_A == 0.0f) cmd_duty_pct = 0.0f;
+
+                s.current_A    = current;
+                s.error_A      = error;
+                s.cmd_duty_pct = cmd_duty_pct;
+                s.dir_sign     = dir_sign;
                 g_rawSamples.push_back(s);
                 g_nextSampleUs += SAMPLE_INTERVAL_US;
                 if ((int32_t)(nowUs - g_nextSampleUs) > (int32_t)(2 * SAMPLE_INTERVAL_US))
@@ -734,10 +771,12 @@ void loop() {
             if (g_sendIndex < g_processed.size()) {
                 const ProcessedSample& s = g_processed[g_sendIndex];
                 uint32_t time_ms = (uint32_t)(s.time_s * 1000.0f + 0.5f);
-                char buf[160];
-                snprintf(buf, sizeof(buf), "DATA,%u,%u,%.5f,%.4f,%.3f,%.4f\n",
+                char buf[220];
+                // DATA,index,time_ms,position_m,velocity_mps,accel_mps2,current_A,error_A,cmd_duty_pct,dir_sign
+                snprintf(buf, sizeof(buf), "DATA,%u,%u,%.5f,%.4f,%.3f,%.4f,%.4f,%.2f,%d\n",
                     (unsigned)g_sendIndex, time_ms,
-                    s.position_m, s.velocity_mps, s.accel_mps2, s.current_A);
+                    s.position_m, s.velocity_mps, s.accel_mps2, s.current_A,
+                    s.error_A, s.cmd_duty_pct, (int)s.dir_sign);
                 serialSend(buf);
                 g_sendIndex++;
                 delay(12);
