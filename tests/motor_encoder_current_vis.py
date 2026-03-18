@@ -207,7 +207,7 @@ def parse_float_safe(s: str, default: float = 0.0) -> Optional[float]:
 
 
 def validate_current_params(duration: int, current_a: float, kp: float, ki: float, kd: float, direction: str) -> Optional[str]:
-    if duration == 0 or current_a == 0.0:
+    if duration == 0:
         return None
     if duration < 0 or duration > DURATION_MAX_CURRENT:
         return f"Duration must be 0-{DURATION_MAX_CURRENT} sec"
@@ -585,8 +585,8 @@ def main():
                 break
 
             # CURRENT control (support only)
-            d = parse_int_safe(input(f"Duration ({DURATION_MIN}-{DURATION_MAX} sec) [0=skip]: "), 0)
-            cur = parse_float_safe(input("Current setpoint (A) [0=skip]: "), 0.0)
+            d = parse_int_safe(input(f"Duration (0-{DURATION_MAX_CURRENT} sec) [0=skip]: "), 0)
+            cur = parse_float_safe(input("Current setpoint (A) [0 allowed]: "), 0.0)
             kp_ = parse_float_safe(input("Kp [0]: "), 0.0)
             ki_ = parse_float_safe(input("Ki [0]: "), 0.0)
             kd_ = parse_float_safe(input("Kd [0]: "), 0.0)
@@ -600,8 +600,8 @@ def main():
                 continue
             duration, current_a, kp, ki, kd = d, float(cur), float(kp_), float(ki_), float(kd_)
             direction = dir_in if dir_in in ("F", "B") else "F"
-            if duration == 0 or current_a == 0.0:
-                print("Skipped (duration=0 or current=0).")
+            if duration == 0:
+                print("Skipped (duration=0).")
                 continue
             break
     else:
@@ -722,8 +722,8 @@ def main():
                         continue
                     break
 
-                d = parse_int_safe(input(f"Duration ({DURATION_MIN}-{DURATION_MAX} sec) [0=skip]: "), 0)
-                cur = parse_float_safe(input("Current setpoint (A) [0=skip]: "), 0.0)
+                d = parse_int_safe(input(f"Duration (0-{DURATION_MAX_CURRENT} sec) [0=skip]: "), 0)
+                cur = parse_float_safe(input("Current setpoint (A) [0 allowed]: "), 0.0)
                 kp_ = parse_float_safe(input("Kp [0]: "), 0.0)
                 ki_ = parse_float_safe(input("Ki [0]: "), 0.0)
                 kd_ = parse_float_safe(input("Kd [0]: "), 0.0)
@@ -737,8 +737,8 @@ def main():
                     continue
                 duration, current_a, kp, ki, kd = d, float(cur), float(kp_), float(ki_), float(kd_)
                 direction = dir_in if dir_in in ("F", "B") else "F"
-                if duration == 0 or current_a == 0.0:
-                    print("Skipped (duration=0 or current=0).")
+                if duration == 0:
+                    print("Skipped (duration=0).")
                     continue
                 break
 
