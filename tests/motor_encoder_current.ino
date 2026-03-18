@@ -46,6 +46,11 @@ static constexpr float    METERS_PER_COUNT    = SPOOL_CIRCUMF_M / (float)COUNTS_
 static constexpr uint32_t SAMPLE_HZ           = 100;
 static constexpr uint32_t SAMPLE_INTERVAL_US  = 1000000UL / SAMPLE_HZ;
 
+// Safety limits (firmware enforces even if client sends bad values)
+#define PWM_MAX_SAFE 25
+#define DURATION_MIN_SAFE 1
+#define DURATION_MAX_SAFE 10
+
 // Pre/post drill: 1 second of current sampling before and after motor run
 static constexpr uint32_t PRE_DRILL_SEC       = 1;
 static constexpr uint32_t POST_DRILL_SEC      = 1;
@@ -267,9 +272,21 @@ static void processCommand(const String& cmd) {
             String pwmStr = cmd.substring(c1 + 1, c2);
             pwmStr.trim();
             g_pwm_duty = pwmStr.toInt();
-            if (g_pwm_duty < 0 || g_pwm_duty > 100) g_pwm_duty = 50;
+            if (g_pwm_duty < 0 || g_pwm_duty > PWM_MAX_SAFE) {
+                serialSendFormatted("ERROR,PWM_MAX_%d,received:%s\n", PWM_MAX_SAFE, cmd.c_str());
+                return;
+            }
         } else {
-            g_pwm_duty = 50;
+            g_pwm_duty = 0;
+        }
+
+        if (g_drill_duration_s < DURATION_MIN_SAFE || g_drill_duration_s > DURATION_MAX_SAFE) {
+            serialSendFormatted("ERROR,INVALID_DURATION_%d_%d,received:%s\n", DURATION_MIN_SAFE, DURATION_MAX_SAFE, cmd.c_str());
+            return;
+        }
+        if (g_pwm_duty == 0) {
+            serialSend("ERROR,PWM_MUST_BE_GT_0\n");
+            return;
         }
 
         if (c2 >= 0 && c3 >= 0) {
@@ -284,11 +301,6 @@ static void processCommand(const String& cmd) {
             g_direction = (dirStr == "B") ? Direction::DIR_BACKWARD : Direction::DIR_FORWARD;
         } else {
             g_direction = Direction::DIR_FORWARD;
-        }
-
-        if (g_drill_duration_s < 1 || g_drill_duration_s > 10) {
-            serialSendFormatted("ERROR,INVALID_DURATION,received:%s\n", cmd.c_str());
-            return;
         }
 
         size_t totalSec = PRE_DRILL_SEC + g_drill_duration_s + POST_DRILL_SEC;

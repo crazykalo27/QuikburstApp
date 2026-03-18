@@ -38,6 +38,11 @@ DATA_TIMEOUT_S    = 120.0
 PRE_DRILL_SEC  = 1
 POST_DRILL_SEC = 1
 
+# Safety limits
+PWM_MAX = 25
+DURATION_MIN = 1
+DURATION_MAX = 10
+
 
 # ============================================================================
 # DATA COLLECTOR (from newEncoderVis DrillDataCollector, adapted for Serial + current)
@@ -147,6 +152,34 @@ class DrillDataCollector:
             "accel_mps2":   np.array(self.accelerations, dtype=np.float64),
             "current_A":    np.array(self.currents, dtype=np.float64),
         }
+
+
+# ============================================================================
+# SAFETY VALIDATION
+# ============================================================================
+
+def parse_int_safe(s: str, default: int = 0) -> Optional[int]:
+    """Parse int; return default if empty, None if invalid."""
+    s = s.strip()
+    if not s:
+        return default
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
+def validate_drill_params(duration: int, pwm_duty: int, direction: str) -> Optional[str]:
+    """Return None if valid, else error message."""
+    if duration < DURATION_MIN or duration > DURATION_MAX:
+        return f"Duration must be {DURATION_MIN}-{DURATION_MAX} sec"
+    if pwm_duty < 0 or pwm_duty > PWM_MAX:
+        return f"PWM must be 0-{PWM_MAX}%"
+    if duration == 0 or pwm_duty == 0:
+        return "Duration and PWM must be > 0 to run"
+    if direction not in ("F", "B"):
+        return "Direction must be F or B"
+    return None
 
 
 # ============================================================================
@@ -367,8 +400,8 @@ def main():
         description="Motor + Encoder + Current (Serial)"
     )
     parser.add_argument("port", nargs="?", help="Serial port")
-    parser.add_argument("duration", nargs="?", type=int, help="Duration 1-10 sec")
-    parser.add_argument("pwm", nargs="?", type=int, help="PWM 0-100")
+    parser.add_argument("duration", nargs="?", type=int, help=f"Duration {DURATION_MIN}-{DURATION_MAX} sec")
+    parser.add_argument("pwm", nargs="?", type=int, help=f"PWM 0-{PWM_MAX}")
     parser.add_argument("direction", nargs="?", choices=["F", "B", "f", "b"], help="F or B")
     parser.add_argument("--no-plot", action="store_true", help="Skip plotting")
     parser.add_argument("--save", type=str, help="Save CSV path")
@@ -391,16 +424,30 @@ def main():
             sys.exit(1)
 
         print(f"Using port: {port}")
-        duration = int(input("Duration (1-10 sec): ") or "5")
-        pwm_duty = int(input("PWM (0-100): ") or "50")
-        direction = (input("Direction (F/B): ") or "F").upper()[0]
+        while True:
+            d = parse_int_safe(input(f"Duration ({DURATION_MIN}-{DURATION_MAX} sec) [0=skip]: "), 0)
+            p = parse_int_safe(input(f"PWM (0-{PWM_MAX}) [0=skip]: "), 0)
+            dir_in = (input("Direction (F/B) [F]: ").strip().upper() or "F")[:1]
+            if d is None or p is None:
+                print("Invalid input. Enter numbers only.")
+                continue
+            err = validate_drill_params(d, p, dir_in)
+            if err:
+                print(f"  {err}")
+                continue
+            duration, pwm_duty, direction = d, p, dir_in
+            break
     else:
         if not port:
-            print("No serial port found. Specify port: python motor_encoder_current_vis.py COM4 5 50 F")
+            print("No serial port found. Specify port: python motor_encoder_current_vis.py COM4 5 25 F")
             sys.exit(1)
-        duration = min(max(args.duration, 1), 10)
-        pwm_duty = min(max(args.pwm, 0), 100)
-        direction = args.direction.upper()[0]
+        duration = min(max(args.duration, 0), DURATION_MAX)
+        pwm_duty = min(max(args.pwm, 0), PWM_MAX)
+        direction = (args.direction or "F").upper()[0]
+        err = validate_drill_params(duration, pwm_duty, direction)
+        if err:
+            print(f"Invalid args: {err}")
+            sys.exit(1)
 
     if not port:
         print("No port specified.")
@@ -468,14 +515,21 @@ def main():
             if again not in ("y", "yes"):
                 break
 
-            # Start over with full prompts
+            # Start over with full prompts (default 0 = skip)
             print()
-            duration = int(input("Duration (1-10 sec): ") or "5")
-            pwm_duty = int(input("PWM (0-100): ") or "50")
-            direction = (input("Direction (F/B): ") or "F").upper()[0]
-            duration = min(max(duration, 1), 10)
-            pwm_duty = min(max(pwm_duty, 0), 100)
-            direction = direction if direction in ("F", "B") else "F"
+            while True:
+                d = parse_int_safe(input(f"Duration ({DURATION_MIN}-{DURATION_MAX} sec) [0=skip]: "), 0)
+                p = parse_int_safe(input(f"PWM (0-{PWM_MAX}) [0=skip]: "), 0)
+                dir_in = (input("Direction (F/B) [F]: ").strip().upper() or "F")[:1]
+                if d is None or p is None:
+                    print("Invalid input. Enter numbers only.")
+                    continue
+                err = validate_drill_params(d, p, dir_in)
+                if err:
+                    print(f"  {err}")
+                    continue
+                duration, pwm_duty, direction = d, p, dir_in
+                break
 
 
 if __name__ == "__main__":
