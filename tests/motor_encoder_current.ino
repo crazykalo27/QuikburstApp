@@ -69,6 +69,7 @@ static constexpr uint16_t PCNT_FILTER_VAL     = 100;
 #define VREF 3.3
 #define SENSITIVITY_MV_PER_A 66.0
 #define DIVIDER_RATIO 2.0
+#define CURRENT_SENSOR_OUTPUT_DIVIDER 2.0  // 2:1 divider at sensor output; ADC reads 1/2 of sensor output
 #define CURRENT_SAMPLES 8
 
 // ============================================================================
@@ -192,7 +193,8 @@ static float readCurrentAmps() {
         sum += analogRead(CURRENT_SENSOR_PIN);
         delayMicroseconds(100);
     }
-    float sensorMV = ((sum / (float)CURRENT_SAMPLES) / ADC_MAX) * VREF * 1000.0f;
+    float adcMV = ((sum / (float)CURRENT_SAMPLES) / ADC_MAX) * VREF * 1000.0f;
+    float sensorMV = adcMV * CURRENT_SENSOR_OUTPUT_DIVIDER;  // 2:1 divider: actual = adc * 2
 
     float supplyDivider = 0;
     for (int i = 0; i < 4; i++) {
@@ -200,7 +202,7 @@ static float readCurrentAmps() {
         delayMicroseconds(50);
     }
     float supplyV = ((supplyDivider / 4.0f) / ADC_MAX) * VREF * DIVIDER_RATIO;
-    float zeroMV = (overrideZeroMV >= 0) ? overrideZeroMV : (supplyV * 1000.0f) / 2.0f;
+    float zeroMV = (overrideZeroMV >= 0) ? (overrideZeroMV * CURRENT_SENSOR_OUTPUT_DIVIDER) : (supplyV * 1000.0f) / 2.0f;
     return (sensorMV - zeroMV) / SENSITIVITY_MV_PER_A;
 }
 
@@ -212,7 +214,7 @@ static void checkZeroOverride() {
             sum += analogRead(CURRENT_SENSOR_PIN);
             delayMicroseconds(200);
         }
-        overrideZeroMV = ((sum / 16.0f) / ADC_MAX) * VREF * 1000.0f;
+        overrideZeroMV = ((sum / 16.0f) / ADC_MAX) * VREF * 1000.0f;  // Store ADC reading (pre-divider)
         Serial.print(">>> ZERO OVERRIDE: ");
         Serial.print(overrideZeroMV, 1);
         Serial.println(" mV <<<");

@@ -4,6 +4,7 @@
  * Current sensor:
  *   - Output on GPIO34
  *   - Sensitivity: 66 mV/A
+ *   - 2:1 voltage divider at output (10k/10k); ADC reads 1/2 of sensor output
  *   - Zero current output assumed to be Vcc / 2
  *
  * Supply measurement:
@@ -28,6 +29,7 @@
  
  #define SENSITIVITY_MV_PER_A 66.0
  #define DIVIDER_RATIO        2.0
+ #define CURRENT_SENSOR_OUTPUT_DIVIDER 2.0  // 2:1 divider at sensor output
  
  #define NUM_SAMPLES 32
 
@@ -90,19 +92,19 @@
    // 2) Reconstruct actual supply voltage from 10k/10k divider
    float supplyVoltage = supplyDividerVoltage * DIVIDER_RATIO;
  
-   // 3) Measure current sensor output voltage at GPIO34
-   float sensorVoltage = readAverageVoltage(CURRENT_SENSOR_PIN);
-   float sensorMilliVolts = sensorVoltage * 1000.0;
- 
+   // 3) Measure current sensor output at GPIO34 (2:1 divider: ADC reads 1/2 of sensor)
+   float adcVoltage = readAverageVoltage(CURRENT_SENSOR_PIN);
+   float sensorMilliVolts = adcVoltage * 1000.0 * CURRENT_SENSOR_OUTPUT_DIVIDER;
+
    // 4) Zero-current output: override if button was pressed, else supply/2
    bool buttonPressed = (digitalRead(ZERO_OVERRIDE_PIN) == LOW);
    if (buttonPressed && !lastButtonState) {
-     overrideZeroMV = sensorMilliVolts;
+     overrideZeroMV = adcVoltage * 1000.0;  // Store ADC reading (pre-divider)
      Serial.println(">>> ZERO OVERRIDE: zero set to current reading <<<");
    }
    lastButtonState = buttonPressed;
 
-   float zeroCurrentMilliVolts = (overrideZeroMV >= 0) ? overrideZeroMV : (supplyVoltage * 1000.0) / 2.0;
+   float zeroCurrentMilliVolts = (overrideZeroMV >= 0) ? (overrideZeroMV * CURRENT_SENSOR_OUTPUT_DIVIDER) : (supplyVoltage * 1000.0) / 2.0;
 
    // 5) Convert sensor delta voltage to current
    float amps = (sensorMilliVolts - zeroCurrentMilliVolts) / SENSITIVITY_MV_PER_A;
