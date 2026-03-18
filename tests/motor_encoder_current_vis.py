@@ -191,9 +191,9 @@ def parse_int_safe(s: str, default: int = 0) -> Optional[int]:
         return None
 
 
-def validate_drill_params(duration: int, pwm_duty: int, direction: str) -> Optional[str]:
+def validate_drill_params(duration: int, pwm_duty: float, direction: str) -> Optional[str]:
     """Return None if valid, else error message. (0 values are treated as 'skip'.)"""
-    if duration == 0 or pwm_duty == 0:
+    if duration == 0 or pwm_duty <= 0:
         return None
     if duration < DURATION_MIN or duration > DURATION_MAX:
         return f"Duration must be {DURATION_MIN}-{DURATION_MAX} sec"
@@ -251,12 +251,12 @@ def find_serial_port() -> Optional[str]:
 # DRILL EXECUTION (from CONTROL.py run_drill, Serial instead of BLE)
 # ============================================================================
 
-def run_drill(ser: serial.Serial, duration_s: int, pwm_duty: int, direction: str) -> Optional[dict]:
+def run_drill(ser: serial.Serial, duration_s: int, pwm_duty: float, direction: str) -> Optional[dict]:
     """Run a drill, return parsed data dict or None on failure."""
     collector = DrillDataCollector()
 
-    drill_cmd = f"DRILL,{duration_s},{pwm_duty},{direction}\n"
-    print(f"Sending: DRILL,{duration_s},{pwm_duty},{direction}")
+    drill_cmd = f"DRILL,{duration_s},{pwm_duty:.2f},{direction}\n"
+    print(f"Sending: DRILL,{duration_s},{pwm_duty:.2f},{direction}")
 
     ser.reset_input_buffer()
     ser.write(drill_cmd.encode("utf-8"))
@@ -479,7 +479,7 @@ def save_csv(data: dict, filepath: str):
 # GRAPHS (same style as encoder data — position, velocity, accel, current)
 # ============================================================================
 
-def plot_results(data: dict, duration_s: int, pwm_duty: int, direction: str, mode: str = "DRILL", current_a: float = 0.0):
+def plot_results(data: dict, duration_s: int, pwm_duty: float, direction: str, mode: str = "DRILL", current_a: float = 0.0):
     """Subplots: position, velocity, acceleration, current, error, cmd duty + PWM (1s pre, run, 1s post)."""
     t   = data["time_s"]
     pos = data["position_m"]
@@ -501,7 +501,7 @@ def plot_results(data: dict, duration_s: int, pwm_duty: int, direction: str, mod
     if mode == "CURRENT":
         fig.suptitle(f"Current control: {duration_s}s, I={current_a:.3f}A (1s pre/post)")
     else:
-        fig.suptitle(f"Drill: {duration_s}s, PWM={pwm_duty}%, {direction} (1s pre/post)")
+        fig.suptitle(f"Drill: {duration_s}s, PWM={pwm_duty:.2f}%, {direction} (1s pre/post)")
 
     for ax in axes:
         ax.axvspan(drill_start, drill_end, alpha=0.15, color="gray", label="motor on")
@@ -555,7 +555,7 @@ def main():
     )
     parser.add_argument("port", nargs="?", help="Serial port")
     parser.add_argument("duration", nargs="?", type=int, help=f"Duration {DURATION_MIN}-{DURATION_MAX} sec")
-    parser.add_argument("pwm", nargs="?", type=int, help=f"PWM 0-{PWM_MAX}")
+    parser.add_argument("pwm", nargs="?", type=float, help=f"PWM 0-{PWM_MAX} (float ok, e.g. 4.56)")
     parser.add_argument("direction", nargs="?", choices=["F", "B", "f", "b"], help="F or B")
     parser.add_argument("--no-plot", action="store_true", help="Skip plotting")
     parser.add_argument("--save", type=str, help="Save CSV path")
@@ -588,17 +588,17 @@ def main():
 
             if mode == "DRILL":
                 d = parse_int_safe(input(f"Duration ({DURATION_MIN}-{DURATION_MAX} sec) [0=skip]: "), 0)
-                p = parse_int_safe(input(f"PWM (0-{PWM_MAX}) [0=skip]: "), 0)
+                p = parse_float_safe(input(f"PWM (0-{PWM_MAX}, float ok e.g. 4.56) [0=skip]: "), 0.0)
                 dir_in = (input("Direction (F/B) [F]: ").strip().upper() or "F")[:1]
                 if d is None or p is None:
                     print("Invalid input. Enter numbers only.")
                     continue
-                err = validate_drill_params(d, p, dir_in)
+                err = validate_drill_params(d, float(p) if p is not None else 0.0, dir_in)
                 if err:
                     print(f"  {err}")
                     continue
-                duration, pwm_duty, direction = d, p, dir_in if dir_in in ("F", "B") else "F"
-                if duration == 0 or pwm_duty == 0:
+                duration, pwm_duty, direction = d, float(p) if p is not None else 0.0, dir_in if dir_in in ("F", "B") else "F"
+                if duration == 0 or pwm_duty <= 0:
                     print("Skipped (duration=0 or pwm=0).")
                     continue
                 break
@@ -629,13 +629,13 @@ def main():
         # Non-interactive args mode = DRILL only (keep it simple/safe)
         mode = "DRILL"
         duration = min(max(args.duration, 0), DURATION_MAX)
-        pwm_duty = min(max(args.pwm, 0), PWM_MAX)
+        pwm_duty = min(max(float(args.pwm), 0.0), PWM_MAX)
         direction = (args.direction or "F").upper()[0]
         err = validate_drill_params(duration, pwm_duty, direction)
         if err:
             print(f"Invalid args: {err}")
             sys.exit(1)
-        if duration == 0 or pwm_duty == 0:
+        if duration == 0 or pwm_duty <= 0:
             print("Refusing to run with duration=0 or pwm=0.")
             sys.exit(1)
 
@@ -650,7 +650,7 @@ def main():
     print(f"  Mode:     {mode}")
     print(f"  Duration: {duration}s")
     if mode == "DRILL":
-        print(f"  PWM:      {pwm_duty}%")
+        print(f"  PWM:      {pwm_duty:.2f}%")
     else:
         print(f"  Current:  {current_a:.3f} A")
         print(f"  PID:      Kp={kp:.3f}, Ki={ki:.3f}, Kd={kd:.3f}")
@@ -681,7 +681,7 @@ def main():
             print()
             print("=" * 60)
             if mode == "DRILL":
-                print(f"Drill: {duration}s, PWM={pwm_duty}%, {direction}")
+                print(f"Drill: {duration}s, PWM={pwm_duty:.2f}%, {direction}")
             else:
                 print(f"Current control: {duration}s, I={current_a:.3f}A, Kp={kp:.3f} Ki={ki:.3f} Kd={kd:.3f}, {direction}")
             print("=" * 60)
@@ -727,17 +727,17 @@ def main():
 
                 if mode == "DRILL":
                     d = parse_int_safe(input(f"Duration ({DURATION_MIN}-{DURATION_MAX} sec) [0=skip]: "), 0)
-                    p = parse_int_safe(input(f"PWM (0-{PWM_MAX}) [0=skip]: "), 0)
+                    p = parse_float_safe(input(f"PWM (0-{PWM_MAX}, float ok) [0=skip]: "), 0.0)
                     dir_in = (input("Direction (F/B) [F]: ").strip().upper() or "F")[:1]
                     if d is None or p is None:
                         print("Invalid input. Enter numbers only.")
                         continue
-                    err = validate_drill_params(d, p, dir_in)
+                    err = validate_drill_params(d, float(p) if p is not None else 0.0, dir_in)
                     if err:
                         print(f"  {err}")
                         continue
-                    duration, pwm_duty, direction = d, p, dir_in if dir_in in ("F", "B") else "F"
-                    if duration == 0 or pwm_duty == 0:
+                    duration, pwm_duty, direction = d, float(p) if p is not None else 0.0, dir_in if dir_in in ("F", "B") else "F"
+                    if duration == 0 or pwm_duty <= 0:
                         print("Skipped (duration=0 or pwm=0).")
                         continue
                     break

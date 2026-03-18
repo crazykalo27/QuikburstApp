@@ -28,7 +28,8 @@
 const int PWM_CHANNEL_1 = 0;
 const int PWM_CHANNEL_2 = 1;
 const int PWM_FREQ = 5000;
-const int PWM_RESOLUTION = 10;
+const int PWM_RESOLUTION = 12;  // 12-bit = 4096 levels (~0.024% per step)
+const int PWM_MAX_VAL = (1 << PWM_RESOLUTION) - 1;  // 4095
 
 // Encoder (from newEncoderread)
 static constexpr int      ENCODER_PIN_A       = 25;
@@ -128,7 +129,7 @@ struct ProcessedSample {
 
 static volatile State     g_state = State::IDLE;
 static uint32_t           g_drill_duration_s = 0;
-static int                g_pwm_duty = 50;
+static float              g_pwm_duty = 50.0f;
 static Direction          g_direction = Direction::DIR_FORWARD;
 
 static volatile int32_t   g_overflowAccum = 0;
@@ -191,23 +192,25 @@ static int32_t readEncoderCount() {
 // ============================================================================
 
 void setMotorIdle() {
-    ledcWriteChannel(PWM_CHANNEL_1, 1023);
-    ledcWriteChannel(PWM_CHANNEL_2, 1023);
+    ledcWriteChannel(PWM_CHANNEL_1, PWM_MAX_VAL);
+    ledcWriteChannel(PWM_CHANNEL_2, PWM_MAX_VAL);
 }
 
 void setMotorForward(int pwm) {
     ledcWriteChannel(PWM_CHANNEL_2, pwm);
-    ledcWriteChannel(PWM_CHANNEL_1, 1023);
+    ledcWriteChannel(PWM_CHANNEL_1, PWM_MAX_VAL);
 }
 
 void setMotorBackward(int pwm) {
     ledcWriteChannel(PWM_CHANNEL_1, pwm);
-    ledcWriteChannel(PWM_CHANNEL_2, 1023);
+    ledcWriteChannel(PWM_CHANNEL_2, PWM_MAX_VAL);
 }
 
-static int dutyToPwm(int duty) { //KALLEN MAKE THIS TAKE FLOATS AS WELL
-    duty = constrain(duty, 0, 100);
-    return map(100 - duty, 0, 100, 0, 1023);
+// Accepts float duty 0-100%; converts with full resolution, rounds only at final int
+static int dutyToPwm(float dutyPercent) {
+    dutyPercent = constrain(dutyPercent, 0.0f, 100.0f);
+    float frac = 1.0f - (dutyPercent / 100.0f);  // inverted: 0% duty -> full PWM
+    return (int)(PWM_MAX_VAL * frac + 0.5f);
 }
 
 // ============================================================================
@@ -366,20 +369,20 @@ static void processCommand(const String& cmd) {
         if (c2 >= 0) {
             String pwmStr = cmd.substring(c1 + 1, c2);
             pwmStr.trim();
-            g_pwm_duty = pwmStr.toInt();
-            if (g_pwm_duty < 0 || g_pwm_duty > PWM_MAX_SAFE) {
+            g_pwm_duty = pwmStr.toFloat();
+            if (g_pwm_duty < 0.0f || g_pwm_duty > (float)PWM_MAX_SAFE) {
                 serialSendFormatted("ERROR,PWM_MAX_%d,received:%s\n", PWM_MAX_SAFE, cmd.c_str());
                 return;
             }
         } else {
-            g_pwm_duty = 0;
+            g_pwm_duty = 0.0f;
         }
 
         if (g_drill_duration_s < DURATION_MIN_SAFE || g_drill_duration_s > DURATION_MAX_SAFE) {
             serialSendFormatted("ERROR,INVALID_DURATION_%d_%d,received:%s\n", DURATION_MIN_SAFE, DURATION_MAX_SAFE, cmd.c_str());
             return;
         }
-        if (g_pwm_duty == 0) {
+        if (g_pwm_duty <= 0.0f) {
             serialSend("ERROR,PWM_MUST_BE_GT_0\n");
             return;
         }
@@ -410,10 +413,10 @@ static void processCommand(const String& cmd) {
         }
 
         g_state = State::ARMED;
-        Serial.printf("[STATE] ARMED duration=%u pwm=%d dir=%s\n",
-            g_drill_duration_s, g_pwm_duty,
+        Serial.printf("[STATE] ARMED duration=%u pwm=%.2f dir=%s\n",
+            g_drill_duration_s, (double)g_pwm_duty,
             g_direction == Direction::DIR_FORWARD ? "F" : "B");
-        serialSendFormatted("READY,%u,%d,%s\n", g_drill_duration_s, g_pwm_duty,
+        serialSendFormatted("READY,%u,%.2f,%s\n", g_drill_duration_s, (double)g_pwm_duty,
             g_direction == Direction::DIR_FORWARD ? "F" : "B");
         return;
     }
@@ -669,7 +672,7 @@ void loop() {
 
             // Motor idle during pre and post phases; run only during drill phase
             if (nowUs >= g_motorStartUs && nowUs < g_motorEndUs) {
-                int pwm = dutyToPwm(g_pwm_duty);
+                int pwm = dutyToPwm((float)g_pwm_duty);
                 if (g_direction == Direction::DIR_FORWARD)
                     setMotorForward(pwm);
                 else
@@ -684,7 +687,7 @@ void loop() {
                 s.count        = readEncoderCount();
                 s.current_A    = readCurrentAmps();
                 s.error_A      = 0.0f;
-                s.cmd_duty_pct = (float)g_pwm_duty;
+                s.cmd_duty_pct = g_pwm_duty;
                 s.cmd_pwm      = dutyToPwm(g_pwm_duty);
                 s.dir_sign     = (g_direction == Direction::DIR_FORWARD) ? 1 : -1;
                 g_rawSamples.push_back(s);
@@ -722,7 +725,7 @@ void loop() {
                 // 0A setpoint: use error to cancel back current (e.g. back-EMF when pulling out)
 
                 // Convert duty percent to inverted motor PWM (0-1023) and drive with chosen direction
-                int pwm = dutyToPwm((int)(cmd_duty_pct + 0.5f));
+                int pwm = dutyToPwm(cmd_duty_pct);
                 if (cmd_duty_pct <= 0.0f) {
                     setMotorIdle();
                 } else if (forward) {
@@ -749,7 +752,7 @@ void loop() {
                 s.current_A    = current;
                 s.error_A      = error;
                 s.cmd_duty_pct = cmd_duty_pct;
-                s.cmd_pwm      = (cmd_duty_pct <= 0.0f) ? 0 : dutyToPwm((int)(cmd_duty_pct + 0.5f));
+                s.cmd_pwm      = (cmd_duty_pct <= 0.0f) ? 0 : dutyToPwm(cmd_duty_pct);
                 s.dir_sign     = dir_sign;
                 g_rawSamples.push_back(s);
                 g_nextSampleUs += SAMPLE_INTERVAL_US;
