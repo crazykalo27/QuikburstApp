@@ -170,15 +170,41 @@ def parse_int_safe(s: str, default: int = 0) -> Optional[int]:
 
 
 def validate_drill_params(duration: int, pwm_duty: int, direction: str) -> Optional[str]:
-    """Return None if valid, else error message."""
+    """Return None if valid, else error message. (0 values are treated as 'skip'.)"""
+    if duration == 0 or pwm_duty == 0:
+        return None
     if duration < DURATION_MIN or duration > DURATION_MAX:
         return f"Duration must be {DURATION_MIN}-{DURATION_MAX} sec"
     if pwm_duty < 0 or pwm_duty > PWM_MAX:
         return f"PWM must be 0-{PWM_MAX}%"
-    if duration == 0 or pwm_duty == 0:
-        return "Duration and PWM must be > 0 to run"
     if direction not in ("F", "B"):
         return "Direction must be F or B"
+    return None
+
+
+def parse_float_safe(s: str, default: float = 0.0) -> Optional[float]:
+    """Parse float; return default if empty, None if invalid."""
+    s = s.strip()
+    if not s:
+        return default
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def validate_current_params(duration: int, current_a: float, kp: float, ki: float, kd: float, direction: str) -> Optional[str]:
+    if duration == 0 or current_a == 0.0:
+        return None
+    if duration < DURATION_MIN or duration > DURATION_MAX:
+        return f"Duration must be {DURATION_MIN}-{DURATION_MAX} sec"
+    if current_a < 0:
+        return "Current must be >= 0"
+    if direction not in ("F", "B"):
+        return "Direction must be F or B"
+    # Gains can be any float for now (supporting WIP controller)
+    if any(np.isnan(x) for x in (kp, ki, kd, current_a)):
+        return "Invalid numeric value"
     return None
 
 
@@ -260,6 +286,88 @@ def run_drill(ser: serial.Serial, duration_s: int, pwm_duty: int, direction: str
         return None
 
     # Receive DATA stream until END
+    print("Receiving data...")
+    deadline = time.time() + DATA_TIMEOUT_S
+    while time.time() < deadline:
+        line = ser.readline().decode("utf-8", errors="ignore").strip()
+        if line:
+            collector.process_line(line)
+            if collector.end_event:
+                break
+        if collector.error_msg:
+            break
+
+    if collector.error_msg:
+        print(f"\nERROR: {collector.error_msg}")
+        return None
+
+    if collector.data_count == 0:
+        print("ERROR: No data received")
+        return None
+
+    return collector.to_numpy()
+
+
+def run_current_control(
+    ser: serial.Serial,
+    duration_s: int,
+    current_a: float,
+    kp: float,
+    ki: float,
+    kd: float,
+    direction: str,
+) -> Optional[dict]:
+    """Run current-control mode (support only), return parsed data dict or None on failure."""
+    collector = DrillDataCollector()
+
+    cmd = f"CURRENT,{duration_s},{current_a:.3f},{kp:.3f},{ki:.3f},{kd:.3f},{direction}\n"
+    print(f"Sending: {cmd.strip()}")
+
+    ser.reset_input_buffer()
+    ser.write(cmd.encode("utf-8"))
+    ser.flush()
+
+    # Wait for READY
+    deadline = time.time() + READY_TIMEOUT_S
+    while time.time() < deadline:
+        line = ser.readline().decode("utf-8", errors="ignore").strip()
+        if line:
+            collector.process_line(line)
+            if collector.ready_event:
+                break
+    if not collector.ready_event:
+        print("ERROR: Timeout waiting for READY")
+        return None
+
+    print("Sending: GO")
+    ser.write(b"GO\n")
+    ser.flush()
+
+    # Wait for RUNNING
+    deadline = time.time() + RUNNING_TIMEOUT_S
+    while time.time() < deadline:
+        line = ser.readline().decode("utf-8", errors="ignore").strip()
+        if line:
+            collector.process_line(line)
+            if collector.running_event:
+                break
+    if not collector.running_event:
+        print("ERROR: Timeout waiting for RUNNING")
+        return None
+
+    total_s = PRE_DRILL_SEC + duration_s + POST_DRILL_SEC
+    print(f"\nControl in progress ({total_s}s total: 1s pre, {duration_s}s control, 1s post)...")
+    deadline = time.time() + total_s + 5.0
+    while time.time() < deadline:
+        line = ser.readline().decode("utf-8", errors="ignore").strip()
+        if line:
+            collector.process_line(line)
+            if collector.done_event:
+                break
+    if not collector.done_event:
+        print("ERROR: Timeout waiting for DONE")
+        return None
+
     print("Receiving data...")
     deadline = time.time() + DATA_TIMEOUT_S
     while time.time() < deadline:
@@ -410,6 +518,10 @@ def main():
 
     port = args.port or find_serial_port()
 
+    mode = "DRILL"
+    current_a = 0.0
+    kp = ki = kd = 0.0
+
     if args.duration is None or args.pwm is None or args.direction is None:
         # Interactive mode: ask for port first (before duration)
         if sys.platform == "win32":
@@ -425,28 +537,61 @@ def main():
 
         print(f"Using port: {port}")
         while True:
+            m = (input("Mode (D=drill / C=current control) [D]: ").strip().upper() or "D")[:1]
+            mode = "CURRENT" if m == "C" else "DRILL"
+
+            if mode == "DRILL":
+                d = parse_int_safe(input(f"Duration ({DURATION_MIN}-{DURATION_MAX} sec) [0=skip]: "), 0)
+                p = parse_int_safe(input(f"PWM (0-{PWM_MAX}) [0=skip]: "), 0)
+                dir_in = (input("Direction (F/B) [F]: ").strip().upper() or "F")[:1]
+                if d is None or p is None:
+                    print("Invalid input. Enter numbers only.")
+                    continue
+                err = validate_drill_params(d, p, dir_in)
+                if err:
+                    print(f"  {err}")
+                    continue
+                duration, pwm_duty, direction = d, p, dir_in if dir_in in ("F", "B") else "F"
+                if duration == 0 or pwm_duty == 0:
+                    print("Skipped (duration=0 or pwm=0).")
+                    continue
+                break
+
+            # CURRENT control (support only)
             d = parse_int_safe(input(f"Duration ({DURATION_MIN}-{DURATION_MAX} sec) [0=skip]: "), 0)
-            p = parse_int_safe(input(f"PWM (0-{PWM_MAX}) [0=skip]: "), 0)
+            cur = parse_float_safe(input("Current setpoint (A) [0=skip]: "), 0.0)
+            kp_ = parse_float_safe(input("Kp [0]: "), 0.0)
+            ki_ = parse_float_safe(input("Ki [0]: "), 0.0)
+            kd_ = parse_float_safe(input("Kd [0]: "), 0.0)
             dir_in = (input("Direction (F/B) [F]: ").strip().upper() or "F")[:1]
-            if d is None or p is None:
+            if d is None or cur is None or kp_ is None or ki_ is None or kd_ is None:
                 print("Invalid input. Enter numbers only.")
                 continue
-            err = validate_drill_params(d, p, dir_in)
+            err = validate_current_params(d, cur, kp_, ki_, kd_, dir_in)
             if err:
                 print(f"  {err}")
                 continue
-            duration, pwm_duty, direction = d, p, dir_in
+            duration, current_a, kp, ki, kd = d, float(cur), float(kp_), float(ki_), float(kd_)
+            direction = dir_in if dir_in in ("F", "B") else "F"
+            if duration == 0 or current_a == 0.0:
+                print("Skipped (duration=0 or current=0).")
+                continue
             break
     else:
         if not port:
             print("No serial port found. Specify port: python motor_encoder_current_vis.py COM4 5 25 F")
             sys.exit(1)
+        # Non-interactive args mode = DRILL only (keep it simple/safe)
+        mode = "DRILL"
         duration = min(max(args.duration, 0), DURATION_MAX)
         pwm_duty = min(max(args.pwm, 0), PWM_MAX)
         direction = (args.direction or "F").upper()[0]
         err = validate_drill_params(duration, pwm_duty, direction)
         if err:
             print(f"Invalid args: {err}")
+            sys.exit(1)
+        if duration == 0 or pwm_duty == 0:
+            print("Refusing to run with duration=0 or pwm=0.")
             sys.exit(1)
 
     if not port:
@@ -457,8 +602,13 @@ def main():
     print("Motor + Encoder + Current (Serial)")
     print("=" * 60)
     print(f"  Port:     {port}")
+    print(f"  Mode:     {mode}")
     print(f"  Duration: {duration}s")
-    print(f"  PWM:      {pwm_duty}%")
+    if mode == "DRILL":
+        print(f"  PWM:      {pwm_duty}%")
+    else:
+        print(f"  Current:  {current_a:.3f} A")
+        print(f"  PID:      Kp={kp:.3f}, Ki={ki:.3f}, Kd={kd:.3f}")
     print(f"  Dir:      {direction}")
     print()
 
@@ -483,10 +633,17 @@ def main():
         while True:
             print()
             print("=" * 60)
-            print(f"Drill: {duration}s, PWM={pwm_duty}%, {direction}")
+            if mode == "DRILL":
+                print(f"Drill: {duration}s, PWM={pwm_duty}%, {direction}")
+            else:
+                print(f"Current control: {duration}s, I={current_a:.3f}A, Kp={kp:.3f} Ki={ki:.3f} Kd={kd:.3f}, {direction}")
             print("=" * 60)
 
-            data = run_drill(ser, duration, pwm_duty, direction)
+            data = (
+                run_drill(ser, duration, pwm_duty, direction)
+                if mode == "DRILL"
+                else run_current_control(ser, duration, current_a, kp, ki, kd, direction)
+            )
 
             if data is None:
                 retry = input("Drill failed. Retry with same params? (y/n): ").strip().lower()
@@ -507,9 +664,9 @@ def main():
 
             # Show graph every time (blocks until window closed)
             if not args.no_plot:
-                plot_results(data, duration, pwm_duty, direction)
+                plot_results(data, duration, pwm_duty if mode == "DRILL" else 0, direction)
 
-            again = input("\nRun another drill? (y/n): ").strip().lower()
+            again = input("\nRun another run? (y/n): ").strip().lower()
             if again in ("n", "q", "no", "quit"):
                 break
             if again not in ("y", "yes"):
@@ -518,17 +675,44 @@ def main():
             # Start over with full prompts (default 0 = skip)
             print()
             while True:
+                m = (input("Mode (D=drill / C=current control) [D]: ").strip().upper() or "D")[:1]
+                mode = "CURRENT" if m == "C" else "DRILL"
+
+                if mode == "DRILL":
+                    d = parse_int_safe(input(f"Duration ({DURATION_MIN}-{DURATION_MAX} sec) [0=skip]: "), 0)
+                    p = parse_int_safe(input(f"PWM (0-{PWM_MAX}) [0=skip]: "), 0)
+                    dir_in = (input("Direction (F/B) [F]: ").strip().upper() or "F")[:1]
+                    if d is None or p is None:
+                        print("Invalid input. Enter numbers only.")
+                        continue
+                    err = validate_drill_params(d, p, dir_in)
+                    if err:
+                        print(f"  {err}")
+                        continue
+                    duration, pwm_duty, direction = d, p, dir_in if dir_in in ("F", "B") else "F"
+                    if duration == 0 or pwm_duty == 0:
+                        print("Skipped (duration=0 or pwm=0).")
+                        continue
+                    break
+
                 d = parse_int_safe(input(f"Duration ({DURATION_MIN}-{DURATION_MAX} sec) [0=skip]: "), 0)
-                p = parse_int_safe(input(f"PWM (0-{PWM_MAX}) [0=skip]: "), 0)
+                cur = parse_float_safe(input("Current setpoint (A) [0=skip]: "), 0.0)
+                kp_ = parse_float_safe(input("Kp [0]: "), 0.0)
+                ki_ = parse_float_safe(input("Ki [0]: "), 0.0)
+                kd_ = parse_float_safe(input("Kd [0]: "), 0.0)
                 dir_in = (input("Direction (F/B) [F]: ").strip().upper() or "F")[:1]
-                if d is None or p is None:
+                if d is None or cur is None or kp_ is None or ki_ is None or kd_ is None:
                     print("Invalid input. Enter numbers only.")
                     continue
-                err = validate_drill_params(d, p, dir_in)
+                err = validate_current_params(d, cur, kp_, ki_, kd_, dir_in)
                 if err:
                     print(f"  {err}")
                     continue
-                duration, pwm_duty, direction = d, p, dir_in
+                duration, current_a, kp, ki, kd = d, float(cur), float(kp_), float(ki_), float(kd_)
+                direction = dir_in if dir_in in ("F", "B") else "F"
+                if duration == 0 or current_a == 0.0:
+                    print("Skipped (duration=0 or current=0).")
+                    continue
                 break
 
 

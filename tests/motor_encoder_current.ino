@@ -146,6 +146,10 @@ float c_kp = 1.0f;
 float c_ki = 0.0f;
 float c_kd = 0.0f;
 
+// Current control setpoint + mode flag (support only; controller itself is WIP)
+float g_des_current_A = 0.0f;
+bool g_useCurrentControl = false;
+
 // ============================================================================
 // PCNT ISR (from newEncoderread)
 // ============================================================================
@@ -256,11 +260,83 @@ static void processCommand(const String& cmd) {
     Serial.print("[RX] ");
     Serial.println(cmd);
 
+    if (cmd.startsWith("CURRENT,")) {
+        // Support command for current-control mode (controller WIP).
+        // Format: CURRENT,<seconds>,<current_A>,<kp>,<ki>,<kd>,<F|B>
+        if (g_state != State::IDLE) {
+            serialSendFormatted("ERROR,NOT_IDLE,received:%s\n", cmd.c_str());
+            return;
+        }
+
+        // Parse by commas (similar style to DRILL)
+        int c1 = cmd.indexOf(',', 8);  // after duration
+        int c2 = cmd.indexOf(',', c1 + 1);  // after current
+        int c3 = cmd.indexOf(',', c2 + 1);  // after kp
+        int c4 = cmd.indexOf(',', c3 + 1);  // after ki
+        int c5 = cmd.indexOf(',', c4 + 1);  // after kd
+        int end = cmd.length();
+
+        if (c1 < 0 || c2 < 0 || c3 < 0 || c4 < 0 || c5 < 0) {
+            serialSendFormatted("ERROR,BAD_FORMAT,received:%s\n", cmd.c_str());
+            return;
+        }
+
+        String durStr = cmd.substring(8, c1);
+        durStr.trim();
+        g_drill_duration_s = durStr.toInt();
+
+        if (g_drill_duration_s < DURATION_MIN_SAFE || g_drill_duration_s > DURATION_MAX_SAFE) {
+            serialSendFormatted("ERROR,INVALID_DURATION_%d_%d,received:%s\n", DURATION_MIN_SAFE, DURATION_MAX_SAFE, cmd.c_str());
+            return;
+        }
+
+        String curStr = cmd.substring(c1 + 1, c2);
+        curStr.trim();
+        g_des_current_A = curStr.toFloat();
+        if (g_des_current_A <= 0.0f) {
+            serialSend("ERROR,CURRENT_MUST_BE_GT_0\n");
+            return;
+        }
+
+        String kpStr = cmd.substring(c2 + 1, c3);
+        String kiStr = cmd.substring(c3 + 1, c4);
+        String kdStr = cmd.substring(c4 + 1, c5);
+        kpStr.trim(); kiStr.trim(); kdStr.trim();
+        c_kp = kpStr.toFloat();
+        c_ki = kiStr.toFloat();
+        c_kd = kdStr.toFloat();
+
+        String dirStr = cmd.substring(c5 + 1, end);
+        dirStr.trim();
+        dirStr.toUpperCase();
+        g_direction = (dirStr == "B") ? Direction::DIR_BACKWARD : Direction::DIR_FORWARD;
+
+        g_useCurrentControl = true;
+
+        size_t totalSec = PRE_DRILL_SEC + g_drill_duration_s + POST_DRILL_SEC;
+        size_t expectedSamples = (size_t)totalSec * SAMPLE_HZ + 128;
+        g_rawSamples.clear();
+        g_processed.clear();
+        try {
+            g_rawSamples.reserve(expectedSamples);
+        } catch (...) {
+            serialSendFormatted("ERROR,OUT_OF_MEMORY,received:%s\n", cmd.c_str());
+            return;
+        }
+
+        g_state = State::ARMED;
+        serialSendFormatted("READY,CURRENT,%u,%.3f,%.3f,%.3f,%.3f,%s\n",
+            g_drill_duration_s, g_des_current_A, c_kp, c_ki, c_kd,
+            g_direction == Direction::DIR_FORWARD ? "F" : "B");
+        return;
+    }
+
     if (cmd.startsWith("DRILL,")) {
         if (g_state != State::IDLE) {
             serialSendFormatted("ERROR,NOT_IDLE,received:%s\n", cmd.c_str());
             return;
         }
+        g_useCurrentControl = false;  // explicit: DRILL always runs open-loop PWM mode
         int c1 = cmd.indexOf(',', 6);
         if (c1 < 0) {
             serialSendFormatted("ERROR,BAD_FORMAT,received:%s\n", cmd.c_str());
@@ -341,8 +417,8 @@ static void processCommand(const String& cmd) {
         g_drillEndUs   = g_motorEndUs + (POST_DRILL_SEC * 1000000UL);
         g_nextSampleUs = g_drillStartUs;
         g_rawSamples.clear();
-        g_state = State::RUNNING;
-        Serial.println("[STATE] RUNNING (1s pre, drill, 1s post)");
+        g_state = g_useCurrentControl ? State::CURRENT_CONTROL : State::RUNNING;
+        Serial.println(g_useCurrentControl ? "[STATE] CURRENT_CONTROL (1s pre, control, 1s post)" : "[STATE] RUNNING (1s pre, drill, 1s post)");
         serialSend("RUNNING\n");
         return;
     }
@@ -353,6 +429,7 @@ static void processCommand(const String& cmd) {
             g_rawSamples.clear();
             g_processed.clear();
             g_state = State::IDLE;
+            g_useCurrentControl = false;
             serialSend("ABORTED\n");
         }
         return;
