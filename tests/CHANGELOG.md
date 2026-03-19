@@ -2,6 +2,9 @@
 
 ## 2026-03-19
 
+**Signed command plot**
+- Python command subplot now applies `dir_sign` so `cmd_duty_pct` and `cmd_pwm` are shown as signed motor commands. This makes controller reversals and braking effort visible around 0 instead of looking like a constant positive magnitude.
+
 **Signed current setpoint**
 - `CURRENT,...` accepts negative `current_A`; the same P-loop drives toward the signed setpoint (error = setpoint − measured). Python validation and prompts updated; current plot shows a blue setpoint line in current-control mode.
 

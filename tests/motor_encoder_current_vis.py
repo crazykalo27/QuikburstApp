@@ -527,7 +527,7 @@ def save_csv(data: dict, filepath: str):
 # ============================================================================
 
 def plot_results(data: dict, duration_s: int, pwm_duty: float, direction: str, mode: str = "DRILL", current_a: float = 0.0):
-    """Subplots: position, velocity, acceleration, current, error, cmd duty + PWM (1s pre, run, 1s post)."""
+    """Subplots: position, velocity, acceleration, current, error, signed cmd duty + PWM (1s pre, run, 1s post)."""
     t   = data["time_s"]
     pos = data["position_m"]
     vel = data["velocity_mps"]
@@ -537,6 +537,8 @@ def plot_results(data: dict, duration_s: int, pwm_duty: float, direction: str, m
     cmd = data.get("cmd_duty_pct", np.zeros_like(t))
     cmd_pwm = data.get("cmd_pwm", np.zeros_like(t, dtype=np.int32))
     dsgn = data.get("dir_sign", np.zeros_like(t))
+    signed_cmd = cmd * dsgn
+    signed_cmd_pwm = cmd_pwm * dsgn
 
     # Average current during motor-on phase (signed: + = forward, - = reverse/regen)
     drill_start = PRE_DRILL_SEC
@@ -587,15 +589,16 @@ def plot_results(data: dict, duration_s: int, pwm_duty: float, direction: str, m
     axes[4].set_title("Current error (setpoint - measured)")
 
     ax5 = axes[5]
-    ax5.plot(t, cmd, "c-", linewidth=1.2, label="cmd_duty_pct (%)")
-    ax5.set_ylabel("Cmd duty (%)", color="c")
+    ax5.plot(t, signed_cmd, "c-", linewidth=1.2, label="signed cmd duty (%)")
+    ax5.axhline(0, color="gray", linestyle=":", linewidth=0.8)
+    ax5.set_ylabel("Signed cmd duty (%)", color="c")
     ax5.tick_params(axis="y", labelcolor="c")
     ax5_r = ax5.twinx()
-    ax5_r.plot(t, cmd_pwm, "brown", linewidth=1.0, alpha=0.8, label="cmd_pwm (0-1023)")
-    ax5_r.set_ylabel("cmd_pwm (0-1023)", color="brown")
+    ax5_r.plot(t, signed_cmd_pwm, "brown", linewidth=1.0, alpha=0.8, label="signed cmd_pwm")
+    ax5_r.set_ylabel("Signed cmd_pwm", color="brown")
     ax5_r.tick_params(axis="y", labelcolor="brown")
     ax5.set_xlabel("Time (s)")
-    ax5.set_title("Commanded duty % and actual PWM sent to motor")
+    ax5.set_title("Signed motor command from controller (+ forward, - backward)")
 
     plt.tight_layout()
     plt.show()
