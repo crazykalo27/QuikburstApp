@@ -1,5 +1,19 @@
 # Motor + Encoder + Current Test — Change Log
 
+## 2026-03-18
+
+**Serial sync + completion handling**
+- Python now drains stale serial lines instead of blindly resetting the input buffer before each run.
+- Host treats incoming data as proof the run completed even if the `DONE` marker was late or missed, which prevents false disconnect/retry loops.
+
+**Signed current**
+- Avg current and est. power are now signed: + = forward/into motor, - = reverse/regen.
+- Summary and plot show peak +/-, avg with sign, and 0 A reference line. CSV stores raw signed current_A.
+
+**Current-control timing**
+- Firmware current-control now updates motor command and logs data on the same fixed sample cadence.
+- Removed duplicate ADC work inside the control loop so the ESP32 is less likely to drift past the expected run-complete timing.
+
 ## 2025-03-16
 
 **PWM resolution + float duty**

@@ -162,6 +162,11 @@ float c_kd = 0.0f;
 // Current control setpoint + mode flag (support only; controller itself is WIP)
 float g_des_current_A = 0.0f;
 bool g_useCurrentControl = false;
+static float g_lastCurrentA = 0.0f;
+static float g_lastErrorA = 0.0f;
+static float g_lastCmdDutyPct = 0.0f;
+static int   g_lastCmdPwm = 0;
+static int8_t g_lastDirSign = 0;
 
 // ============================================================================
 // PCNT ISR (from newEncoderread)
@@ -211,6 +216,16 @@ static int dutyToPwm(float dutyPercent) {
     dutyPercent = constrain(dutyPercent, 0.0f, 100.0f);
     float frac = 1.0f - (dutyPercent / 100.0f);  // inverted: 0% duty -> full PWM
     return (int)(PWM_MAX_VAL * frac + 0.5f);
+}
+
+static void applyMotorCommand(int pwm, int8_t dirSign) {
+    if (pwm <= 0 || dirSign == 0) {
+        setMotorIdle();
+    } else if (dirSign > 0) {
+        setMotorForward(pwm);
+    } else {
+        setMotorBackward(pwm);
+    }
 }
 
 // ============================================================================
@@ -433,6 +448,11 @@ static void processCommand(const String& cmd) {
         g_drillEndUs   = g_motorEndUs + (POST_DRILL_SEC * 1000000UL);
         g_nextSampleUs = g_drillStartUs;
         g_rawSamples.clear();
+        g_lastCurrentA = 0.0f;
+        g_lastErrorA = 0.0f;
+        g_lastCmdDutyPct = 0.0f;
+        g_lastCmdPwm = 0;
+        g_lastDirSign = 0;
         g_state = g_useCurrentControl ? State::CURRENT_CONTROL : State::RUNNING;
         Serial.println(g_useCurrentControl ? "[STATE] CURRENT_CONTROL (1s pre, control, 1s post)" : "[STATE] RUNNING (1s pre, drill, 1s post)");
         serialSend("RUNNING\n");
@@ -708,51 +728,46 @@ void loop() {
 
             pollSerialCommands();
 
-            // Motor idle during pre and post phases; run only during drill phase
-            if (nowUs >= g_motorStartUs && nowUs < g_motorEndUs) {
-                float current = readCurrentAmps();
-                float error = g_des_current_A - current;
-
-                // P-only controller output interpreted as duty percent
-                float cmd_duty_pct = c_kp * error;
-
-                // Direction chosen by sign of cmd (reversing mid-run is handled)
-                bool forward = (cmd_duty_pct >= 0.0f);
-                if (cmd_duty_pct < 0.0f) cmd_duty_pct = -cmd_duty_pct;
-
-                // Hard safety clamp (never exceed 10%)
-                if (cmd_duty_pct > PWM_MAX_CURRENT_CONTROL_SAFE) cmd_duty_pct = PWM_MAX_CURRENT_CONTROL_SAFE;
-                // 0A setpoint: use error to cancel back current (e.g. back-EMF when pulling out)
-
-                // Convert duty percent to inverted motor PWM (0-1023) and drive with chosen direction
-                int pwm = dutyToPwm(cmd_duty_pct);
-                if (cmd_duty_pct <= 0.0f) {
-                    setMotorIdle();
-                } else if (forward) {
-                    setMotorForward(pwm);
-                } else {
-                    setMotorBackward(pwm);
-                }
-            } else {
+            const bool motorActive = (nowUs >= g_motorStartUs && nowUs < g_motorEndUs);
+            if (!motorActive) {
+                g_lastCmdDutyPct = 0.0f;
+                g_lastCmdPwm = 0;
+                g_lastDirSign = 0;
                 setMotorIdle();
+            } else {
+                applyMotorCommand(g_lastCmdPwm, g_lastDirSign);
             }
 
-            // read data to report at the end of control period
+            // Keep current-control work on the sample cadence so the loop can
+            // hit DONE on time and hold a consistent report rate.
             if ((int32_t)(nowUs - g_nextSampleUs) >= 0) {
                 RawSample s;
                 s.timestamp_us = nowUs;
                 s.count        = readEncoderCount();
                 float current = readCurrentAmps();
                 float error = g_des_current_A - current;
-                float cmd_duty_pct = c_kp * error;
-                int8_t dir_sign = (cmd_duty_pct >= 0.0f) ? 1 : -1;
-                if (cmd_duty_pct < 0.0f) cmd_duty_pct = -cmd_duty_pct;
-                if (cmd_duty_pct > PWM_MAX_CURRENT_CONTROL_SAFE) cmd_duty_pct = PWM_MAX_CURRENT_CONTROL_SAFE;
+                float cmd_duty_pct = 0.0f;
+                int8_t dir_sign = 0;
+
+                if (motorActive) {
+                    cmd_duty_pct = c_kp * error;
+                    dir_sign = (cmd_duty_pct >= 0.0f) ? 1 : -1;
+                    if (cmd_duty_pct < 0.0f) cmd_duty_pct = -cmd_duty_pct;
+                    if (cmd_duty_pct > PWM_MAX_CURRENT_CONTROL_SAFE) cmd_duty_pct = PWM_MAX_CURRENT_CONTROL_SAFE;
+                }
+
+                int pwm = (cmd_duty_pct <= 0.0f || dir_sign == 0) ? 0 : dutyToPwm(cmd_duty_pct);
+                g_lastCurrentA = current;
+                g_lastErrorA = error;
+                g_lastCmdDutyPct = cmd_duty_pct;
+                g_lastCmdPwm = pwm;
+                g_lastDirSign = dir_sign;
+                applyMotorCommand(g_lastCmdPwm, g_lastDirSign);
 
                 s.current_A    = current;
                 s.error_A      = error;
                 s.cmd_duty_pct = cmd_duty_pct;
-                s.cmd_pwm      = (cmd_duty_pct <= 0.0f) ? 0 : dutyToPwm(cmd_duty_pct);
+                s.cmd_pwm      = pwm;
                 s.dir_sign     = dir_sign;
                 g_rawSamples.push_back(s);
                 g_nextSampleUs += SAMPLE_INTERVAL_US;

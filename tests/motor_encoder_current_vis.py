@@ -31,9 +31,12 @@ import serial
 # CONFIGURATION (from CONTROL.py / newEncoderVis)
 # ============================================================================
 
-READY_TIMEOUT_S   = 5.0
-RUNNING_TIMEOUT_S = 5.0
-DATA_TIMEOUT_S    = 120.0
+READY_TIMEOUT_S        = 5.0
+RUNNING_TIMEOUT_S      = 5.0
+DONE_TIMEOUT_MARGIN_S  = 10.0
+DATA_TIMEOUT_S         = 120.0
+SERIAL_DRAIN_QUIET_S   = 0.25
+SERIAL_DRAIN_MAX_S     = 1.5
 
 PRE_DRILL_SEC  = 1
 POST_DRILL_SEC = 1
@@ -79,7 +82,7 @@ class DrillDataCollector:
     def process_line(self, line: str):
         """Parse a single line from ESP32."""
 
-        if line.startswith("READY,"):
+        if line == "READY" or line.startswith("READY,"):
             print(f"  [ESP32] READY — {line}")
             self.ready_event = True
             return
@@ -247,6 +250,21 @@ def find_serial_port() -> Optional[str]:
     return None
 
 
+def drain_pending_serial(ser: serial.Serial, quiet_s: float = SERIAL_DRAIN_QUIET_S, max_s: float = SERIAL_DRAIN_MAX_S):
+    """Read and discard stale serial lines without dropping the OS buffer."""
+    old_timeout = ser.timeout
+    start = time.time()
+    last_activity = start
+    ser.timeout = 0.05
+    try:
+        while time.time() - start < max_s and time.time() - last_activity < quiet_s:
+            line = ser.readline().decode("utf-8", errors="ignore").strip()
+            if line:
+                last_activity = time.time()
+    finally:
+        ser.timeout = old_timeout
+
+
 # ============================================================================
 # DRILL EXECUTION (from CONTROL.py run_drill, Serial instead of BLE)
 # ============================================================================
@@ -258,7 +276,7 @@ def run_drill(ser: serial.Serial, duration_s: int, pwm_duty: float, direction: s
     drill_cmd = f"DRILL,{duration_s},{pwm_duty:.2f},{direction}\n"
     print(f"Sending: DRILL,{duration_s},{pwm_duty:.2f},{direction}")
 
-    ser.reset_input_buffer()
+    drain_pending_serial(ser)
     ser.write(drill_cmd.encode("utf-8"))
     ser.flush()
 
@@ -294,28 +312,40 @@ def run_drill(ser: serial.Serial, duration_s: int, pwm_duty: float, direction: s
     # Wait for DONE (1s pre + duration + 1s post)
     total_s = PRE_DRILL_SEC + duration_s + POST_DRILL_SEC
     print(f"\nDrill in progress ({total_s}s total: 1s pre, {duration_s}s motor, 1s post)...")
-    deadline = time.time() + total_s + 5.0
+    deadline = time.time() + total_s + DONE_TIMEOUT_MARGIN_S
+    saw_data_before_done = False
     while time.time() < deadline:
         line = ser.readline().decode("utf-8", errors="ignore").strip()
         if line:
             collector.process_line(line)
             if collector.done_event:
                 break
-    if not collector.done_event:
+            if collector.data_count > 0 or collector.end_event:
+                saw_data_before_done = True
+                break
+        if collector.error_msg:
+            break
+    if collector.error_msg:
+        print(f"\nERROR: {collector.error_msg}")
+        return None
+    if not collector.done_event and saw_data_before_done:
+        print("  WARNING: DONE not seen; data already started, continuing")
+    elif not collector.done_event:
         print("ERROR: Timeout waiting for DONE")
         return None
 
     # Receive DATA stream until END
-    print("Receiving data...")
-    deadline = time.time() + DATA_TIMEOUT_S
-    while time.time() < deadline:
-        line = ser.readline().decode("utf-8", errors="ignore").strip()
-        if line:
-            collector.process_line(line)
-            if collector.end_event:
+    if not collector.end_event:
+        print("Receiving data...")
+        deadline = time.time() + DATA_TIMEOUT_S
+        while time.time() < deadline:
+            line = ser.readline().decode("utf-8", errors="ignore").strip()
+            if line:
+                collector.process_line(line)
+                if collector.end_event:
+                    break
+            if collector.error_msg:
                 break
-        if collector.error_msg:
-            break
 
     if collector.error_msg:
         print(f"\nERROR: {collector.error_msg}")
@@ -343,7 +373,7 @@ def run_current_control(
     cmd = f"CURRENT,{duration_s},{current_a:.3f},{kp:.3f},{ki:.3f},{kd:.3f},{direction}\n"
     print(f"Sending: {cmd.strip()}")
 
-    ser.reset_input_buffer()
+    drain_pending_serial(ser)
     ser.write(cmd.encode("utf-8"))
     ser.flush()
 
@@ -377,27 +407,39 @@ def run_current_control(
 
     total_s = PRE_DRILL_SEC + duration_s + POST_DRILL_SEC
     print(f"\nControl in progress ({total_s}s total: 1s pre, {duration_s}s control, 1s post)...")
-    deadline = time.time() + total_s + 5.0
+    deadline = time.time() + total_s + DONE_TIMEOUT_MARGIN_S
+    saw_data_before_done = False
     while time.time() < deadline:
         line = ser.readline().decode("utf-8", errors="ignore").strip()
         if line:
             collector.process_line(line)
             if collector.done_event:
                 break
-    if not collector.done_event:
-        print("ERROR: Timeout waiting for DONE")
-        return None
-
-    print("Receiving data...")
-    deadline = time.time() + DATA_TIMEOUT_S
-    while time.time() < deadline:
-        line = ser.readline().decode("utf-8", errors="ignore").strip()
-        if line:
-            collector.process_line(line)
-            if collector.end_event:
+            if collector.data_count > 0 or collector.end_event:
+                saw_data_before_done = True
                 break
         if collector.error_msg:
             break
+    if collector.error_msg:
+        print(f"\nERROR: {collector.error_msg}")
+        return None
+    if not collector.done_event and saw_data_before_done:
+        print("  WARNING: DONE not seen; data already started, continuing")
+    elif not collector.done_event:
+        print("ERROR: Timeout waiting for DONE")
+        return None
+
+    if not collector.end_event:
+        print("Receiving data...")
+        deadline = time.time() + DATA_TIMEOUT_S
+        while time.time() < deadline:
+            line = ser.readline().decode("utf-8", errors="ignore").strip()
+            if line:
+                collector.process_line(line)
+                if collector.end_event:
+                    break
+            if collector.error_msg:
+                break
 
     if collector.error_msg:
         print(f"\nERROR: {collector.error_msg}")
@@ -425,12 +467,15 @@ def print_summary(data: dict, duration_s: int):
     cur = data["current_A"]
     t   = data["time_s"]
 
-    # Average current during motor-on phase
+    # Average current during motor-on phase (signed: + = forward, - = reverse/regen)
     drill_start = PRE_DRILL_SEC
     drill_end = PRE_DRILL_SEC + duration_s
     mask = (t >= drill_start) & (t <= drill_end)
-    avg_current = np.mean(np.abs(cur[mask])) if np.any(mask) else 0.0
-    est_power = avg_current * DEFAULT_SUPPLY_V
+    avg_current = np.mean(cur[mask]) if np.any(mask) else 0.0
+    est_power = avg_current * DEFAULT_SUPPLY_V  # signed: + = into motor, - = out
+
+    peak_pos = np.max(cur) if len(cur) else 0.0
+    peak_neg = np.min(cur) if len(cur) else 0.0
 
     print(f"\n  Duration:       {t[-1]:.3f} s")
     print(f"  Samples:        {len(t)}")
@@ -439,9 +484,9 @@ def print_summary(data: dict, duration_s: int):
     print(f"  Peak velocity:  {np.max(np.abs(vel)):.3f} m/s ({np.max(np.abs(vel)) * 2.237:.2f} mph)")
     print(f"  Peak accel:     {np.max(acc):.2f} m/s²")
     print(f"  Peak decel:     {np.min(acc):.2f} m/s²")
-    print(f"  Peak current:   {np.max(np.abs(cur)):.3f} A")
-    print(f"  Avg current:    {avg_current:.3f} A (during drill)")
-    print(f"  Est. power:     {est_power:.2f} W (at {DEFAULT_SUPPLY_V}V)")
+    print(f"  Peak current:   +{peak_pos:.3f} A / {peak_neg:.3f} A")
+    print(f"  Avg current:    {avg_current:+.3f} A (during drill, signed)")
+    print(f"  Est. power:     {est_power:+.2f} W (at {DEFAULT_SUPPLY_V}V, signed)")
 
 
 def save_csv(data: dict, filepath: str):
@@ -491,11 +536,11 @@ def plot_results(data: dict, duration_s: int, pwm_duty: float, direction: str, m
     cmd_pwm = data.get("cmd_pwm", np.zeros_like(t, dtype=np.int32))
     dsgn = data.get("dir_sign", np.zeros_like(t))
 
-    # Average current during motor-on phase (for power consumption)
+    # Average current during motor-on phase (signed: + = forward, - = reverse/regen)
     drill_start = PRE_DRILL_SEC
     drill_end = PRE_DRILL_SEC + duration_s
     mask = (t >= drill_start) & (t <= drill_end)
-    avg_current_drill = np.mean(np.abs(cur[mask])) if np.any(mask) else 0.0
+    avg_current_drill = np.mean(cur[mask]) if np.any(mask) else 0.0
 
     fig, axes = plt.subplots(6, 1, sharex=True, figsize=(10, 13))
     if mode == "CURRENT":
@@ -519,11 +564,12 @@ def plot_results(data: dict, duration_s: int, pwm_duty: float, direction: str, m
     axes[2].set_ylabel("Acceleration (m/s²)")
     axes[2].set_title("Acceleration")
 
-    axes[3].plot(t, cur, "r-", linewidth=1.5, label="Current")
+    axes[3].plot(t, cur, "r-", linewidth=1.5, label="Current (signed)")
+    axes[3].axhline(0, color="gray", linestyle=":", linewidth=0.8)
     axes[3].axhline(avg_current_drill, color="orange", linestyle="--", linewidth=1.5,
-                    label=f"Avg (drill): {avg_current_drill:.3f} A")
+                    label=f"Avg (drill): {avg_current_drill:+.3f} A")
     axes[3].set_ylabel("Current (A)")
-    axes[3].set_title("Current (1s baseline before/after)")
+    axes[3].set_title("Current (signed: + forward, - reverse/regen)")
     axes[3].legend(loc="upper right", fontsize=8)
 
     axes[4].plot(t, err, "k-", linewidth=1.2)
@@ -660,7 +706,7 @@ def main():
     print()
 
     print(f"Connecting to {port}...")
-    with serial.Serial(port, args.baud, timeout=1) as ser:
+    with serial.Serial(port, args.baud, timeout=1, exclusive=True) as ser:
         # Opening serial often resets ESP32; wait for it to boot and signal ready
         print("  Waiting for ESP32 (up to 10s; opening port may reset it)...")
         boot_deadline = time.time() + 10.0
