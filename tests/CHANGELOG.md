@@ -1,5 +1,26 @@
 # Motor + Encoder + Current Test — Change Log
 
+## 2026-03-19
+
+**Signed current setpoint**
+- `CURRENT,...` accepts negative `current_A`; the same P-loop drives toward the signed setpoint (error = setpoint − measured). Python validation and prompts updated; current plot shows a blue setpoint line in current-control mode.
+
+**Current sense polarity**
+- Added `CURRENT_SENSE_SIGN` (default `-1.0f` for this hardware) so a positive `CURRENT` setpoint closes on positive reported amps. Set to `+1.0f` if your shunt/INA polarity already matches without a flip.
+
+**Faster current loop**
+- Raised the firmware sampling cadence from 100 Hz to 250 Hz as a conservative step up for current control.
+- Current sampling now does less ADC work per cycle by caching the zero/reference voltage and refreshing the supply-based reference periodically instead of every sample.
+
+**Quieter active runs**
+- Removed non-protocol serial debug chatter during `DRILL` and `CURRENT` runs so the ESP32 mainly sends `READY`, `RUNNING`, `DONE`, `DATA`, `END`, and errors.
+- Zero-override feedback is still available, but only emitted outside the active run states.
+
+**More robust timing**
+- Post-processing now derives velocity/acceleration from the actual sample timestamps rather than assuming every interval was perfect.
+- Data upload after a run is paced by UART buffer availability instead of a fixed per-line delay, so higher sample counts do not spend extra time idling after completion.
+- Python no longer prints `READY`, `RUNNING`, and `DONE` markers for every run, which keeps the terminal focused on actual results while preserving the same handshake logic.
+
 ## 2026-03-18
 
 **Serial sync + completion handling**

@@ -37,6 +37,8 @@ DONE_TIMEOUT_MARGIN_S  = 10.0
 DATA_TIMEOUT_S         = 120.0
 SERIAL_DRAIN_QUIET_S   = 0.25
 SERIAL_DRAIN_MAX_S     = 1.5
+TARGET_SAMPLE_HZ       = 250
+SAMPLE_PROGRESS_STEP   = 250
 
 PRE_DRILL_SEC  = 1
 POST_DRILL_SEC = 1
@@ -83,18 +85,19 @@ class DrillDataCollector:
         """Parse a single line from ESP32."""
 
         if line == "READY" or line.startswith("READY,"):
-            print(f"  [ESP32] READY — {line}")
             self.ready_event = True
             return
 
         if line == "RUNNING":
-            print(f"  [ESP32] RUNNING")
             self.running_event = True
             return
 
         if line == "DONE":
-            print(f"  [ESP32] DONE")
             self.done_event = True
+            return
+
+        if line.startswith("ZERO,"):
+            print(f"  [ESP32] Current zero updated: {line.split(',', 1)[1]} mV")
             return
 
         if line.startswith("DATA,"):
@@ -159,7 +162,7 @@ class DrillDataCollector:
         self.dir_signs.append(dsgn)
         self.data_count += 1
 
-        if self.data_count % 100 == 0:
+        if self.data_count % SAMPLE_PROGRESS_STEP == 0:
             print(f"    ... received {self.data_count} samples", end="\r")
 
     def to_numpy(self):
@@ -223,8 +226,6 @@ def validate_current_params(duration: int, current_a: float, kp: float, ki: floa
         return None
     if duration < 0 or duration > DURATION_MAX_CURRENT:
         return f"Duration must be 0-{DURATION_MAX_CURRENT} sec"
-    if current_a < 0:
-        return "Current must be >= 0"
     # Gains can be any float for now (supporting WIP controller)
     if any(np.isnan(x) for x in (kp, ki, kd, current_a)):
         return "Invalid numeric value"
@@ -479,7 +480,8 @@ def print_summary(data: dict, duration_s: int):
 
     print(f"\n  Duration:       {t[-1]:.3f} s")
     print(f"  Samples:        {len(t)}")
-    print(f"  Sample rate:    {len(t) / t[-1]:.1f} Hz" if t[-1] > 0 else "")
+    if t[-1] > 0:
+        print(f"  Sample rate:    {len(t) / t[-1]:.1f} Hz (target {TARGET_SAMPLE_HZ} Hz)")
     print(f"  Total distance: {np.max(np.abs(pos)):.4f} m ({np.max(np.abs(pos)) / 0.0254:.2f} in)")
     print(f"  Peak velocity:  {np.max(np.abs(vel)):.3f} m/s ({np.max(np.abs(vel)) * 2.237:.2f} mph)")
     print(f"  Peak accel:     {np.max(acc):.2f} m/s²")
@@ -566,6 +568,14 @@ def plot_results(data: dict, duration_s: int, pwm_duty: float, direction: str, m
 
     axes[3].plot(t, cur, "r-", linewidth=1.5, label="Current (signed)")
     axes[3].axhline(0, color="gray", linestyle=":", linewidth=0.8)
+    if mode == "CURRENT":
+        axes[3].axhline(
+            current_a,
+            color="blue",
+            linestyle="--",
+            linewidth=1.2,
+            label=f"Setpoint: {current_a:+.3f} A",
+        )
     axes[3].axhline(avg_current_drill, color="orange", linestyle="--", linewidth=1.5,
                     label=f"Avg (drill): {avg_current_drill:+.3f} A")
     axes[3].set_ylabel("Current (A)")
@@ -651,7 +661,7 @@ def main():
 
             # CURRENT control (support only) — direction is determined by controller sign
             d = parse_int_safe(input(f"Duration (0-{DURATION_MAX_CURRENT} sec) [0=skip]: "), 0)
-            cur = parse_float_safe(input("Current setpoint (A) [0 allowed]: "), 0.0)
+            cur = parse_float_safe(input("Current setpoint (A, signed ±) [0 ok]: "), 0.0)
             kp_ = parse_float_safe(input("Kp [0]: "), 0.0)
             ki_ = parse_float_safe(input("Ki [0]: "), 0.0)
             kd_ = parse_float_safe(input("Kd [0]: "), 0.0)
@@ -789,7 +799,7 @@ def main():
                     break
 
                 d = parse_int_safe(input(f"Duration (0-{DURATION_MAX_CURRENT} sec) [0=skip]: "), 0)
-                cur = parse_float_safe(input("Current setpoint (A) [0 allowed]: "), 0.0)
+                cur = parse_float_safe(input("Current setpoint (A, signed ±) [0 ok]: "), 0.0)
                 kp_ = parse_float_safe(input("Kp [0]: "), 0.0)
                 ki_ = parse_float_safe(input("Ki [0]: "), 0.0)
                 kd_ = parse_float_safe(input("Kd [0]: "), 0.0)
