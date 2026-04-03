@@ -1,64 +1,104 @@
 /*
- * VESC UART Test — ESP32 ↔ Python serial bridge
+ * VESC UART Test — ESP32 ↔ host (USB Serial + BLE) ↔ VESC (UART2)
  *
- * Serial  (USB, 115200) — commands from Python host
- * Serial2 (UART2) — VESC communication via VescUart lib
+ * Serial  (USB, 115200) — same text protocol as before
+ * BLE     — Nordic UART Service (NUS); advertised name "Quikburst" for discovery
  *
- * Pin names: many boards label UART2 as RX2 / TX2 (not D11/D12). Set GPIOs below
- * to match YOUR board’s pinout (often RX2=GPIO16, TX2=GPIO17 on ESP32-WROOM DevKits).
- * Do not use TX0/RX0 for the VESC if those pins are tied to the USB–serial chip.
+ * VESC: Serial2 @ VESC_UART_RX_PIN / VESC_UART_TX_PIN (see below).
  *
- * Protocol (newline-terminated text, same style as tests/motor_encoder_current):
- *   SET_CURRENT,<amps>        → drive motor at <amps> (signed float)
- *   SET_BRAKE,<amps>          → apply brake current
- *   SET_DUTY,<duty>           → duty cycle 0.0–1.0
- *   SET_RPM,<erpm>            → target eRPM (RPM × poles)
- *   STOP                      → setCurrent(0) — release motor
- *   GET_VALUES                → request telemetry snapshot
- *   GET_FW                    → request firmware version
- *   KEEPALIVE                 → send keepalive to VESC
+ * Protocol (newline-terminated; identical on USB and BLE):
+ *   PING                      → PONG,Quikburst
+ *   SET_CURRENT,<amps>        → OK,SET_CURRENT,...
+ *   SET_BRAKE,<amps>          → ...
+ *   SET_DUTY,<duty>           → duty clamped to 0…0.20 (20%)
+ *   SET_RPM,<erpm>            → ...
+ *   STOP                      → OK,STOP
+ *   GET_VALUES                → TELEM,...
+ *   GET_FW                    → FW,...
+ *   KEEPALIVE                 → OK,KEEPALIVE
+ *   [READY]                   — periodic heartbeat (USB + BLE when connected)
  *
- * Responses:
- *   OK,<cmd>                  — command accepted
- *   TELEM,rpm,duty,voltage,avgMotorCurrent,avgInputCurrent,tempMos,tempMotor,tach,tachAbs,fault
- *   FW,<major>.<minor>
- *   ERROR,<reason>
- *   [READY]                   — periodic heartbeat in idle
+ * BLE UUIDs (Nordic UART Service — works with bleak / nRF Connect):
+ *   Service 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
+ *   RX (host writes) 6E400002-B5A3-F393-E0A9-E50E24DCCA9E
+ *   TX (notify)      6E400003-B5A3-F393-E0A9-E50E24DCCA9E
  */
 
 #include <VescUart.h>
 #include <stdarg.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
-// UART2 to VESC — GPIO numbers (not silkscreen “D” labels unless your core maps them).
-// Wiring: ESP32 TX pin → VESC RX ; ESP32 RX pin → VESC TX ; GND ↔ GND.
+// UART2 to VESC
 #if !defined(VESC_UART_RX_PIN) || !defined(VESC_UART_TX_PIN)
-#define VESC_UART_RX_PIN 16  // often labeled RX2 — receives bytes from VESC TX
-#define VESC_UART_TX_PIN 17  // often labeled TX2 — drives VESC RX
+#define VESC_UART_RX_PIN 16
+#define VESC_UART_TX_PIN 17
 #endif
+
+// Max duty cycle for SET_DUTY (fraction 0–1); matches Python GUI cap.
+#ifndef VESC_MAX_DUTY
+#define VESC_MAX_DUTY 0.20f
+#endif
+
+static constexpr char BLE_DEVICE_NAME[] = "Quikburst";
+
+#define NUS_SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_RX_UUID             "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_TX_UUID             "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 VescUart UART;
 
-static String g_cmdBuf = "";
+static String g_serialCmdBuf;
+static String g_bleCmdBuf;
 
 static constexpr uint32_t READY_INTERVAL_MS = 5000;
 static uint32_t g_lastReadyMs = 0;
 
+static BLEServer* g_server = nullptr;
+static BLECharacteristic* g_txChar = nullptr;
+static bool g_bleConnected = false;
+static bool g_bleWasConnected = false;
+
 // ---------------------------------------------------------------------------
-// helpers
+// Host output: USB Serial + BLE notify (chunked; client should reassemble to lines)
 // ---------------------------------------------------------------------------
 
-static void respond(const char* msg) {
-  Serial.println(msg);
+static void sendBleRaw(const uint8_t* data, size_t len) {
+  if (!g_bleConnected || !g_txChar || len == 0) return;
+  constexpr size_t kChunk = 20;
+  size_t off = 0;
+  while (off < len) {
+    size_t n = len - off;
+    if (n > kChunk) n = kChunk;
+    g_txChar->setValue(data + off, n);
+    g_txChar->notify();
+    off += n;
+    delay(3);
+  }
 }
 
-static void respondFmt(const char* fmt, ...) {
+static void sendHostLine(const char* line) {
+  Serial.println(line);
+  if (!g_bleConnected || !g_txChar) return;
+  String s(line);
+  s += '\n';
+  sendBleRaw((const uint8_t*)s.c_str(), s.length());
+}
+
+static void sendHostFmt(const char* fmt, ...) {
   char buf[256];
   va_list args;
   va_start(args, fmt);
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
-  Serial.println(buf);
+  sendHostLine(buf);
 }
+
+// ---------------------------------------------------------------------------
+// Command parsing (shared)
+// ---------------------------------------------------------------------------
 
 static float parseFloat(const String& s) {
   String t = s;
@@ -66,55 +106,58 @@ static float parseFloat(const String& s) {
   return t.toFloat();
 }
 
-// ---------------------------------------------------------------------------
-// command handler
-// ---------------------------------------------------------------------------
-
 static void processCommand(const String& cmd) {
+
+  if (cmd == "PING") {
+    sendHostLine("PONG,Quikburst");
+    return;
+  }
 
   if (cmd == "STOP") {
     UART.setCurrent(0.0f);
-    respond("OK,STOP");
+    sendHostLine("OK,STOP");
     return;
   }
 
   if (cmd.startsWith("SET_CURRENT,")) {
     float amps = parseFloat(cmd.substring(12));
     UART.setCurrent(amps);
-    respondFmt("OK,SET_CURRENT,%.3f", amps);
+    sendHostFmt("OK,SET_CURRENT,%.3f", amps);
     return;
   }
 
   if (cmd.startsWith("SET_BRAKE,")) {
     float amps = parseFloat(cmd.substring(10));
     UART.setBrakeCurrent(amps);
-    respondFmt("OK,SET_BRAKE,%.3f", amps);
+    sendHostFmt("OK,SET_BRAKE,%.3f", amps);
     return;
   }
 
   if (cmd.startsWith("SET_DUTY,")) {
     float duty = parseFloat(cmd.substring(9));
+    if (duty < 0.0f) duty = 0.0f;
+    if (duty > VESC_MAX_DUTY) duty = VESC_MAX_DUTY;
     UART.setDuty(duty);
-    respondFmt("OK,SET_DUTY,%.4f", duty);
+    sendHostFmt("OK,SET_DUTY,%.4f", duty);
     return;
   }
 
   if (cmd.startsWith("SET_RPM,")) {
     float rpm = parseFloat(cmd.substring(8));
     UART.setRPM(rpm);
-    respondFmt("OK,SET_RPM,%.1f", rpm);
+    sendHostFmt("OK,SET_RPM,%.1f", rpm);
     return;
   }
 
   if (cmd == "KEEPALIVE") {
     UART.sendKeepalive();
-    respond("OK,KEEPALIVE");
+    sendHostLine("OK,KEEPALIVE");
     return;
   }
 
   if (cmd == "GET_VALUES") {
     if (UART.getVescValues()) {
-      respondFmt("TELEM,%.1f,%.4f,%.2f,%.3f,%.3f,%.1f,%.1f,%ld,%ld,%d",
+      sendHostFmt("TELEM,%.1f,%.4f,%.2f,%.3f,%.3f,%.1f,%.1f,%ld,%ld,%d",
         UART.data.rpm,
         UART.data.dutyCycleNow,
         UART.data.inpVoltage,
@@ -126,39 +169,100 @@ static void processCommand(const String& cmd) {
         UART.data.tachometerAbs,
         (int)UART.data.error);
     } else {
-      respond("ERROR,VESC_TIMEOUT");
+      sendHostLine("ERROR,VESC_TIMEOUT");
     }
     return;
   }
 
   if (cmd == "GET_FW") {
     if (UART.getFWversion()) {
-      respondFmt("FW,%d.%d", UART.fw_version.major, UART.fw_version.minor);
+      sendHostFmt("FW,%d.%d", UART.fw_version.major, UART.fw_version.minor);
     } else {
-      respond("ERROR,FW_TIMEOUT");
+      sendHostLine("ERROR,FW_TIMEOUT");
     }
     return;
   }
 
-  respondFmt("ERROR,UNKNOWN_CMD,%s", cmd.c_str());
+  sendHostFmt("ERROR,UNKNOWN_CMD,%s", cmd.c_str());
+}
+
+static void feedLineBuffer(String& buf, char c) {
+  if (c == '\n' || c == '\r') {
+    if (buf.length() > 0) {
+      processCommand(buf);
+      buf = "";
+    }
+  } else {
+    buf += c;
+    if (buf.length() > 200) buf = "";
+  }
 }
 
 // ---------------------------------------------------------------------------
-// serial polling
+// BLE
+// ---------------------------------------------------------------------------
+
+class QuikburstServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer*) override {
+    g_bleConnected = true;
+    sendHostLine("OK,BT_CONNECTED");
+  }
+  void onDisconnect(BLEServer*) override {
+    g_bleConnected = false;
+    Serial.println("(BLE disconnected)");
+  }
+};
+
+class QuikburstRxCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* ch) override {
+    // ESP32 Arduino 3.x: getValue() returns Arduino String (not std::string).
+    String val = ch->getValue();
+    if (val.length() == 0) return;
+    for (size_t i = 0; i < val.length(); i++) {
+      feedLineBuffer(g_bleCmdBuf, val[i]);
+    }
+  }
+};
+
+static void setupBle() {
+  BLEDevice::init(BLE_DEVICE_NAME);
+  g_server = BLEDevice::createServer();
+  g_server->setCallbacks(new QuikburstServerCallbacks());
+
+  BLEService* svc = g_server->createService(NUS_SERVICE_UUID);
+
+  BLECharacteristic* rx = svc->createCharacteristic(
+      NUS_RX_UUID,
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  rx->setCallbacks(new QuikburstRxCallbacks());
+
+  g_txChar = svc->createCharacteristic(
+      NUS_TX_UUID,
+      BLECharacteristic::PROPERTY_NOTIFY);
+  g_txChar->addDescriptor(new BLE2902());
+
+  svc->start();
+
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(NUS_SERVICE_UUID);
+  adv->setScanResponse(true);
+  adv->setMinPreferred(0x06);
+  adv->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+
+  Serial.print("BLE advertising as \"");
+  Serial.print(BLE_DEVICE_NAME);
+  Serial.println("\" (Nordic UART Service)");
+}
+
+// ---------------------------------------------------------------------------
+// USB Serial
 // ---------------------------------------------------------------------------
 
 static void pollSerial() {
   while (Serial.available()) {
     char c = Serial.read();
-    if (c == '\n' || c == '\r') {
-      if (g_cmdBuf.length() > 0) {
-        processCommand(g_cmdBuf);
-        g_cmdBuf = "";
-      }
-    } else {
-      g_cmdBuf += c;
-      if (g_cmdBuf.length() > 200) g_cmdBuf = "";
-    }
+    feedLineBuffer(g_serialCmdBuf, c);
   }
 }
 
@@ -168,16 +272,18 @@ static void pollSerial() {
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial) { delay(10); }
+  delay(800);
 
   Serial2.begin(115200, SERIAL_8N1, VESC_UART_RX_PIN, VESC_UART_TX_PIN);
   UART.setSerialPort(&Serial2);
 
-  delay(500);
+  setupBle();
+
+  delay(300);
   Serial.println();
-  Serial.println("VESC UART Test (ESP32)");
-  Serial.println("Commands: SET_CURRENT,<A> | SET_BRAKE,<A> | SET_DUTY,<d> | SET_RPM,<e> | STOP | GET_VALUES | GET_FW | KEEPALIVE");
-  Serial.println("[READY]");
+  Serial.println("VESC UART Test (ESP32) — USB + BLE \"Quikburst\"");
+  Serial.println("Commands: PING | SET_CURRENT,<A> | SET_BRAKE,<A> | SET_DUTY,<d> | SET_RPM,<e> | STOP | GET_VALUES | GET_FW | KEEPALIVE");
+  sendHostLine("[READY]");
 }
 
 void loop() {
@@ -186,8 +292,14 @@ void loop() {
   uint32_t now = millis();
   if (now - g_lastReadyMs >= READY_INTERVAL_MS) {
     g_lastReadyMs = now;
-    respond("[READY]");
+    sendHostLine("[READY]");
   }
 
-  delay(1);
+  if (!g_bleConnected && g_bleWasConnected) {
+    delay(300);
+    BLEDevice::startAdvertising();
+  }
+  g_bleWasConnected = g_bleConnected;
+
+  delay(2);
 }
