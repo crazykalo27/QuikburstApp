@@ -1,5 +1,17 @@
 # Motor + Encoder + Current Test — Change Log
 
+## 2026-04-02
+
+**VESC sketch UART pins**
+- `vescUartTest.ino` now uses `Serial2` with configurable `VESC_UART_RX_PIN` / `VESC_UART_TX_PIN` (default GPIO16/GPIO17 for typical RX2/TX2 silkscreen), instead of `D12`/`D11`, which many ESP32 boards do not expose.
+
+## 2026-04-01
+
+**New: VESC UART test pair (NewMotorController/)**
+- Rewrote `vescUartTest.ino` from LCD-only telemetry display into a full serial command bridge. ESP32 accepts text commands over USB (`Serial`) and forwards them to a Flipsky VESC over `Serial1` using the SolidGeek/VescUart library.
+- Supported commands: `SET_CURRENT`, `SET_BRAKE`, `SET_DUTY`, `SET_RPM`, `STOP`, `GET_VALUES`, `GET_FW`, `KEEPALIVE`. Protocol follows the same newline-terminated text style as the motor_encoder_current test pair.
+- Created `vesc_serial_control.py` as the Python companion — interactive CLI with auto port detection, background reader thread, and Ctrl-C safety stop.
+
 ## 2026-03-19
 
 **Signed command plot**
