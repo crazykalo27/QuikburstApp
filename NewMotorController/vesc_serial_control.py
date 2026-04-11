@@ -1,16 +1,15 @@
 """
 VESC control — Python companion for vescUartTest.ino
 
-  • GUI (default): tkinter — USB serial or BLE, all commands, log pane
-  • CLI: --cli — terminal mode (same flags as before)
+  • GUI (default): tkinter — Bluetooth LE (Quikburst / NUS), all commands, log pane
+  • CLI: --cli — terminal mode over BLE
 
 Install:
-  pip install pyserial bleak matplotlib
+  pip install bleak matplotlib
 
 Usage:
   python vesc_serial_control.py              # GUI
-  python vesc_serial_control.py --cli [COM4] [--baud 115200]
-  python vesc_serial_control.py --cli --ble [--name Quikburst]
+  python vesc_serial_control.py --cli [--name Quikburst] [--scan 12] [--address MAC]
 """
 
 from __future__ import annotations
@@ -30,15 +29,11 @@ from collections import deque
 from tkinter import ttk, scrolledtext, messagebox
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import serial
-import serial.tools.list_ports
-
 # Nordic UART Service (must match firmware)
 NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 NUS_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 NUS_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
-READY_TIMEOUT_S = 10.0
 PING_TIMEOUT_S = 5.0
 
 # Must match vescUartTest.ino VESC_MAX_DUTY (fraction 0–1).
@@ -63,8 +58,18 @@ def _spool_rpm_from_position_delta(pos1_m: float, pos0_m: float, t1_s: float, t0
     return _spool_rpm_from_linear_velocity_mps((pos1_m - pos0_m) / dt)
 
 
-# Coalesce matplotlib redraws for main TELEM+encoder figure and secondary encoder figure (~25 Hz).
-LIVE_PLOTS_REDRAW_MS = 40
+# Coalesce matplotlib redraws (~60 Hz max; redraw also scheduled on each new sample).
+LIVE_PLOTS_REDRAW_MS = 16
+
+
+def _u32_diff_ms(a: int, b: int) -> int:
+    """Signed (a - b) in milliseconds for uint32 device millis."""
+    da = int(a) & 0xFFFFFFFF
+    db = int(b) & 0xFFFFFFFF
+    d = (da - db) & 0xFFFFFFFF
+    if d >= 0x80000000:
+        d -= 0x100000000
+    return int(d)
 
 
 def clamp_duty_str(s: str) -> float:
@@ -158,65 +163,6 @@ def is_enc_log_payload(payload: str) -> bool:
     if s.startswith("<< "):
         s = s[3:].strip()
     return s.upper().startswith("ENC,")
-
-
-# --------------------------------------------------------------------------
-# Serial
-# --------------------------------------------------------------------------
-
-def find_serial_port() -> Optional[str]:
-    ports = serial.tools.list_ports.comports()
-    for p in ports:
-        desc = (p.device + " " + str(p.description) + " " + str(p.manufacturer)).lower()
-        if any(k in desc for k in ("usb", "serial", "slab", "cp210", "ch340", "ftdi")):
-            return p.device
-    if ports:
-        return ports[0].device
-    return None
-
-
-def list_serial_port_names() -> List[str]:
-    return [p.device for p in serial.tools.list_ports.comports()]
-
-
-def send_serial_line(ser: serial.Serial, cmd: str) -> None:
-    ser.write((cmd.strip() + "\n").encode("utf-8"))
-    ser.flush()
-
-
-def wait_for_ready(ser: serial.Serial, timeout: float = READY_TIMEOUT_S, log: Optional[Callable[[str], None]] = None) -> bool:
-    log = log or print
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if ser.in_waiting:
-            line = ser.readline().decode("utf-8", errors="ignore").strip()
-            if line:
-                log(f"<< {line}")
-            if "READY" in line.upper():
-                return True
-        else:
-            time.sleep(0.05)
-    return False
-
-
-class SerialReader(threading.Thread):
-    def __init__(self, ser: serial.Serial, line_cb: Callable[[str], None], stop_evt: threading.Event):
-        super().__init__(daemon=True)
-        self.ser = ser
-        self.line_cb = line_cb
-        self.stop_evt = stop_evt
-
-    def run(self) -> None:
-        while not self.stop_evt.is_set():
-            try:
-                if self.ser.in_waiting:
-                    line = self.ser.readline().decode("utf-8", errors="ignore").strip()
-                    if line:
-                        self.line_cb(line)
-                else:
-                    time.sleep(0.02)
-            except (serial.SerialException, OSError):
-                break
 
 
 # --------------------------------------------------------------------------
@@ -317,26 +263,29 @@ async def ble_ping_test(client, link: BleLineLink, log: Callable[[str], None]) -
 # --------------------------------------------------------------------------
 
 HELP_TEXT = """
-Commands (USB and BLE):
-  PING, SET_CURRENT,<A>, SET_BRAKE,<A>, SET_DUTY,<d> (duty capped at 0.20), SET_RPM,<e>,
+Commands (BLE):
+  PING, SET_CURRENT,<A>, SET_BRAKE (no args — full brake on firmware), SET_DUTY,<d> (duty capped at 0.20),
   STOP, GET_VALUES, GET_FW, KEEPALIVE, ENC_RESET, ENC_STREAM,<0|1>
 
 Telemetry: the VESC does NOT push TELEM by itself. Each GET_VALUES request returns one TELEM line
 (TELEM,esp32_ms,... where esp32_ms is ESP millis when sent — same clock as ENC time_ms). The GUI maps
 those device times to a wall timeline (anchor = first sample) so ENC and TELEM align by when they
-occurred on the ESP32, not USB receive order. Legacy firmware without esp32_ms still uses host receive time.
+occurred on the ESP32, not host receive order. Legacy firmware without esp32_ms still uses host receive time.
 Use "Live TELEM poll" (or auto-start after connect) so TELEM and ENC stream together; plots refresh together.
 
-Encoder: firmware streams ENC,time_ms,count,position_m,velocity_mps at 100 Hz over USB and BLE
+Encoder: firmware streams ENC,time_ms,count,position_m,velocity_mps at 100 Hz over BLE
 (same quadrature + 4\" spool geometry as ahaan100/encoder.ino). ENC lines are not copied to the
-log (rate). Commands: ENC_RESET (zero), ENC_STREAM,0 | ENC_STREAM,1. CSV position/velocity appear
+log (rate). Commands: ENC_RESET (zero), ENC_STREAM,0 | ENC_STREAM,1. When not exporting CSV, OK,ENC_RESET clears live encoder plot memory so the next run reads near zero on the graph. CSV position/velocity appear
 only on stream=enc rows (TELEM rows leave those columns blank); enable Firmware ENC stream on connect.
+Timed CSV: device_ms is ESP32 millis() for that row (TELEM esp32_ms or ENC time_ms); t_rel_s is
+seconds on that same clock from capture start so TELEM and ENC align. host_unix_s is mapped
+synthetic wall time for plotting continuity.
 Timed CSV: rpm column is spool RPM from ENC linear velocity (same 4\" spool as firmware); near-zero
 velocity uses position delta vs host time. TELEM rows repeat the latest ENC spool rpm (VESC eRPM
 and fault are not written to CSV). Live plots show VESC eRPM, Vbat, and currents from GET_VALUES
 (MOSFET/motor temps are not shown or logged to CSV).
 
-Timed CSV export: with the export checkbox on, any Set current/brake/duty/RPM arms capture.
+Timed CSV export: with the export checkbox on, any Set current/brake/duty arms capture.
 The Test button always arms CSV for that run (checkbox not required) and sends STOP (zero current),
 not SET_DUTY,0 — useful when duty zero still shows sync-rectifier drag. Auto-stop after N>0 s ends
 with a CSV; duration 0 + Test still arms CSV until you press STOP (then CSV).
@@ -351,13 +300,11 @@ def protocol_line_from_user_input(raw: str) -> str:
     verb = parts[0].upper()
     if verb == "SET_CURRENT" and len(parts) == 2:
         return f"SET_CURRENT,{parts[1]}"
-    if verb == "SET_BRAKE" and len(parts) == 2:
-        return f"SET_BRAKE,{parts[1]}"
+    if verb == "SET_BRAKE":
+        return "SET_BRAKE"
     if verb == "SET_DUTY" and len(parts) == 2:
         d = clamp_duty_str(parts[1])
         return f"SET_DUTY,{d:.4f}"
-    if verb == "SET_RPM" and len(parts) == 2:
-        return f"SET_RPM,{parts[1]}"
     if verb == "ENC_RESET":
         return "ENC_RESET"
     if verb == "ENC_STREAM" and len(parts) == 2:
@@ -446,59 +393,6 @@ def run_ble_mode_cli(name: str, scan_s: float, address: Optional[str], skip_ping
     asyncio.run(_go())
 
 
-def interactive_serial_cli(ser: serial.Serial) -> None:
-    stop = threading.Event()
-
-    def on_line(line: str) -> None:
-        print(f"  << {line}")
-
-    reader = SerialReader(ser, on_line, stop)
-    reader.start()
-    print(HELP_TEXT)
-    print()
-    try:
-        while True:
-            try:
-                raw = input("vesc> ").strip()
-            except EOFError:
-                break
-            if not raw:
-                continue
-            upper = raw.upper()
-            if upper in ("QUIT", "EXIT", "Q"):
-                send_serial_line(ser, "STOP")
-                time.sleep(0.2)
-                break
-            if upper == "HELP":
-                print(HELP_TEXT)
-                continue
-            send_serial_line(ser, sanitize_vesc_command_line(protocol_line_from_user_input(raw)))
-            time.sleep(0.15)
-    except KeyboardInterrupt:
-        print("\nInterrupted — STOP")
-        send_serial_line(ser, "STOP")
-        time.sleep(0.2)
-    finally:
-        stop.set()
-
-
-def serial_ping_test(ser: serial.Serial, log: Callable[[str], None]) -> bool:
-    while ser.in_waiting:
-        ser.readline()
-    log("Test: sending PING...")
-    send_serial_line(ser, "PING")
-    deadline = time.time() + PING_TIMEOUT_S
-    while time.time() < deadline:
-        line = ser.readline().decode("utf-8", errors="ignore").strip()
-        if line:
-            log(f"<< {line}")
-        if line.upper().startswith("PONG"):
-            log("PING/PONG OK.")
-            return True
-    log("ERROR: no PONG.")
-    return False
-
-
 # --------------------------------------------------------------------------
 # GUI
 # --------------------------------------------------------------------------
@@ -511,25 +405,21 @@ class VescControlGui:
         root.minsize(900, 720)
 
         self._ui_q: queue.Queue[tuple] = queue.Queue()
-        self._ser: Optional[serial.Serial] = None
-        self._ser_reader_stop: Optional[threading.Event] = None
-        self._ser_reader: Optional[SerialReader] = None
 
         self._ble_thread: Optional[threading.Thread] = None
         self._ble_cmd_q: queue.Queue = queue.Queue()
         self._ble_running = threading.Event()
         self._ble_ready = threading.Event()
-        self.transport = tk.StringVar(value="serial")
         self.status = tk.StringVar(value="Disconnected")
         self.ble_name = tk.StringVar(value="Quikburst")
         self.ble_addr = tk.StringVar(value="")
         self.scan_timeout = tk.DoubleVar(value=12.0)
         self.var_ping = tk.BooleanVar(value=True)
-        self.baud = tk.StringVar(value="115200")
         self.var_run_duration_s = tk.DoubleVar(value=5.0)
         self.var_keepalive_s = tk.DoubleVar(value=0.5)
         self.var_export_csv_timed = tk.BooleanVar(value=False)
         self._csv_timed_capture_start: Optional[float] = None
+        self._csv_device_ms_start: Optional[int] = None
         self._timed_stop_after_id: Optional[str] = None
         self._timed_keepalive_after_id: Optional[str] = None
         self._timed_deadline = 0.0
@@ -541,7 +431,7 @@ class VescControlGui:
 
         self.var_live_telem = tk.BooleanVar(value=False)
         self.var_auto_live_telem = tk.BooleanVar(value=True)
-        self.var_telem_ms = tk.IntVar(value=200)
+        self.var_telem_ms = tk.IntVar(value=50)
         self.var_telem_window_s = tk.DoubleVar(value=30.0)
         self._telem_poll_after_id: Optional[str] = None
         # (t_wall, rpm, duty, vbat, i_motor, i_in) — VESC eRPM for live plots only
@@ -560,7 +450,7 @@ class VescControlGui:
         self.var_enc_stream = tk.BooleanVar(value=True)
 
         self._build()
-        self.root.after(80, self._pump_ui_queue)
+        self.root.after(20, self._pump_ui_queue)
 
     def _build(self) -> None:
         main = ttk.Frame(self.root, padding=8)
@@ -574,23 +464,11 @@ class VescControlGui:
         right = ttk.Frame(outer)
         outer.add(right, weight=1)
 
-        conn = ttk.LabelFrame(left, text="Connection", padding=8)
+        conn = ttk.LabelFrame(left, text="Connection (Bluetooth LE)", padding=8)
         conn.pack(fill=tk.X, pady=(0, 8))
 
-        ttk.Radiobutton(conn, text="USB Serial", variable=self.transport, value="serial").grid(row=0, column=0, sticky=tk.W)
-        ttk.Radiobutton(conn, text="Bluetooth LE (Quikburst)", variable=self.transport, value="ble").grid(row=0, column=1, sticky=tk.W, padx=(16, 0))
-
-        ser_row = ttk.Frame(conn)
-        ser_row.grid(row=1, column=0, columnspan=4, sticky=tk.EW, pady=(8, 0))
-        ttk.Label(ser_row, text="Port:").pack(side=tk.LEFT)
-        self.port_combo = ttk.Combobox(ser_row, width=14, state="readonly")
-        self.port_combo.pack(side=tk.LEFT, padx=(4, 4))
-        ttk.Button(ser_row, text="Refresh", command=self._refresh_ports).pack(side=tk.LEFT)
-        ttk.Label(ser_row, text="Baud:").pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Combobox(ser_row, textvariable=self.baud, width=8, values=("115200", "921600", "57600", "9600")).pack(side=tk.LEFT, padx=(4, 0))
-
         ble_row = ttk.Frame(conn)
-        ble_row.grid(row=2, column=0, columnspan=4, sticky=tk.EW, pady=(6, 0))
+        ble_row.grid(row=0, column=0, columnspan=4, sticky=tk.EW)
         ttk.Label(ble_row, text="BLE name:").pack(side=tk.LEFT)
         ttk.Entry(ble_row, textvariable=self.ble_name, width=18).pack(side=tk.LEFT, padx=(4, 12))
         ttk.Label(ble_row, text="Address (optional):").pack(side=tk.LEFT)
@@ -599,17 +477,17 @@ class VescControlGui:
         ttk.Spinbox(ble_row, from_=3, to=60, textvariable=self.scan_timeout, width=5).pack(side=tk.LEFT, padx=(4, 0))
 
         opt_row = ttk.Frame(conn)
-        opt_row.grid(row=3, column=0, columnspan=4, sticky=tk.W, pady=(8, 0))
+        opt_row.grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=(8, 0))
         ttk.Checkbutton(opt_row, text="PING test after connect", variable=self.var_ping).pack(side=tk.LEFT)
 
         btn_row = ttk.Frame(conn)
-        btn_row.grid(row=4, column=0, columnspan=4, sticky=tk.W, pady=(10, 0))
+        btn_row.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(10, 0))
         self.btn_connect = ttk.Button(btn_row, text="Connect", command=self._on_connect)
         self.btn_connect.pack(side=tk.LEFT, padx=(0, 8))
         self.btn_disconnect = ttk.Button(btn_row, text="Disconnect", command=self._on_disconnect, state=tk.DISABLED)
         self.btn_disconnect.pack(side=tk.LEFT)
 
-        ttk.Label(conn, textvariable=self.status, foreground="#0a5").grid(row=5, column=0, columnspan=4, sticky=tk.W, pady=(8, 0))
+        ttk.Label(conn, textvariable=self.status, foreground="#0a5").grid(row=3, column=0, columnspan=4, sticky=tk.W, pady=(8, 0))
 
         cmd_fr = ttk.LabelFrame(left, text="Commands (same protocol as firmware)", padding=8)
         cmd_fr.pack(fill=tk.X, pady=(0, 8))
@@ -618,7 +496,7 @@ class VescControlGui:
 
         time_fr = ttk.LabelFrame(
             cmd_fr,
-            text="Timed motor output (Set current / brake / duty / RPM, Test, matching raw motor lines)",
+            text="Timed motor output (Set current / brake / duty, Test, matching raw motor lines)",
             padding=6,
         )
         time_fr.grid(row=0, column=0, columnspan=4, sticky=tk.EW, pady=(0, 8))
@@ -653,19 +531,22 @@ class VescControlGui:
             self.cmd_widgets.extend([e, b])
 
         self.var_cur = tk.StringVar(value="0")
-        self.var_brk = tk.StringVar(value="0")
         self.var_duty = tk.StringVar(value="0")
-        self.var_rpm = tk.StringVar(value="0")
 
         self.cmd_widgets.extend([sb_dur, sb_ka])
 
         row_param(3, "Current (A)", self.var_cur, "Set current", "SET_CURRENT")
-        row_param(4, "Brake (A)", self.var_brk, "Set brake", "SET_BRAKE")
+        ttk.Label(
+            cmd_fr,
+            text="Brake (no current — duration uses Auto-stop above)",
+        ).grid(row=4, column=0, sticky=tk.W, pady=2)
+        btn_brake = ttk.Button(cmd_fr, text="Set brake", command=self._send_brake)
+        btn_brake.grid(row=4, column=2, sticky=tk.W, pady=2)
+        self.cmd_widgets.append(btn_brake)
         row_param(5, f"Duty (0–{MAX_DUTY:.2f} max)", self.var_duty, "Set duty", "SET_DUTY")
-        row_param(6, "eRPM", self.var_rpm, "Set RPM", "SET_RPM")
 
         quick = ttk.Frame(cmd_fr)
-        quick.grid(row=7, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
+        quick.grid(row=6, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
         b_stop = ttk.Button(quick, text="STOP", command=lambda: self._send_wire("STOP"))
         b_stop.pack(side=tk.LEFT, padx=(0, 6))
         self.cmd_widgets.append(b_stop)
@@ -684,7 +565,7 @@ class VescControlGui:
         ttk.Button(quick, text="Help", command=lambda: messagebox.showinfo("Commands", HELP_TEXT)).pack(side=tk.LEFT, padx=(12, 0))
 
         raw_fr = ttk.Frame(cmd_fr)
-        raw_fr.grid(row=8, column=0, columnspan=3, sticky=tk.EW, pady=(10, 0))
+        raw_fr.grid(row=7, column=0, columnspan=3, sticky=tk.EW, pady=(10, 0))
         ttk.Label(raw_fr, text="Raw line:").pack(side=tk.LEFT)
         self.raw_entry = ttk.Entry(raw_fr, width=40)
         self.raw_entry.pack(side=tk.LEFT, padx=(4, 8), fill=tk.X, expand=True)
@@ -711,7 +592,7 @@ class VescControlGui:
             command=self._on_live_telem_toggle,
         ).pack(side=tk.LEFT)
         ttk.Label(telem_row, text="every (ms):").pack(side=tk.LEFT, padx=(8, 0))
-        sb_telem_ms = ttk.Spinbox(telem_row, from_=50, to=5000, increment=50, textvariable=self.var_telem_ms, width=6)
+        sb_telem_ms = ttk.Spinbox(telem_row, from_=20, to=5000, increment=10, textvariable=self.var_telem_ms, width=6)
         sb_telem_ms.pack(side=tk.LEFT, padx=(4, 12))
         ttk.Label(telem_row, text="X-axis window (s):").pack(side=tk.LEFT)
         sb_telem_win = ttk.Spinbox(telem_row, from_=5, to=600, increment=5, textvariable=self.var_telem_window_s, width=6)
@@ -756,17 +637,7 @@ class VescControlGui:
         self._enc_graph_inner.pack(fill=tk.BOTH, expand=True)
         self._build_enc_matplotlib(self._enc_graph_inner)
 
-        self._refresh_ports()
         self._set_commands_enabled(False)
-
-    def _refresh_ports(self) -> None:
-        ports = list_serial_port_names()
-        self.port_combo["values"] = ports
-        if ports:
-            guess = find_serial_port()
-            self.port_combo.set(guess if guess in ports else ports[0])
-        else:
-            self.port_combo.set("")
 
     def _log(self, msg: str) -> None:
         self._ui_q.put(("log", msg))
@@ -879,6 +750,28 @@ class VescControlGui:
             delta -= 0x100000000
         return float(self._session_anchor_wall) + delta / 1000.0
 
+    def _estimate_device_ms_at_host_wall(self, host_wall: float) -> Optional[int]:
+        """Best-effort ESP32 millis at a host unix instant (same linear map as sample timestamps)."""
+        aw = self._session_anchor_wall
+        ae = self._session_anchor_esp_ms
+        if aw is None or ae is None:
+            return None
+        dt_ms = int((float(host_wall) - float(aw)) * 1000.0)
+        return (int(ae) + dt_ms) & 0xFFFFFFFF
+
+    def _plot_time_end(self) -> float:
+        """Right edge of rolling plot window: follow latest mapped sample so TELEM/ENC share the same time base."""
+        t_end = time.time()
+        for row in self._telem_samples:
+            tw = row[0]
+            if tw > t_end:
+                t_end = tw
+        for row in self._enc_samples:
+            tw = row[0]
+            if tw > t_end:
+                t_end = tw
+        return t_end
+
     def _feed_telem_from_log_line(self, payload: str) -> None:
         d = parse_telem_line(payload)
         if d is None:
@@ -888,6 +781,7 @@ class VescControlGui:
         self._telem_samples.append(
             (
                 tw,
+                esp,
                 d["rpm"],
                 d["duty"],
                 d["vbat"],
@@ -904,7 +798,7 @@ class VescControlGui:
             tw = max(1.0, float(self.var_telem_window_s.get()))
         except (tk.TclError, ValueError):
             tw = 30.0
-        t_end = time.time()
+        t_end = self._plot_time_end()
         t_start = t_end - tw
         xs: List[float] = []
         rpm_l: List[float] = []
@@ -912,7 +806,7 @@ class VescControlGui:
         im_l: List[float] = []
         iin_l: List[float] = []
         for row in self._telem_samples:
-            t_wall, rpm, _duty, vb, imo, i_i = row[:6]
+            t_wall, _esp_ms, rpm, _duty, vb, imo, i_i = row[:7]
             if t_wall < t_start:
                 continue
             xs.append(t_wall - t_start)
@@ -982,11 +876,12 @@ class VescControlGui:
             self._ui_q.put(item)
 
     def _export_timed_run_csv(self, t_end: float, reason: str) -> None:
-        """Write TELEM + ENC rows between capture start and t_end (timestamps = ESP32-based wall mapping when available)."""
+        """Write TELEM + ENC rows in capture window; t_rel_s uses ESP32 millis when available."""
         self._flush_pending_log_lines_to_samples()
         t_end = max(t_end, time.time())
-        t0 = self._csv_timed_capture_start
-        if t0 is None:
+        t0_wall = self._csv_timed_capture_start
+        dev_start = self._csv_device_ms_start
+        if t0_wall is None:
             if reason == "timed_stop":
                 self._log(
                     "CSV export skipped: no capture window was armed (timed run ended). "
@@ -994,19 +889,31 @@ class VescControlGui:
                 )
             return
         self._csv_timed_capture_start = None
+        self._csv_device_ms_start = None
+
+        dev_end = self._estimate_device_ms_at_host_wall(t_end)
+        use_dev = dev_start is not None and dev_end is not None
 
         rows_out: List[Tuple[float, Dict[str, Any]]] = []
         for row in self._telem_samples:
-            tw = row[0]
-            if not (t0 <= tw <= t_end):
+            tw, esp_ms, rpm, duty, vb, imo, i_i = row[:7]
+            if use_dev and esp_ms is not None:
+                e = int(esp_ms)
+                if _u32_diff_ms(e, dev_start) < 0 or _u32_diff_ms(dev_end, e) < 0:
+                    continue
+            elif not (t0_wall <= tw <= t_end):
                 continue
-            _erpm, duty, vb, imo, i_i = row[1:6]
+            if use_dev and esp_ms is not None and dev_start is not None:
+                t_rel = _u32_diff_ms(int(esp_ms), dev_start) / 1000.0
+            else:
+                t_rel = tw - t0_wall
             rows_out.append(
                 (
                     tw,
                     {
                         "host_unix_s": tw,
-                        "t_rel_s": tw - t0,
+                        "device_ms": int(esp_ms) if esp_ms is not None else "",
+                        "t_rel_s": t_rel,
                         "stream": "telem",
                         "rpm": "",
                         "duty": duty,
@@ -1022,15 +929,23 @@ class VescControlGui:
             )
         for row in self._enc_samples:
             tw = row[0]
-            if not (t0 <= tw <= t_end):
-                continue
             pos_m, vel_mps, count, enc_ms = row[1], row[2], row[3], row[4]
+            if use_dev:
+                if _u32_diff_ms(int(enc_ms), dev_start) < 0 or _u32_diff_ms(dev_end, int(enc_ms)) < 0:
+                    continue
+            elif not (t0_wall <= tw <= t_end):
+                continue
+            if use_dev and dev_start is not None:
+                t_rel = _u32_diff_ms(int(enc_ms), dev_start) / 1000.0
+            else:
+                t_rel = tw - t0_wall
             rows_out.append(
                 (
                     tw,
                     {
                         "host_unix_s": tw,
-                        "t_rel_s": tw - t0,
+                        "device_ms": int(enc_ms),
+                        "t_rel_s": t_rel,
                         "stream": "enc",
                         "rpm": 0.0,
                         "duty": "",
@@ -1047,11 +962,18 @@ class VescControlGui:
 
         rows_out.sort(key=lambda x: x[0])
         enc_rows = [(tw, d) for tw, d in rows_out if d.get("stream") == "enc"]
+        enc_rows.sort(key=lambda x: int(x[1]["device_ms"]))
         prev_tw: Optional[float] = None
         prev_pos: Optional[float] = None
+        prev_count: Optional[int] = None
         for tw, d in enc_rows:
             pos_m = float(d["position_m"])
             vel_mps = float(d["velocity_mps"])
+            count = int(d["enc_count"])
+            # ENC_RESET zeros count — do not chain position-delta RPM across that discontinuity.
+            if prev_count is not None and count < prev_count - 10:
+                prev_tw, prev_pos = None, None
+            prev_count = count
             rpm_spool = _spool_rpm_from_linear_velocity_mps(vel_mps)
             if abs(vel_mps) < 1e-5 and prev_tw is not None and prev_pos is not None:
                 rpm_spool = _spool_rpm_from_position_delta(pos_m, prev_pos, tw, prev_tw)
@@ -1073,6 +995,7 @@ class VescControlGui:
         path = os.path.join(out_dir, f"timed_run_{stamp}_{safe_reason}.csv")
         fieldnames = [
             "host_unix_s",
+            "device_ms",
             "t_rel_s",
             "stream",
             "rpm",
@@ -1104,7 +1027,7 @@ class VescControlGui:
             )
         elif n_enc > 0:
             self._log(
-                "(CSV: rpm = spool RPM from ENC velocity / 4 in circumference; TELEM rows use last ENC rpm.)"
+                "(CSV: device_ms = ESP32 millis; t_rel_s from that clock; rpm = spool from ENC; TELEM rows fill rpm from last ENC.)"
             )
 
     def _feed_enc_from_log_line(self, payload: str) -> None:
@@ -1130,7 +1053,7 @@ class VescControlGui:
             tw = max(1.0, float(self.var_telem_window_s.get()))
         except (tk.TclError, ValueError):
             tw = 30.0
-        t_end = time.time()
+        t_end = self._plot_time_end()
         t_start = t_end - tw
         xs: List[float] = []
         pos_l: List[float] = []
@@ -1167,7 +1090,7 @@ class VescControlGui:
         self._send_line(f"ENC_STREAM,{on}")
 
     def _is_connected(self) -> bool:
-        return self._ser is not None or (
+        return (
             self._ble_thread is not None
             and self._ble_thread.is_alive()
             and self._ble_ready.is_set()
@@ -1190,7 +1113,7 @@ class VescControlGui:
             return
         self._send_line("GET_VALUES")
         try:
-            ms = max(50, int(self.var_telem_ms.get()))
+            ms = max(20, int(self.var_telem_ms.get()))
         except (tk.TclError, ValueError):
             ms = 200
         self._telem_poll_after_id = self.root.after(ms, self._telem_poll_tick)
@@ -1227,6 +1150,12 @@ class VescControlGui:
                         self._append_log_safe(payload)
                     self._feed_telem_from_log_line(payload)
                     self._feed_enc_from_log_line(payload)
+                    # Fresh plot after hardware zero — only when not holding samples for an active CSV window.
+                    if (
+                        self._csv_timed_capture_start is None
+                        and payload.strip().upper().startswith("OK,ENC_RESET")
+                    ):
+                        self._clear_enc_data()
                 elif kind == "status":
                     self.status.set(payload)
                 elif kind == "connected":
@@ -1238,6 +1167,7 @@ class VescControlGui:
                 elif kind == "disconnected":
                     self._reset_device_time_anchor()
                     self._csv_timed_capture_start = None
+                    self._csv_device_ms_start = None
                     self._cancel_timed_run()
                     self._stop_telem_polling()
                     self.var_live_telem.set(False)
@@ -1253,7 +1183,7 @@ class VescControlGui:
                     messagebox.showerror("Error", payload)
         except queue.Empty:
             pass
-        self.root.after(80, self._pump_ui_queue)
+        self.root.after(20, self._pump_ui_queue)
 
     def _apply_connected_state(self, connected: bool) -> None:
         self.btn_connect.configure(state=tk.DISABLED if connected else tk.NORMAL)
@@ -1336,9 +1266,8 @@ class VescControlGui:
         u = line.strip().upper()
         return (
             u.startswith("SET_CURRENT,")
-            or u.startswith("SET_BRAKE,")
+            or u == "SET_BRAKE"
             or u.startswith("SET_DUTY,")
-            or u.startswith("SET_RPM,")
         )
 
     def _maybe_arm_timed_run(self, *, force_csv: bool = False, from_test: bool = False) -> None:
@@ -1352,8 +1281,10 @@ class VescControlGui:
             ka = 0.0
         if self.var_export_csv_timed.get() or force_csv:
             self._csv_timed_capture_start = time.time()
+            self._csv_device_ms_start = self._estimate_device_ms_at_host_wall(time.time())
         else:
             self._csv_timed_capture_start = None
+            self._csv_device_ms_start = None
         if dur > 0:
             self._schedule_timed_run(dur, max(0.0, ka))
         else:
@@ -1364,7 +1295,7 @@ class VescControlGui:
     def _on_test_freewheel_record(self) -> None:
         """Timed CSV/keepalive like motor sets, but command STOP (0 A) instead of SET_DUTY,0."""
         if not self._is_connected():
-            messagebox.showwarning("Not connected", "Connect over USB or BLE first.")
+            messagebox.showwarning("Not connected", "Connect over Bluetooth first.")
             return
         self._maybe_arm_timed_run(force_csv=True, from_test=True)
         self._send_line("STOP")
@@ -1372,6 +1303,11 @@ class VescControlGui:
             "(Test: STOP + CSV always armed for this run (Export checkbox not required); "
             "enable Live TELEM poll for VESC rows in the file)"
         )
+
+    def _send_brake(self) -> None:
+        """SET_BRAKE has no host-side magnitude; timed auto-stop still applies."""
+        self._maybe_arm_timed_run()
+        self._send_line("SET_BRAKE")
 
     def _send_motor_param(self, prefix: str, value: str) -> None:
         val = value.strip()
@@ -1383,87 +1319,7 @@ class VescControlGui:
 
     def _on_connect(self) -> None:
         self.btn_connect.configure(state=tk.DISABLED)
-        if self.transport.get() == "serial":
-
-            def run_serial() -> None:
-                try:
-                    self._thread_serial_connect()
-                except Exception as e:
-                    self._ui_q.put(("log", f"USB connect thread error: {e}"))
-                    self._set_status("Disconnected")
-                    self._ui_q.put(("disconnected", None))
-
-            threading.Thread(target=run_serial, daemon=True).start()
-        else:
-            threading.Thread(target=self._thread_ble_connect, daemon=True).start()
-
-    def _thread_serial_connect(self) -> None:
-        port = self.port_combo.get().strip()
-        if not port:
-            self._ui_q.put(("errorbox", "Select a serial port."))
-            self._ui_q.put(("disconnected", None))
-            return
-        try:
-            baud = int(self.baud.get())
-        except ValueError:
-            self._ui_q.put(("errorbox", "Invalid baud rate."))
-            self._ui_q.put(("disconnected", None))
-            return
-        self._set_status("Connecting (USB)...")
-        ser: Optional[serial.Serial] = None
-        try:
-            ser = serial.Serial(port, baud, timeout=0.5)
-        except serial.SerialException as e:
-            self._ui_q.put(("log", f"Open failed: {e}"))
-            self._set_status("Disconnected")
-            self._ui_q.put(("errorbox", str(e)))
-            self._ui_q.put(("disconnected", None))
-            return
-
-        try:
-            self._log(f"Opened {port} @ {baud}")
-            self._log("Waiting for READY...")
-            if not wait_for_ready(ser, READY_TIMEOUT_S, log=lambda m: self._log(m)):
-                self._log("(No READY — continuing)")
-            time.sleep(0.2)
-            while ser.in_waiting:
-                ser.readline()
-            if self.var_ping.get():
-                serial_ping_test(ser, log=lambda m: self._log(m))
-
-            stop = threading.Event()
-
-            def on_line(line: str) -> None:
-                self._log(f"<< {line}")
-
-            self._ser = ser
-            self._ser_reader_stop = stop
-            self._ser_reader = SerialReader(ser, on_line, stop)
-            self._ser_reader.start()
-            ser = None
-            self._set_status(f"Connected: {port}")
-            self._ui_q.put(("connected", None))
-            self._ui_q.put(("post_connect_enc", None))
-        except Exception as e:
-            self._ui_q.put(("log", f"USB connect failed: {e}"))
-            self._ui_q.put(("errorbox", str(e)))
-            if self._ser_reader_stop is not None:
-                self._ser_reader_stop.set()
-            self._ser_reader = None
-            self._ser_reader_stop = None
-            if self._ser is not None:
-                try:
-                    self._ser.close()
-                except Exception:
-                    pass
-                self._ser = None
-            if ser is not None:
-                try:
-                    ser.close()
-                except Exception:
-                    pass
-            self._set_status("Disconnected")
-            self._ui_q.put(("disconnected", None))
+        threading.Thread(target=self._thread_ble_connect, daemon=True).start()
 
     def _thread_ble_connect(self) -> None:
         try:
@@ -1513,7 +1369,7 @@ class VescControlGui:
         async def pump_rx() -> None:
             while self._ble_running.is_set():
                 try:
-                    ln = await link.get_line(0.35)
+                    ln = await link.get_line(0.05)
                     self._log(f"<< {ln}")
                 except asyncio.TimeoutError:
                     continue
@@ -1593,28 +1449,10 @@ class VescControlGui:
     def _on_disconnect(self) -> None:
         self._reset_device_time_anchor()
         self._csv_timed_capture_start = None
+        self._csv_device_ms_start = None
         self._cancel_timed_run()
         self._stop_telem_polling()
         self.var_live_telem.set(False)
-        if self._ser is not None:
-            if self._ser_reader_stop:
-                self._ser_reader_stop.set()
-            try:
-                send_serial_line(self._ser, "STOP")
-            except Exception:
-                pass
-            try:
-                self._ser.close()
-            except Exception:
-                pass
-            self._ser = None
-            self._ser_reader = None
-            self._ser_reader_stop = None
-            self._apply_connected_state(False)
-            self._set_status("Disconnected")
-            self._log("USB disconnected.")
-            return
-
         if self._ble_thread and self._ble_thread.is_alive():
             self._ble_ready.clear()
             self._ble_cmd_q.put(("close",))
@@ -1644,19 +1482,11 @@ class VescControlGui:
     def _send_line(self, line: str) -> None:
         line = sanitize_vesc_command_line(line.strip())
         wire = line + "\n"
-        if self._ser is not None:
-            try:
-                self._ser.write(wire.encode("utf-8"))
-                self._ser.flush()
-                self._log(f">> {line.strip()}")
-            except Exception as e:
-                self._log(f"Send error: {e}")
-            return
         if self._ble_thread and self._ble_thread.is_alive() and self._ble_ready.is_set():
             self._ble_cmd_q.put(("write", wire.encode("utf-8")))
             self._log(f">> {line.strip()}")
             return
-        messagebox.showwarning("Not connected", "Connect over USB or BLE first.")
+        messagebox.showwarning("Not connected", "Connect over Bluetooth first.")
 
 
 def run_gui() -> None:
@@ -1666,11 +1496,8 @@ def run_gui() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Quikburst VESC control — GUI (default) or CLI")
-    parser.add_argument("--cli", action="store_true", help="Terminal mode instead of GUI")
-    parser.add_argument("port", nargs="?", help="[CLI] Serial port, e.g. COM4")
-    parser.add_argument("--baud", type=int, default=115200)
-    parser.add_argument("--ble", action="store_true", help="[CLI] Bluetooth LE")
+    parser = argparse.ArgumentParser(description="Quikburst VESC control — GUI (default) or BLE CLI")
+    parser.add_argument("--cli", action="store_true", help="Terminal mode over Bluetooth LE")
     parser.add_argument("--name", type=str, default="Quikburst")
     parser.add_argument("--scan", type=float, default=12.0)
     parser.add_argument("--address", type=str, default=None)
@@ -1681,30 +1508,8 @@ def main() -> None:
         run_gui()
         return
 
-    if args.ble:
-        run_ble_mode_cli(args.name, args.scan, args.address, args.no_ping_test)
-        print("Disconnected.")
-        return
-
-    port = args.port or find_serial_port()
-    if not port:
-        port = input("COM port [COM4]: ").strip() or "COM4" if sys.platform == "win32" else input("Serial: ").strip() or "/dev/ttyUSB0"
-    print(f"Connecting to {port}...")
-    try:
-        ser = serial.Serial(port, args.baud, timeout=0.5)
-    except serial.SerialException as e:
-        print(e)
-        sys.exit(1)
-    print("Waiting for READY...")
-    if not wait_for_ready(ser, log=print):
-        print("(No READY — continuing)")
-    time.sleep(0.3)
-    while ser.in_waiting:
-        ser.readline()
-    if not args.no_ping_test:
-        serial_ping_test(ser, log=print)
-    interactive_serial_cli(ser)
-    ser.close()
+    run_ble_mode_cli(args.name, args.scan, args.address, args.no_ping_test)
+    print("Disconnected.")
 
 
 if __name__ == "__main__":

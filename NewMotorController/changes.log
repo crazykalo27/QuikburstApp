@@ -13,4 +13,8 @@
 2026-04-10: vesc_serial_control.py — remove t_mos/t_motor from timed CSV, live TELEM plot (4 stacked traces), and samples; strip_tach_columns.py drops those columns too.
 2026-04-10: strip_tach_columns.py — also drops rpm from existing CSVs only (exporter unchanged).
 2026-04-10: vescUartTest.ino — TELEM prefixed with esp32_ms (millis); vesc_serial_control.py maps ENC time_ms + TELEM esp32_ms to wall time via session anchor (legacy TELEM without field still uses host receive time).
+2026-04-11: Host link BLE-only — vescUartTest.ino removes USB command I/O and Serial debug prints; sendHostLine is BLE notify only. vesc_serial_control.py drops pyserial, USB GUI/CLI, and `--ble` (CLI is always BLE).
+2026-04-11: vesc_serial_control.py — plot window end tracks max(mapped sample, host now); 20ms UI pump, 16ms plot coalesce, 50ms default GET_VALUES, 20ms min poll, BLE get_line 50ms; timed CSV device_ms + t_rel_s on ESP32 clock; data_capture_viewer TIME_CANDIDATES includes device_ms.
+2026-04-11: NewMotorController pair — removed SET_RPM/eRPM UI and firmware path. SET_BRAKE is now a no-arg command; firmware uses VESC_BRAKE_APPLY_AMPS; STOP clears brake current; GUI brake is button-only with same timed CSV/auto-stop behavior.
+2026-04-11: vesc_serial_control.py — on OK,ENC_RESET clear encoder plot buffers when no CSV capture is armed (keeps in-flight export rows); timed CSV spool rpm no longer chains position-delta across ENC_RESET (count step-down breaks prev).
 2026-04-10: data_capture_viewer.py — Cut overwrites CSV with rows in current X range (plot zoom or min/max); re-zeroes t_rel_s when possible. Delete file removes current CSV from disk and refreshes list.

@@ -28,7 +28,7 @@ from matplotlib.figure import Figure
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-TIME_CANDIDATES = ("t_rel_s", "time_s", "time", "t_s", "timestamp", "host_unix_s")
+TIME_CANDIDATES = ("t_rel_s", "device_ms", "time_s", "time", "t_s", "timestamp", "host_unix_s")
 
 
 def discover_data_files(root: Path) -> list[Path]:

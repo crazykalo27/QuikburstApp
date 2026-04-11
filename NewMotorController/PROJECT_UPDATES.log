@@ -1,1 +1,3 @@
 2026-04-10: Added data_capture_viewer.py — tkinter GUI to browse CSV/Excel under NewMotorController, stacked time-series with shared X and file/series navigation; requirements.txt gains pandas + openpyxl.
+2026-04-11: vesc_serial_control.py and vescUartTest.ino — dropped USB serial host path; control is BLE-only; removed pyserial from requirements.
+2026-04-11: vesc_serial_control.py — live plots use latest sample time as window end (TELEM vs ENC alignment); faster UI pump / BLE line wait / TELEM poll default; CSV adds device_ms and t_rel_s from ESP32 millis capture window.

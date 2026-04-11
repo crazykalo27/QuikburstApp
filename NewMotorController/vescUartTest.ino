@@ -1,17 +1,15 @@
 /*
- * VESC UART Test — ESP32 ↔ host (USB Serial + BLE) ↔ VESC (UART2)
+ * VESC UART Test — ESP32 ↔ host (BLE only) ↔ VESC (UART2)
  *
- * Serial  (USB, 115200) — same text protocol as before
- * BLE     — Nordic UART Service (NUS); advertised name "Quikburst" for discovery
+ * Host link: Nordic UART Service (NUS); advertised name "Quikburst" for discovery.
  *
  * VESC: Serial2 @ VESC_UART_RX_PIN / VESC_UART_TX_PIN (see below).
  *
- * Protocol (newline-terminated; identical on USB and BLE):
+ * Protocol (newline-terminated; BLE Nordic UART RX writes, TX notifications):
  *   PING                      → PONG,Quikburst
  *   SET_CURRENT,<amps>        → OK,SET_CURRENT,...
- *   SET_BRAKE,<amps>          → ...
+ *   SET_BRAKE                 → OK,SET_BRAKE (full brake; no host current arg — see VESC_BRAKE_APPLY_AMPS)
  *   SET_DUTY,<duty>           → duty clamped to 0…0.20 (20%)
- *   SET_RPM,<erpm>            → ...
  *   STOP                      → OK,STOP
  *   GET_VALUES                → TELEM,esp32_ms,rpm,duty,vbat,imotor,iin,tmos,tmotor,tach,tachAbs,fault
  *                               (esp32_ms = millis() when line is sent; same clock as ENC time_ms)
@@ -19,10 +17,10 @@
  *   KEEPALIVE                 → OK,KEEPALIVE
  *   ENC_RESET                 → OK,ENC_RESET (zero encoder count / position)
  *   ENC_STREAM,<0|1>         → OK,ENC_STREAM,... (enable/disable ENC line streaming)
- *   ENC,...                   — streamed ~100 Hz when ENC_STREAM on (USB + BLE):
+ *   ENC,...                   — streamed ~100 Hz when ENC_STREAM on (BLE):
  *                               ENC,time_ms,count,position_m,velocity_mps
  *                               (same quadrature + spool geometry as ahaan100/encoder.ino)
- *   [READY]                   — periodic heartbeat (USB + BLE when connected)
+ *   [READY]                   — periodic heartbeat to BLE when connected
  *
  * BLE UUIDs (Nordic UART Service — works with bleak / nRF Connect):
  *   Service 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
@@ -33,9 +31,9 @@
  * so you can scan and connect again without power-cycling the ESP32.
  *
  * Status LEDs (active HIGH):
- *   GPIO 27 — on while firmware is running and not BLE-connected (USB-only / idle advertising).
+ *   GPIO 27 — on while firmware is running and not BLE-connected (idle advertising).
  *   GPIO 26 — on while BLE host is connected (27 off) unless motor is active.
- *   When motor is commanded non-idle (current / duty / RPM / brake): both 26 and 27 on.
+ *   When motor is commanded non-idle (current / duty / brake): both 26 and 27 on.
  */
 
 #include <VescUart.h>
@@ -55,6 +53,11 @@
 // Max duty cycle for SET_DUTY (fraction 0–1); matches Python GUI cap.
 #ifndef VESC_MAX_DUTY
 #define VESC_MAX_DUTY 0.20f
+#endif
+
+// SET_BRAKE applies this brake current over UART; VESC still enforces its own limits. Not sent from host.
+#ifndef VESC_BRAKE_APPLY_AMPS
+#define VESC_BRAKE_APPLY_AMPS 120.0f
 #endif
 
 // ---------------------------------------------------------------------------
@@ -153,7 +156,6 @@ static constexpr char BLE_DEVICE_NAME[] = "Quikburst";
 
 VescUart UART;
 
-static String g_serialCmdBuf;
 static String g_bleCmdBuf;
 
 static constexpr uint32_t READY_INTERVAL_MS = 5000;
@@ -191,7 +193,7 @@ static void updateStatusLeds() {
 }
 
 // ---------------------------------------------------------------------------
-// Host output: USB Serial + BLE notify (chunked; client should reassemble to lines)
+// Host output: BLE notify only (chunked; client should reassemble to lines)
 // ---------------------------------------------------------------------------
 
 static void sendBleRaw(const uint8_t* data, size_t len) {
@@ -209,7 +211,6 @@ static void sendBleRaw(const uint8_t* data, size_t len) {
 }
 
 static void sendHostLine(const char* line) {
-  Serial.println(line);
   if (!g_bleConnected || !g_txChar) return;
   String s(line);
   s += '\n';
@@ -244,6 +245,7 @@ static void processCommand(const String& cmd) {
 
   if (cmd == "STOP") {
     UART.setCurrent(0.0f);
+    UART.setBrakeCurrent(0.0f);
     g_motorActive = false;
     updateStatusLeds();
     sendHostLine("OK,STOP");
@@ -259,12 +261,11 @@ static void processCommand(const String& cmd) {
     return;
   }
 
-  if (cmd.startsWith("SET_BRAKE,")) {
-    float amps = parseFloat(cmd.substring(10));
-    UART.setBrakeCurrent(amps);
-    g_motorActive = (fabsf(amps) > 1e-4f);
+  if (cmd == "SET_BRAKE") {
+    UART.setBrakeCurrent(VESC_BRAKE_APPLY_AMPS);
+    g_motorActive = true;
     updateStatusLeds();
-    sendHostFmt("OK,SET_BRAKE,%.3f", amps);
+    sendHostLine("OK,SET_BRAKE");
     return;
   }
 
@@ -276,15 +277,6 @@ static void processCommand(const String& cmd) {
     g_motorActive = (duty > 1e-5f);
     updateStatusLeds();
     sendHostFmt("OK,SET_DUTY,%.4f", duty);
-    return;
-  }
-
-  if (cmd.startsWith("SET_RPM,")) {
-    float rpm = parseFloat(cmd.substring(8));
-    UART.setRPM(rpm);
-    g_motorActive = (fabsf(rpm) > 1e-3f);
-    updateStatusLeds();
-    sendHostFmt("OK,SET_RPM,%.1f", rpm);
     return;
   }
 
@@ -368,7 +360,6 @@ class QuikburstServerCallbacks : public BLEServerCallbacks {
   void onDisconnect(BLEServer*) override {
     g_bleConnected = false;
     updateStatusLeds();
-    Serial.println("(BLE disconnected)");
     // Defer restart to loop(): stack is still tearing down; immediate startAdvertising often fails to re-advertise.
     g_bleAdvRestartAtMs = millis() + 400;
   }
@@ -417,21 +408,6 @@ static void setupBle() {
   svc->start();
 
   restartBleAdvertising();
-
-  Serial.print("BLE advertising as \"");
-  Serial.print(BLE_DEVICE_NAME);
-  Serial.println("\" (Nordic UART Service)");
-}
-
-// ---------------------------------------------------------------------------
-// USB Serial
-// ---------------------------------------------------------------------------
-
-static void pollSerial() {
-  while (Serial.available()) {
-    char c = Serial.read();
-    feedLineBuffer(g_serialCmdBuf, c);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -439,9 +415,6 @@ static void pollSerial() {
 // ---------------------------------------------------------------------------
 
 void setup() {
-  Serial.begin(115200);
-  delay(800);
-
   pinMode(STATUS_LED_BLE_PIN, OUTPUT);
   pinMode(STATUS_LED_ON_PIN, OUTPUT);
   g_motorActive = false;
@@ -453,28 +426,17 @@ void setup() {
   setupBle();
 
   delay(300);
-  Serial.println();
   pinMode(ENC_PIN_A, INPUT_PULLUP);
   pinMode(ENC_PIN_B, INPUT_PULLUP);
   g_lastEncoded = ((int8_t)digitalRead(ENC_PIN_A) << 1) | (int8_t)digitalRead(ENC_PIN_B);
   attachInterrupt(digitalPinToInterrupt(ENC_PIN_A), updateEncoder, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_PIN_B), updateEncoder, CHANGE);
 
-  Serial.println("VESC UART Test (ESP32) — USB + BLE \"Quikburst\"");
-  Serial.println("Commands: PING | SET_CURRENT,<A> | SET_BRAKE,<A> | SET_DUTY,<d> | SET_RPM,<e> | STOP | GET_VALUES | GET_FW | KEEPALIVE | ENC_RESET | ENC_STREAM,<0|1>");
-  Serial.print("Encoder: PPR="); Serial.print(ENCODER_PPR);
-  Serial.print(" counts/rev="); Serial.print(COUNTS_PER_REV);
-  Serial.print(" m/count="); Serial.println(METERS_PER_COUNT, 6);
-  Serial.println("Stream: ENC,time_ms,count,position_m,velocity_mps @ 100 Hz (ENC_STREAM off to disable)");
-  Serial.println("TELEM: esp32_ms then VESC values (esp32_ms matches ENC millis clock)");
-  Serial.println("LEDs: GPIO27 on when running (no BLE); GPIO26 on when BLE; both on when motor command non-idle");
   updateStatusLeds();
   sendHostLine("[READY]");
 }
 
 void loop() {
-  pollSerial();
-
   uint32_t now = millis();
   pollEncoderStream(now);
   if (now - g_lastReadyMs >= READY_INTERVAL_MS) {
@@ -488,7 +450,6 @@ void loop() {
       g_bleAdvRestartAtMs = 0;
       if (!g_bleConnected) {
         restartBleAdvertising();
-        Serial.println("(BLE advertising restarted — scan for Quikburst)");
       }
     }
   }
