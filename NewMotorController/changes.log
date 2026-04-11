@@ -1,0 +1,16 @@
+2026-04-10: vescUartTest.ino — quadrature encoder (pins 33/25, 600 PPR 4x, 4" spool → m/count) streams ENC,... @100 Hz via sendHostLine (USB+BLE); ENC_RESET, ENC_STREAM. vesc_serial_control.py — parse ENC, live position/velocity plots (throttled redraw), ENC lines omitted from text log, GUI sync ENC_STREAM on connect.
+2026-04-10: vesc_serial_control.py — timed-run checkbox exports TELEM+ENC samples to NewMotorController/timed_captures/*.csv on auto STOP, manual STOP, or raw STOP; samples store full TELEM tach/fault and ENC count/millis.
+2026-04-10: vescUartTest.ino — status LEDs GPIO26 (BLE) / GPIO27 (on when not BLE); both on when SET_CURRENT/BRAKE/DUTY/RPM non-idle; STOP clears motor LED state.
+2026-04-10: vesc_serial_control.py — main TELEM figure adds top subplot encoder position (m) above RPM; encoder throttled redraw refreshes it too.
+2026-04-10: vescUartTest.ino — BLE disconnect schedules advertising restart (~400ms) via restartBleAdvertising() + g_server->startAdvertising; vesc_serial_control.py — brief post-session delay + log when reconnecting after a real BLE session.
+2026-04-10: vesc_serial_control.py — unified LIVE_PLOTS_REDRAW_MS coalesces TELEM+encoder figure redraws; auto-start live TELEM after connect (checkbox); larger deques; CSV log shows telem vs enc row counts.
+2026-04-10: vesc_serial_control.py — CSV export arms on any motor Set (incl. SET_DUTY,0) when checkbox on; duration 0 exports on manual STOP; duration>0 unchanged (auto STOP+CSV).
+2026-04-10: vesc_serial_control.py — GUI "Test" next to STOP: arms timed CSV/keepalive like motor buttons but sends only STOP (zero current), avoiding SET_DUTY,0 for freer-shaft characterization.
+2026-04-10: vesc_serial_control.py — Test always arms CSV capture (ignores Export checkbox); fixed _timed_run_is_test cleared by schedule/cancel so timed Test actually exports; log when timed_stop has no capture window.
+2026-04-10: vesc_serial_control.py — CSV export flushes pending ('log',) UI-queue lines into TELEM/ENC deques first (fixes missing enc/position rows at timed stop); arm timed capture before motor send; HELP + log hint that position_m is stream=enc only.
+2026-04-10: vesc_serial_control.py — timed CSV no longer includes tach/tach_abs; strip_tach_columns.py removes those two columns from existing CSVs (default timed_captures/*.csv).
+2026-04-10: vesc_serial_control.py — timed CSV drops fault; rpm column = spool RPM from ENC (4 in circ.) with position fallback; TELEM rpm forward-filled from last ENC. strip_tach_columns.py also drops fault.
+2026-04-10: vesc_serial_control.py — remove t_mos/t_motor from timed CSV, live TELEM plot (4 stacked traces), and samples; strip_tach_columns.py drops those columns too.
+2026-04-10: strip_tach_columns.py — also drops rpm from existing CSVs only (exporter unchanged).
+2026-04-10: vescUartTest.ino — TELEM prefixed with esp32_ms (millis); vesc_serial_control.py maps ENC time_ms + TELEM esp32_ms to wall time via session anchor (legacy TELEM without field still uses host receive time).
+2026-04-10: data_capture_viewer.py — Cut overwrites CSV with rows in current X range (plot zoom or min/max); re-zeroes t_rel_s when possible. Delete file removes current CSV from disk and refreshes list.

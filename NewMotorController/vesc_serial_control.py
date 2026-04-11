@@ -17,6 +17,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
+import datetime
+import math
+import os
 import queue
 import sys
 import time
@@ -24,7 +28,7 @@ import threading
 import tkinter as tk
 from collections import deque
 from tkinter import ttk, scrolledtext, messagebox
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import serial
 import serial.tools.list_ports
@@ -39,6 +43,28 @@ PING_TIMEOUT_S = 5.0
 
 # Must match vescUartTest.ino VESC_MAX_DUTY (fraction 0–1).
 MAX_DUTY = 0.20
+
+# Match vescUartTest.ino: 4" spool → linear m/count; used for CSV spool RPM from encoder velocity/position.
+_SPOOL_DIAMETER_IN = 4.0
+_SPOOL_CIRCUMFERENCE_M = math.pi * _SPOOL_DIAMETER_IN * 0.0254
+
+
+def _spool_rpm_from_linear_velocity_mps(v_mps: float) -> float:
+    """Spool revolutions per minute from linear tape speed (m/s)."""
+    if _SPOOL_CIRCUMFERENCE_M <= 0:
+        return 0.0
+    return (v_mps / _SPOOL_CIRCUMFERENCE_M) * 60.0
+
+
+def _spool_rpm_from_position_delta(pos1_m: float, pos0_m: float, t1_s: float, t0_s: float) -> float:
+    dt = t1_s - t0_s
+    if dt <= 0:
+        return 0.0
+    return _spool_rpm_from_linear_velocity_mps((pos1_m - pos0_m) / dt)
+
+
+# Coalesce matplotlib redraws for main TELEM+encoder figure and secondary encoder figure (~25 Hz).
+LIVE_PLOTS_REDRAW_MS = 40
 
 
 def clamp_duty_str(s: str) -> float:
@@ -60,30 +86,78 @@ def sanitize_vesc_command_line(line: str) -> str:
 
 
 def parse_telem_line(msg: str) -> Optional[Dict[str, Any]]:
-    """Parse TELEM line from log (with or without '<< ' prefix). Firmware: TELEM,rpm,duty,vbat,imotor,iin,tmos,tmotor,tach,tachAbs,fault"""
+    """Parse TELEM from log (optional '<< ' prefix).
+
+    New firmware: TELEM,esp32_ms,rpm,duty,... (12+ fields). Legacy: TELEM,rpm,... (11 fields, no esp32_ms).
+    tach/tachAbs/fault and temps are validated on the wire but not returned (CSV omits them).
+    """
     s = msg.strip()
     if s.startswith("<< "):
         s = s[3:].strip()
     if not s.upper().startswith("TELEM,"):
         return None
     parts = s.split(",")
-    if len(parts) < 11:
+    try:
+        if len(parts) >= 12:
+            esp_ms = int(parts[1])
+            for i in (9, 10):
+                int(float(parts[i]))
+            int(float(parts[11]))
+            float(parts[7])
+            float(parts[8])
+            return {
+                "esp_ms": esp_ms,
+                "rpm": float(parts[2]),
+                "duty": float(parts[3]),
+                "vbat": float(parts[4]),
+                "i_motor": float(parts[5]),
+                "i_in": float(parts[6]),
+            }
+        if len(parts) >= 11:
+            for i in (8, 9):
+                int(float(parts[i]))
+            int(float(parts[10]))
+            float(parts[6])
+            float(parts[7])
+            return {
+                "esp_ms": None,
+                "rpm": float(parts[1]),
+                "duty": float(parts[2]),
+                "vbat": float(parts[3]),
+                "i_motor": float(parts[4]),
+                "i_in": float(parts[5]),
+            }
+    except (ValueError, IndexError):
+        return None
+    return None
+
+
+def parse_enc_line(msg: str) -> Optional[Dict[str, Any]]:
+    """Parse ENC from firmware: ENC,time_ms,count,position_m,velocity_mps (optional '<< ' prefix)."""
+    s = msg.strip()
+    if s.startswith("<< "):
+        s = s[3:].strip()
+    if not s.upper().startswith("ENC,"):
+        return None
+    parts = s.split(",")
+    if len(parts) != 5:
         return None
     try:
         return {
-            "rpm": float(parts[1]),
-            "duty": float(parts[2]),
-            "vbat": float(parts[3]),
-            "i_motor": float(parts[4]),
-            "i_in": float(parts[5]),
-            "t_mos": float(parts[6]),
-            "t_motor": float(parts[7]),
-            "tach": int(float(parts[8])),
-            "tach_abs": int(float(parts[9])),
-            "fault": int(parts[10]),
+            "time_ms": int(parts[1]),
+            "count": int(parts[2]),
+            "position_m": float(parts[3]),
+            "velocity_mps": float(parts[4]),
         }
     except (ValueError, IndexError):
         return None
+
+
+def is_enc_log_payload(payload: str) -> bool:
+    s = payload.strip()
+    if s.startswith("<< "):
+        s = s[3:].strip()
+    return s.upper().startswith("ENC,")
 
 
 # --------------------------------------------------------------------------
@@ -245,11 +319,27 @@ async def ble_ping_test(client, link: BleLineLink, log: Callable[[str], None]) -
 HELP_TEXT = """
 Commands (USB and BLE):
   PING, SET_CURRENT,<A>, SET_BRAKE,<A>, SET_DUTY,<d> (duty capped at 0.20), SET_RPM,<e>,
-  STOP, GET_VALUES, GET_FW, KEEPALIVE
+  STOP, GET_VALUES, GET_FW, KEEPALIVE, ENC_RESET, ENC_STREAM,<0|1>
 
-Telemetry: the VESC does NOT push TELEM by itself. Each GET_VALUES request returns one TELEM line.
-Use "Live TELEM poll" in the GUI to request GET_VALUES repeatedly for a live graph (near real-time,
-limited by poll interval + UART/BLE latency).
+Telemetry: the VESC does NOT push TELEM by itself. Each GET_VALUES request returns one TELEM line
+(TELEM,esp32_ms,... where esp32_ms is ESP millis when sent — same clock as ENC time_ms). The GUI maps
+those device times to a wall timeline (anchor = first sample) so ENC and TELEM align by when they
+occurred on the ESP32, not USB receive order. Legacy firmware without esp32_ms still uses host receive time.
+Use "Live TELEM poll" (or auto-start after connect) so TELEM and ENC stream together; plots refresh together.
+
+Encoder: firmware streams ENC,time_ms,count,position_m,velocity_mps at 100 Hz over USB and BLE
+(same quadrature + 4\" spool geometry as ahaan100/encoder.ino). ENC lines are not copied to the
+log (rate). Commands: ENC_RESET (zero), ENC_STREAM,0 | ENC_STREAM,1. CSV position/velocity appear
+only on stream=enc rows (TELEM rows leave those columns blank); enable Firmware ENC stream on connect.
+Timed CSV: rpm column is spool RPM from ENC linear velocity (same 4\" spool as firmware); near-zero
+velocity uses position delta vs host time. TELEM rows repeat the latest ENC spool rpm (VESC eRPM
+and fault are not written to CSV). Live plots show VESC eRPM, Vbat, and currents from GET_VALUES
+(MOSFET/motor temps are not shown or logged to CSV).
+
+Timed CSV export: with the export checkbox on, any Set current/brake/duty/RPM arms capture.
+The Test button always arms CSV for that run (checkbox not required) and sends STOP (zero current),
+not SET_DUTY,0 — useful when duty zero still shows sync-rectifier drag. Auto-stop after N>0 s ends
+with a CSV; duration 0 + Test still arms CSV until you press STOP (then CSV).
 
 If the motor stops after a few seconds with no auto-stop set, that is usually the VESC
 APP / UART timeout — use "Keepalive every (s)" in the GUI or raise the timeout in VESC Tool.
@@ -268,6 +358,10 @@ def protocol_line_from_user_input(raw: str) -> str:
         return f"SET_DUTY,{d:.4f}"
     if verb == "SET_RPM" and len(parts) == 2:
         return f"SET_RPM,{parts[1]}"
+    if verb == "ENC_RESET":
+        return "ENC_RESET"
+    if verb == "ENC_STREAM" and len(parts) == 2:
+        return f"ENC_STREAM,{parts[1].strip()}"
     if verb in ("STOP", "GET_VALUES", "GET_FW", "KEEPALIVE", "PING"):
         return verb
     return raw
@@ -414,7 +508,7 @@ class VescControlGui:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title("Quikburst VESC Control")
-        root.minsize(900, 520)
+        root.minsize(900, 720)
 
         self._ui_q: queue.Queue[tuple] = queue.Queue()
         self._ser: Optional[serial.Serial] = None
@@ -434,20 +528,36 @@ class VescControlGui:
         self.baud = tk.StringVar(value="115200")
         self.var_run_duration_s = tk.DoubleVar(value=5.0)
         self.var_keepalive_s = tk.DoubleVar(value=0.5)
+        self.var_export_csv_timed = tk.BooleanVar(value=False)
+        self._csv_timed_capture_start: Optional[float] = None
         self._timed_stop_after_id: Optional[str] = None
         self._timed_keepalive_after_id: Optional[str] = None
         self._timed_deadline = 0.0
         self._timed_ka_interval_s = 0.0
+        self._timed_run_is_test = False
+        # Map ESP32 millis() (ENC time_ms + TELEM esp32_ms) to a wall timeline; reset each session.
+        self._session_anchor_wall: Optional[float] = None
+        self._session_anchor_esp_ms: Optional[int] = None
 
         self.var_live_telem = tk.BooleanVar(value=False)
+        self.var_auto_live_telem = tk.BooleanVar(value=True)
         self.var_telem_ms = tk.IntVar(value=200)
         self.var_telem_window_s = tk.DoubleVar(value=30.0)
         self._telem_poll_after_id: Optional[str] = None
-        # (t_wall, rpm, duty, vbat, i_motor, i_in, t_mos, t_motor)
-        self._telem_samples: deque = deque(maxlen=8000)
+        # (t_wall, rpm, duty, vbat, i_motor, i_in) — VESC eRPM for live plots only
+        self._telem_samples: deque = deque(maxlen=25000)
         self._fig: Any = None
         self._canvas: Any = None
         self._telem_lines: List[Any] = []
+
+        self._enc_samples: deque = deque(maxlen=50000)
+        self._fig_enc: Any = None
+        self._canvas_enc: Any = None
+        self._ln_enc_pos: Any = None
+        self._ln_enc_vel: Any = None
+        self._enc_axes: Any = None
+        self._plots_redraw_after_id: Optional[str] = None
+        self.var_enc_stream = tk.BooleanVar(value=True)
 
         self._build()
         self.root.after(80, self._pump_ui_queue)
@@ -506,7 +616,11 @@ class VescControlGui:
 
         self.cmd_widgets: List[tk.Widget] = []
 
-        time_fr = ttk.LabelFrame(cmd_fr, text="Timed motor output (applies to Set current / brake / duty / RPM and matching raw lines)", padding=6)
+        time_fr = ttk.LabelFrame(
+            cmd_fr,
+            text="Timed motor output (Set current / brake / duty / RPM, Test, matching raw motor lines)",
+            padding=6,
+        )
         time_fr.grid(row=0, column=0, columnspan=4, sticky=tk.EW, pady=(0, 8))
         ttk.Label(time_fr, text="Auto-stop after (s), 0 = until STOP:").grid(row=0, column=0, sticky=tk.W)
         sb_dur = ttk.Spinbox(time_fr, from_=0, to=600, increment=1, textvariable=self.var_run_duration_s, width=8)
@@ -520,6 +634,11 @@ class VescControlGui:
             font=("TkDefaultFont", 8),
             foreground="#444",
         ).grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=(6, 0))
+        ttk.Checkbutton(
+            time_fr,
+            text="Export TELEM + encoder to CSV (motor commands + Test; N>0 s → auto STOP+CSV; N=0 → CSV on STOP)",
+            variable=self.var_export_csv_timed,
+        ).grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(8, 0))
 
         def row_param(r: int, label: str, var: tk.StringVar, btn_text: str, proto_prefix: str) -> None:
             ttk.Label(cmd_fr, text=label).grid(row=r, column=0, sticky=tk.W, pady=2)
@@ -540,15 +659,20 @@ class VescControlGui:
 
         self.cmd_widgets.extend([sb_dur, sb_ka])
 
-        row_param(2, "Current (A)", self.var_cur, "Set current", "SET_CURRENT")
-        row_param(3, "Brake (A)", self.var_brk, "Set brake", "SET_BRAKE")
-        row_param(4, f"Duty (0–{MAX_DUTY:.2f} max)", self.var_duty, "Set duty", "SET_DUTY")
-        row_param(5, "eRPM", self.var_rpm, "Set RPM", "SET_RPM")
+        row_param(3, "Current (A)", self.var_cur, "Set current", "SET_CURRENT")
+        row_param(4, "Brake (A)", self.var_brk, "Set brake", "SET_BRAKE")
+        row_param(5, f"Duty (0–{MAX_DUTY:.2f} max)", self.var_duty, "Set duty", "SET_DUTY")
+        row_param(6, "eRPM", self.var_rpm, "Set RPM", "SET_RPM")
 
         quick = ttk.Frame(cmd_fr)
-        quick.grid(row=6, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
+        quick.grid(row=7, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
+        b_stop = ttk.Button(quick, text="STOP", command=lambda: self._send_wire("STOP"))
+        b_stop.pack(side=tk.LEFT, padx=(0, 6))
+        self.cmd_widgets.append(b_stop)
+        btn_test = ttk.Button(quick, text="Test", command=self._on_test_freewheel_record)
+        btn_test.pack(side=tk.LEFT, padx=(0, 6))
+        self.cmd_widgets.append(btn_test)
         for text, wire in (
-            ("STOP", "STOP"),
             ("GET_VALUES", "GET_VALUES"),
             ("GET_FW", "GET_FW"),
             ("KEEPALIVE", "KEEPALIVE"),
@@ -560,7 +684,7 @@ class VescControlGui:
         ttk.Button(quick, text="Help", command=lambda: messagebox.showinfo("Commands", HELP_TEXT)).pack(side=tk.LEFT, padx=(12, 0))
 
         raw_fr = ttk.Frame(cmd_fr)
-        raw_fr.grid(row=7, column=0, columnspan=3, sticky=tk.EW, pady=(10, 0))
+        raw_fr.grid(row=8, column=0, columnspan=3, sticky=tk.EW, pady=(10, 0))
         ttk.Label(raw_fr, text="Raw line:").pack(side=tk.LEFT)
         self.raw_entry = ttk.Entry(raw_fr, width=40)
         self.raw_entry.pack(side=tk.LEFT, padx=(4, 8), fill=tk.X, expand=True)
@@ -576,7 +700,7 @@ class VescControlGui:
 
         telem_row = ttk.LabelFrame(
             right,
-            text="Live TELEM graph (poll = repeated GET_VALUES; VESC does not auto-stream)",
+            text="Live TELEM + plots (GET_VALUES poll; refreshed together with encoder graphs)",
             padding=6,
         )
         telem_row.pack(fill=tk.X, pady=(0, 8))
@@ -592,15 +716,45 @@ class VescControlGui:
         ttk.Label(telem_row, text="X-axis window (s):").pack(side=tk.LEFT)
         sb_telem_win = ttk.Spinbox(telem_row, from_=5, to=600, increment=5, textvariable=self.var_telem_window_s, width=6)
         sb_telem_win.pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Button(telem_row, text="Apply window", command=self._redraw_telem_plot).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(telem_row, text="Apply window", command=self._apply_graph_windows).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(telem_row, text="Clear graph data", command=self._clear_telem_data).pack(side=tk.LEFT)
         self.cmd_widgets.extend([sb_telem_ms, sb_telem_win])
+        ttk.Checkbutton(
+            telem_row,
+            text="Auto-start live poll after connect",
+            variable=self.var_auto_live_telem,
+        ).pack(side=tk.LEFT, padx=(12, 0))
 
-        graph_fr = ttk.LabelFrame(right, text="TELEM vs time (seconds in window)", padding=4)
+        enc_row = ttk.LabelFrame(
+            right,
+            text="Encoder (linear m — same as ahaan100/encoder.ino; pushed ~100 Hz, not shown in log)",
+            padding=6,
+        )
+        enc_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Button(enc_row, text="ENC zero", command=lambda: self._send_line("ENC_RESET")).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            enc_row,
+            text="Firmware ENC stream",
+            variable=self.var_enc_stream,
+            command=self._on_enc_stream_toggle,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Button(enc_row, text="Clear encoder graph", command=self._clear_enc_data).pack(side=tk.LEFT, padx=(12, 0))
+
+        graph_fr = ttk.LabelFrame(
+            right,
+            text="TELEM + encoder position vs time (encoder on top; same window)",
+            padding=4,
+        )
         graph_fr.pack(fill=tk.BOTH, expand=True)
         self._graph_inner = ttk.Frame(graph_fr)
         self._graph_inner.pack(fill=tk.BOTH, expand=True)
         self._build_telem_matplotlib(self._graph_inner)
+
+        enc_graph_fr = ttk.LabelFrame(right, text="Encoder position / velocity vs time (same window as TELEM)", padding=4)
+        enc_graph_fr.pack(fill=tk.BOTH, expand=True)
+        self._enc_graph_inner = ttk.Frame(enc_graph_fr)
+        self._enc_graph_inner.pack(fill=tk.BOTH, expand=True)
+        self._build_enc_matplotlib(self._enc_graph_inner)
 
         self._refresh_ports()
         self._set_commands_enabled(False)
@@ -643,50 +797,105 @@ class VescControlGui:
             ).pack(expand=True)
             return
 
-        self._fig = Figure(figsize=(5.5, 7.0), constrained_layout=True)
-        ax1 = self._fig.add_subplot(4, 1, 1)
-        ax2 = self._fig.add_subplot(4, 1, 2, sharex=ax1)
-        ax3 = self._fig.add_subplot(4, 1, 3, sharex=ax1)
-        ax4 = self._fig.add_subplot(4, 1, 4, sharex=ax1)
+        self._fig = Figure(figsize=(5.5, 6.8), constrained_layout=True)
+        ax0 = self._fig.add_subplot(4, 1, 1)
+        ax1 = self._fig.add_subplot(4, 1, 2, sharex=ax0)
+        ax2 = self._fig.add_subplot(4, 1, 3, sharex=ax0)
+        ax3 = self._fig.add_subplot(4, 1, 4, sharex=ax0)
+        ax0.set_ylabel("Pos (m)")
         ax1.set_ylabel("RPM")
         ax2.set_ylabel("Vbat")
         ax3.set_ylabel("A")
-        ax4.set_ylabel("°C")
-        ax4.set_xlabel("Time in window (s)")
-        (self._ln_rpm,) = ax1.plot([], [], "b-", lw=1)
+        ax3.set_xlabel("Time in window (s)")
+        (self._ln_telem_enc_pos,) = ax0.plot([], [], color="tab:green", lw=1.2)
+        (self._ln_rpm,) = ax1.plot([], [], color="tab:blue", lw=1)
         (self._ln_v,) = ax2.plot([], [], "g-", lw=1)
         (self._ln_im,) = ax3.plot([], [], "r-", lw=1, label="I motor")
         (self._ln_iin,) = ax3.plot([], [], "m-", lw=1, label="I in")
         ax3.legend(loc="upper right", fontsize=7)
-        (self._ln_tmos,) = ax4.plot([], [], color="darkorange", lw=1, label="MOS")
-        (self._ln_tmotor,) = ax4.plot([], [], "c-", lw=1, label="Motor")
-        ax4.legend(loc="upper right", fontsize=7)
-        self._telem_axes = (ax1, ax2, ax3, ax4)
+        self._telem_axes = (ax0, ax1, ax2, ax3)
 
         self._canvas = FigureCanvasTkAgg(self._fig, master=parent)
         self._canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
+    def _build_enc_matplotlib(self, parent: ttk.Frame) -> None:
+        try:
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        except ImportError:
+            ttk.Label(
+                parent,
+                text="Install matplotlib for encoder plots:\n  pip install matplotlib",
+                justify=tk.CENTER,
+            ).pack(expand=True)
+            return
+
+        self._fig_enc = Figure(figsize=(5.5, 3.2), constrained_layout=True)
+        axp = self._fig_enc.add_subplot(2, 1, 1)
+        axv = self._fig_enc.add_subplot(2, 1, 2, sharex=axp)
+        axp.set_ylabel("Position (m)")
+        axv.set_ylabel("Velocity (m/s)")
+        axv.set_xlabel("Time in window (s)")
+        (self._ln_enc_pos,) = axp.plot([], [], color="tab:blue", lw=1)
+        (self._ln_enc_vel,) = axv.plot([], [], color="tab:purple", lw=1)
+        self._enc_axes = (axp, axv)
+
+        self._canvas_enc = FigureCanvasTkAgg(self._fig_enc, master=parent)
+        self._canvas_enc.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def _apply_graph_windows(self) -> None:
+        self._redraw_telem_plot()
+        self._redraw_enc_plot()
+
     def _clear_telem_data(self) -> None:
         self._telem_samples.clear()
         self._redraw_telem_plot()
+        self._redraw_enc_plot()
+
+    def _schedule_live_plots_redraw(self) -> None:
+        if self._plots_redraw_after_id is not None:
+            return
+        self._plots_redraw_after_id = self.root.after(LIVE_PLOTS_REDRAW_MS, self._live_plots_redraw_tick)
+
+    def _live_plots_redraw_tick(self) -> None:
+        self._plots_redraw_after_id = None
+        self._redraw_telem_plot()
+        self._redraw_enc_plot()
+
+    def _reset_device_time_anchor(self) -> None:
+        self._session_anchor_wall = None
+        self._session_anchor_esp_ms = None
+
+    def _wall_from_esp_millis(self, esp_ms: int) -> float:
+        """Convert ESP32 millis to a wall clock — anchor first seen sample to time.time(), then add delta."""
+        e = int(esp_ms) & 0xFFFFFFFF
+        if self._session_anchor_wall is None:
+            self._session_anchor_wall = time.time()
+            self._session_anchor_esp_ms = e
+            return self._session_anchor_wall
+        a = int(self._session_anchor_esp_ms) & 0xFFFFFFFF
+        delta = (e - a) & 0xFFFFFFFF
+        if delta >= 0x80000000:
+            delta -= 0x100000000
+        return float(self._session_anchor_wall) + delta / 1000.0
 
     def _feed_telem_from_log_line(self, payload: str) -> None:
         d = parse_telem_line(payload)
         if d is None:
             return
+        esp = d.get("esp_ms")
+        tw = self._wall_from_esp_millis(int(esp)) if esp is not None else time.time()
         self._telem_samples.append(
             (
-                time.time(),
+                tw,
                 d["rpm"],
                 d["duty"],
                 d["vbat"],
                 d["i_motor"],
                 d["i_in"],
-                d["t_mos"],
-                d["t_motor"],
             )
         )
-        self._redraw_telem_plot()
+        self._schedule_live_plots_redraw()
 
     def _redraw_telem_plot(self) -> None:
         if self._fig is None or self._canvas is None or not hasattr(self, "_ln_rpm"):
@@ -702,10 +911,8 @@ class VescControlGui:
         v_l: List[float] = []
         im_l: List[float] = []
         iin_l: List[float] = []
-        tmos_l: List[float] = []
-        tmot_l: List[float] = []
         for row in self._telem_samples:
-            t_wall, rpm, _duty, vb, imo, i_i, tmo, tmt = row
+            t_wall, rpm, _duty, vb, imo, i_i = row[:6]
             if t_wall < t_start:
                 continue
             xs.append(t_wall - t_start)
@@ -713,23 +920,251 @@ class VescControlGui:
             v_l.append(vb)
             im_l.append(imo)
             iin_l.append(i_i)
-            tmos_l.append(tmo)
-            tmot_l.append(tmt)
+
+        enc_x: List[float] = []
+        enc_pos: List[float] = []
+        for row in self._enc_samples:
+            t_wall = row[0]
+            if t_wall < t_start:
+                continue
+            enc_x.append(t_wall - t_start)
+            enc_pos.append(row[1])
+
+        if hasattr(self, "_ln_telem_enc_pos"):
+            self._ln_telem_enc_pos.set_data(enc_x, enc_pos)
 
         self._ln_rpm.set_data(xs, rpm_l)
         self._ln_v.set_data(xs, v_l)
         self._ln_im.set_data(xs, im_l)
         self._ln_iin.set_data(xs, iin_l)
-        self._ln_tmos.set_data(xs, tmos_l)
-        self._ln_tmotor.set_data(xs, tmot_l)
 
         self._telem_axes[0].set_xlim(0.0, tw)
-        if xs:
+        has_telem = bool(xs)
+        has_enc = bool(enc_x)
+        if has_telem or has_enc:
             for ax in self._telem_axes:
                 ax.relim()
                 ax.autoscale_view(scalex=False)
             self._telem_axes[0].set_xlim(0.0, tw)
         self._canvas.draw_idle()
+
+    def _clear_enc_data(self) -> None:
+        self._enc_samples.clear()
+        self._redraw_telem_plot()
+        self._redraw_enc_plot()
+
+    @staticmethod
+    def _timed_captures_dir() -> str:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "timed_captures")
+
+    def _flush_pending_log_lines_to_samples(self) -> None:
+        """Move ('log',) items from the UI queue into TELEM/ENC deques (main thread only).
+
+        Inbound lines are queued for the log pane; ENC is skipped in the text log but must still
+        be fed here. If we export CSV before the periodic pump runs, rows can sit in the queue and
+        never reach _enc_samples — this removes that gap (common on timed auto-stop).
+        """
+        deferred: List[Tuple[str, Any]] = []
+        try:
+            while True:
+                item = self._ui_q.get_nowait()
+                if item[0] == "log":
+                    payload = item[1]
+                    if not is_enc_log_payload(payload):
+                        self._append_log_safe(payload)
+                    self._feed_telem_from_log_line(payload)
+                    self._feed_enc_from_log_line(payload)
+                else:
+                    deferred.append(item)
+        except queue.Empty:
+            pass
+        for item in deferred:
+            self._ui_q.put(item)
+
+    def _export_timed_run_csv(self, t_end: float, reason: str) -> None:
+        """Write TELEM + ENC rows between capture start and t_end (timestamps = ESP32-based wall mapping when available)."""
+        self._flush_pending_log_lines_to_samples()
+        t_end = max(t_end, time.time())
+        t0 = self._csv_timed_capture_start
+        if t0 is None:
+            if reason == "timed_stop":
+                self._log(
+                    "CSV export skipped: no capture window was armed (timed run ended). "
+                    "Use Test for always-on CSV, or enable Export + a motor command."
+                )
+            return
+        self._csv_timed_capture_start = None
+
+        rows_out: List[Tuple[float, Dict[str, Any]]] = []
+        for row in self._telem_samples:
+            tw = row[0]
+            if not (t0 <= tw <= t_end):
+                continue
+            _erpm, duty, vb, imo, i_i = row[1:6]
+            rows_out.append(
+                (
+                    tw,
+                    {
+                        "host_unix_s": tw,
+                        "t_rel_s": tw - t0,
+                        "stream": "telem",
+                        "rpm": "",
+                        "duty": duty,
+                        "vbat": vb,
+                        "i_motor": imo,
+                        "i_in": i_i,
+                        "enc_millis": "",
+                        "enc_count": "",
+                        "position_m": "",
+                        "velocity_mps": "",
+                    },
+                )
+            )
+        for row in self._enc_samples:
+            tw = row[0]
+            if not (t0 <= tw <= t_end):
+                continue
+            pos_m, vel_mps, count, enc_ms = row[1], row[2], row[3], row[4]
+            rows_out.append(
+                (
+                    tw,
+                    {
+                        "host_unix_s": tw,
+                        "t_rel_s": tw - t0,
+                        "stream": "enc",
+                        "rpm": 0.0,
+                        "duty": "",
+                        "vbat": "",
+                        "i_motor": "",
+                        "i_in": "",
+                        "enc_millis": enc_ms,
+                        "enc_count": count,
+                        "position_m": pos_m,
+                        "velocity_mps": vel_mps,
+                    },
+                )
+            )
+
+        rows_out.sort(key=lambda x: x[0])
+        enc_rows = [(tw, d) for tw, d in rows_out if d.get("stream") == "enc"]
+        prev_tw: Optional[float] = None
+        prev_pos: Optional[float] = None
+        for tw, d in enc_rows:
+            pos_m = float(d["position_m"])
+            vel_mps = float(d["velocity_mps"])
+            rpm_spool = _spool_rpm_from_linear_velocity_mps(vel_mps)
+            if abs(vel_mps) < 1e-5 and prev_tw is not None and prev_pos is not None:
+                rpm_spool = _spool_rpm_from_position_delta(pos_m, prev_pos, tw, prev_tw)
+            d["rpm"] = rpm_spool
+            prev_tw, prev_pos = tw, pos_m
+
+        last_enc_rpm: Optional[float] = None
+        for tw, d in rows_out:
+            if d.get("stream") == "enc":
+                last_enc_rpm = float(d["rpm"])
+            elif d.get("stream") == "telem" and last_enc_rpm is not None:
+                d["rpm"] = last_enc_rpm
+        n_telem = sum(1 for _tw, d in rows_out if d.get("stream") == "telem")
+        n_enc = sum(1 for _tw, d in rows_out if d.get("stream") == "enc")
+        out_dir = self._timed_captures_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_reason = "".join(c if c.isalnum() or c in "-_" else "_" for c in reason)[:40]
+        path = os.path.join(out_dir, f"timed_run_{stamp}_{safe_reason}.csv")
+        fieldnames = [
+            "host_unix_s",
+            "t_rel_s",
+            "stream",
+            "rpm",
+            "duty",
+            "vbat",
+            "i_motor",
+            "i_in",
+            "enc_millis",
+            "enc_count",
+            "position_m",
+            "velocity_mps",
+        ]
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                for _tw, d in rows_out:
+                    w.writerow(d)
+        except OSError as e:
+            self._log(f"CSV export failed: {e}")
+            return
+
+        n = len(rows_out)
+        self._log(f"CSV export ({reason}): {n} rows ({n_telem} telem + {n_enc} enc) → {path}")
+        if n_telem > 0 and n_enc == 0:
+            self._log(
+                "(CSV: no enc rows in window — turn on Firmware ENC stream, keep Live TELEM poll on; "
+                "position_m is only on stream=enc rows.)"
+            )
+        elif n_enc > 0:
+            self._log(
+                "(CSV: rpm = spool RPM from ENC velocity / 4 in circumference; TELEM rows use last ENC rpm.)"
+            )
+
+    def _feed_enc_from_log_line(self, payload: str) -> None:
+        d = parse_enc_line(payload)
+        if d is None:
+            return
+        tw = self._wall_from_esp_millis(int(d["time_ms"]))
+        self._enc_samples.append(
+            (
+                tw,
+                d["position_m"],
+                d["velocity_mps"],
+                d["count"],
+                d["time_ms"],
+            )
+        )
+        self._schedule_live_plots_redraw()
+
+    def _redraw_enc_plot(self) -> None:
+        if self._fig_enc is None or self._canvas_enc is None or self._ln_enc_pos is None:
+            return
+        try:
+            tw = max(1.0, float(self.var_telem_window_s.get()))
+        except (tk.TclError, ValueError):
+            tw = 30.0
+        t_end = time.time()
+        t_start = t_end - tw
+        xs: List[float] = []
+        pos_l: List[float] = []
+        vel_l: List[float] = []
+        for row in self._enc_samples:
+            t_wall, pos_m, vel_mps = row[:3]
+            if t_wall < t_start:
+                continue
+            xs.append(t_wall - t_start)
+            pos_l.append(pos_m)
+            vel_l.append(vel_mps)
+
+        self._ln_enc_pos.set_data(xs, pos_l)
+        self._ln_enc_vel.set_data(xs, vel_l)
+
+        assert self._enc_axes is not None
+        self._enc_axes[0].set_xlim(0.0, tw)
+        if xs:
+            for ax in self._enc_axes:
+                ax.relim()
+                ax.autoscale_view(scalex=False)
+            self._enc_axes[0].set_xlim(0.0, tw)
+        self._canvas_enc.draw_idle()
+
+    def _on_enc_stream_toggle(self) -> None:
+        if not self._is_connected():
+            return
+        self._sync_enc_stream_to_firmware()
+
+    def _sync_enc_stream_to_firmware(self) -> None:
+        if not self._is_connected():
+            return
+        on = 1 if self.var_enc_stream.get() else 0
+        self._send_line(f"ENC_STREAM,{on}")
 
     def _is_connected(self) -> bool:
         return self._ser is not None or (
@@ -774,21 +1209,44 @@ class VescControlGui:
         else:
             self._stop_telem_polling()
 
+    def _try_auto_start_live_telem(self) -> None:
+        if not self.var_auto_live_telem.get():
+            return
+        if not self._is_connected():
+            return
+        self.var_live_telem.set(True)
+        self._start_telem_polling()
+        self._log("(Auto-started live TELEM poll — use with ENC stream for combined live plots + CSV)")
+
     def _pump_ui_queue(self) -> None:
         try:
             while True:
                 kind, payload = self._ui_q.get_nowait()
                 if kind == "log":
-                    self._append_log_safe(payload)
+                    if not is_enc_log_payload(payload):
+                        self._append_log_safe(payload)
                     self._feed_telem_from_log_line(payload)
+                    self._feed_enc_from_log_line(payload)
                 elif kind == "status":
                     self.status.set(payload)
                 elif kind == "connected":
+                    self._reset_device_time_anchor()
                     self._apply_connected_state(True)
+                elif kind == "post_connect_enc":
+                    self._sync_enc_stream_to_firmware()
+                    self.root.after(350, self._try_auto_start_live_telem)
                 elif kind == "disconnected":
+                    self._reset_device_time_anchor()
+                    self._csv_timed_capture_start = None
                     self._cancel_timed_run()
                     self._stop_telem_polling()
                     self.var_live_telem.set(False)
+                    if self._plots_redraw_after_id is not None:
+                        try:
+                            self.root.after_cancel(self._plots_redraw_after_id)
+                        except Exception:
+                            pass
+                        self._plots_redraw_after_id = None
                     self.status.set("Disconnected")
                     self._apply_connected_state(False)
                 elif kind == "errorbox":
@@ -828,6 +1286,7 @@ class VescControlGui:
             self._timed_keepalive_after_id = None
         self._timed_deadline = 0.0
         self._timed_ka_interval_s = 0.0
+        self._timed_run_is_test = False
 
     def _schedule_timed_run(self, duration_s: float, keepalive_interval_s: float) -> None:
         self._cancel_timed_run()
@@ -856,6 +1315,10 @@ class VescControlGui:
             self._timed_keepalive_after_id = None
         self._timed_deadline = 0.0
         self._timed_ka_interval_s = 0.0
+        t_end = time.time()
+        reason = "test_stop" if self._timed_run_is_test else "timed_stop"
+        self._timed_run_is_test = False
+        self._export_timed_run_csv(t_end, reason)
         self._send_line("STOP")
         self._log("(Timed run: sent STOP)")
 
@@ -878,7 +1341,7 @@ class VescControlGui:
             or u.startswith("SET_RPM,")
         )
 
-    def _maybe_arm_timed_run(self) -> None:
+    def _maybe_arm_timed_run(self, *, force_csv: bool = False, from_test: bool = False) -> None:
         try:
             dur = float(self.var_run_duration_s.get())
         except (tk.TclError, ValueError):
@@ -887,16 +1350,36 @@ class VescControlGui:
             ka = float(self.var_keepalive_s.get())
         except (tk.TclError, ValueError):
             ka = 0.0
+        if self.var_export_csv_timed.get() or force_csv:
+            self._csv_timed_capture_start = time.time()
+        else:
+            self._csv_timed_capture_start = None
         if dur > 0:
             self._schedule_timed_run(dur, max(0.0, ka))
+        else:
+            self._cancel_timed_run()
+        # After schedule (its internal cancel must not wipe this): mark Test runs for CSV filename/reason.
+        self._timed_run_is_test = bool(from_test and dur > 0)
+
+    def _on_test_freewheel_record(self) -> None:
+        """Timed CSV/keepalive like motor sets, but command STOP (0 A) instead of SET_DUTY,0."""
+        if not self._is_connected():
+            messagebox.showwarning("Not connected", "Connect over USB or BLE first.")
+            return
+        self._maybe_arm_timed_run(force_csv=True, from_test=True)
+        self._send_line("STOP")
+        self._log(
+            "(Test: STOP + CSV always armed for this run (Export checkbox not required); "
+            "enable Live TELEM poll for VESC rows in the file)"
+        )
 
     def _send_motor_param(self, prefix: str, value: str) -> None:
         val = value.strip()
         if prefix == "SET_DUTY":
             val = f"{clamp_duty_str(val):.4f}"
         line = f"{prefix},{val}"
-        self._send_line(line)
         self._maybe_arm_timed_run()
+        self._send_line(line)
 
     def _on_connect(self) -> None:
         self.btn_connect.configure(state=tk.DISABLED)
@@ -960,6 +1443,7 @@ class VescControlGui:
             ser = None
             self._set_status(f"Connected: {port}")
             self._ui_q.put(("connected", None))
+            self._ui_q.put(("post_connect_enc", None))
         except Exception as e:
             self._ui_q.put(("log", f"USB connect failed: {e}"))
             self._ui_q.put(("errorbox", str(e)))
@@ -1024,6 +1508,7 @@ class VescControlGui:
             return
 
         link = BleLineLink()
+        had_ble_session = False
 
         async def pump_rx() -> None:
             while self._ble_running.is_set():
@@ -1051,11 +1536,13 @@ class VescControlGui:
                         self._ui_q.put(("disconnected", None))
                         return
 
+                had_ble_session = True
                 self._ble_running.set()
                 pump = asyncio.create_task(pump_rx())
                 self._set_status(f"Connected BLE: {addr}")
                 self._ble_ready.set()
                 self._ui_q.put(("connected", None))
+                self._ui_q.put(("post_connect_enc", None))
 
                 try:
                     while True:
@@ -1095,12 +1582,17 @@ class VescControlGui:
             self._log(f"BLE error: {e}")
             self._ui_q.put(("errorbox", str(e)))
         finally:
+            if had_ble_session:
+                await asyncio.sleep(0.5)
+                self._log("BLE session ended — wait ~1s for Quikburst to advertise, then Connect again.")
             self._ble_ready.clear()
             self._ble_running.clear()
             self._ui_q.put(("disconnected", None))
             self._set_status("Disconnected")
 
     def _on_disconnect(self) -> None:
+        self._reset_device_time_anchor()
+        self._csv_timed_capture_start = None
         self._cancel_timed_run()
         self._stop_telem_polling()
         self.var_live_telem.set(False)
@@ -1131,6 +1623,7 @@ class VescControlGui:
 
     def _send_wire(self, line: str) -> None:
         if line.strip().upper() == "STOP":
+            self._export_timed_run_csv(time.time(), "manual_stop")
             self._cancel_timed_run()
         self._send_line(line)
 
@@ -1139,9 +1632,14 @@ class VescControlGui:
         if not raw:
             return
         line = sanitize_vesc_command_line(protocol_line_from_user_input(raw))
-        self._send_line(line)
+        if line.strip().upper() == "STOP":
+            self._export_timed_run_csv(time.time(), "manual_stop")
+            self._cancel_timed_run()
+            self._send_line("STOP")
+            return
         if self._line_starts_motor_set(line):
             self._maybe_arm_timed_run()
+        self._send_line(line)
 
     def _send_line(self, line: str) -> None:
         line = sanitize_vesc_command_line(line.strip())

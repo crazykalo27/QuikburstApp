@@ -1,0 +1,1 @@
+2026-04-10: Added data_capture_viewer.py — tkinter GUI to browse CSV/Excel under NewMotorController, stacked time-series with shared X and file/series navigation; requirements.txt gains pandas + openpyxl.
