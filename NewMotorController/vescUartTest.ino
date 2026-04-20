@@ -198,7 +198,11 @@ static void updateStatusLeds() {
 
 static void sendBleRaw(const uint8_t* data, size_t len) {
   if (!g_bleConnected || !g_txChar || len == 0) return;
-  constexpr size_t kChunk = 20;
+  // Python side negotiates ATT MTU 247 (usable payload ~244). Use 180 so a full
+  // TELEM / ENC line fits in a single notify — was kChunk=20 with delay(3),
+  // which blocked loop() ~12 ms per TELEM and ~6 ms per ENC. The BLE stack
+  // has its own TX flow control, so no per-chunk sleep is needed.
+  constexpr size_t kChunk = 180;
   size_t off = 0;
   while (off < len) {
     size_t n = len - off;
@@ -206,7 +210,6 @@ static void sendBleRaw(const uint8_t* data, size_t len) {
     g_txChar->setValue(data + off, n);
     g_txChar->notify();
     off += n;
-    delay(3);
   }
 }
 
@@ -352,9 +355,15 @@ static void feedLineBuffer(String& buf, char c) {
 // ---------------------------------------------------------------------------
 
 class QuikburstServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer*) override {
+  void onConnect(BLEServer* s, esp_ble_gatts_cb_param_t* param) override {
     g_bleConnected = true;
     updateStatusLeds();
+    // Ask the central for a tight connection interval (6 = 7.5 ms min, 12 = 15 ms max).
+    // Each notify has to wait for the next connection event, so this directly
+    // caps the "+interval" offset we see in TELEM cadence. macOS may round to
+    // 15 ms per Apple accessory policy, but any reduction from the default helps.
+    // latency = 0 (no slave latency); timeout = 400 (4 s supervision).
+    s->updateConnParams(param->connect.remote_bda, 6, 12, 0, 400);
     sendHostLine("OK,BT_CONNECTED");
   }
   void onDisconnect(BLEServer*) override {
@@ -380,8 +389,11 @@ static void restartBleAdvertising() {
   BLEAdvertising* adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(NUS_SERVICE_UUID);
   adv->setScanResponse(true);
+  // Advertise preferred slave connection interval 7.5–15 ms (units of 1.25 ms).
+  // (Previous code called setMinPreferred twice — a known copy-paste bug from
+  // the ESP32 Arduino examples; the second call silently overwrote the first.)
   adv->setMinPreferred(0x06);
-  adv->setMinPreferred(0x12);
+  adv->setMaxPreferred(0x0C);
   if (g_server != nullptr) {
     g_server->startAdvertising();
   }
@@ -454,5 +466,5 @@ void loop() {
     }
   }
 
-  delay(2);
+  delay(1);
 }

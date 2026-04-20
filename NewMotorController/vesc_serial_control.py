@@ -418,6 +418,14 @@ class VescControlGui:
         self.var_run_duration_s = tk.DoubleVar(value=5.0)
         self.var_keepalive_s = tk.DoubleVar(value=0.5)
         self.var_export_csv_timed = tk.BooleanVar(value=False)
+        # Default on: resample the capture onto a uniform device_ms grid in the
+        # CSV so every row is exactly 'grid ms' apart regardless of BLE/VESC
+        # jitter. Grid step is var_csv_grid_ms, independent of TELEM poll; set
+        # it higher than poll ms to downsample (e.g. poll at 30 ms to hit the
+        # BLE floor, write CSV at 100 ms to keep files tidy). Live graphs keep
+        # using the raw samples since device_ms is accurate there.
+        self.var_csv_fixed_grid = tk.BooleanVar(value=True)
+        self.var_csv_grid_ms = tk.IntVar(value=125)
         self._csv_timed_capture_start: Optional[float] = None
         self._csv_device_ms_start: Optional[int] = None
         self._timed_stop_after_id: Optional[str] = None
@@ -425,15 +433,27 @@ class VescControlGui:
         self._timed_deadline = 0.0
         self._timed_ka_interval_s = 0.0
         self._timed_run_is_test = False
+        # Wall-clock anchor + duration for the live "TEST / RUN  3.2 / 10 s" readout.
+        self._timed_start_wall: Optional[float] = None
+        self._timed_total_s: float = 0.0
+        self.var_run_status_str = tk.StringVar(value="Idle")
         # Map ESP32 millis() (ENC time_ms + TELEM esp32_ms) to a wall timeline; reset each session.
         self._session_anchor_wall: Optional[float] = None
         self._session_anchor_esp_ms: Optional[int] = None
 
         self.var_live_telem = tk.BooleanVar(value=False)
         self.var_auto_live_telem = tk.BooleanVar(value=True)
-        self.var_telem_ms = tk.IntVar(value=50)
+        self.var_telem_ms = tk.IntVar(value=100)
+        self.var_telem_rate_str = tk.StringVar(value="Actual: — Hz")
+        self.var_enc_rate_str = tk.StringVar(value="ENC: — Hz")
         self.var_telem_window_s = tk.DoubleVar(value=30.0)
         self._telem_poll_after_id: Optional[str] = None
+        # Fixed-rate scheduler state: next_send_wall drifts forward by exactly
+        # ms/1000 each tick (not response+delay). pending_since gates sends so
+        # we don't queue faster than firmware can answer — when BLE/VESC RTT >
+        # requested interval the effective rate is capped at RTT cleanly.
+        self._telem_next_send_wall: float = 0.0
+        self._telem_pending_since: Optional[float] = None
         # (t_wall, rpm, duty, vbat, i_motor, i_in) — VESC eRPM for live plots only
         self._telem_samples: deque = deque(maxlen=25000)
         self._fig: Any = None
@@ -449,8 +469,61 @@ class VescControlGui:
         self._plots_redraw_after_id: Optional[str] = None
         self.var_enc_stream = tk.BooleanVar(value=True)
 
+        # Default-off: the text pane was the single biggest UI-side cost at high
+        # poll rates. Indicators below replace the visual feedback.
+        self.var_verbose_log = tk.BooleanVar(value=False)
+        # key -> (canvas, oval_id); ready is stateful, others pulse.
+        self._indicators: Dict[str, Tuple[tk.Canvas, int]] = {}
+        self._indicator_clear_after: Dict[str, Optional[str]] = {}
+        self._ready_last_wall: Optional[float] = None
+        self._error_last_msg: Optional[str] = None
+
         self._build()
         self.root.after(20, self._pump_ui_queue)
+        self.root.after(500, self._update_telem_rate_display)
+        self.root.after(1000, self._tick_ready_indicator)
+        self.root.after(250, self._tick_run_status)
+
+    def _update_telem_rate_display(self) -> None:
+        """Derive TELEM + ENC Hz from device_ms deltas over the last ~2 s so the user can see the link's real cadence."""
+        try:
+            now_wall = time.time()
+            window_s = 2.0
+
+            def _rate_str(device_ms_vals: List[int], label: str, active: bool) -> str:
+                if len(device_ms_vals) >= 2:
+                    device_ms_vals.sort()
+                    span_ms = _u32_diff_ms(device_ms_vals[-1], device_ms_vals[0])
+                    n_intervals = len(device_ms_vals) - 1
+                    if span_ms > 0 and n_intervals > 0:
+                        mean_ms = span_ms / n_intervals
+                        hz = 1000.0 / mean_ms if mean_ms > 0 else 0.0
+                        return f"{label}: {hz:5.1f} Hz ({mean_ms:4.0f} ms)"
+                if active:
+                    return f"{label}: waiting…"
+                return f"{label}: — Hz"
+
+            telem_vals: List[int] = []
+            for row in self._telem_samples:
+                tw = row[0]
+                esp_ms = row[1]
+                if esp_ms is None:
+                    continue
+                if tw >= now_wall - window_s:
+                    telem_vals.append(int(esp_ms))
+            telem_active = self.var_live_telem.get() and self._is_connected()
+            self.var_telem_rate_str.set(_rate_str(telem_vals, "Actual", telem_active))
+
+            enc_vals: List[int] = []
+            for row in self._enc_samples:
+                tw = row[0]
+                enc_ms = row[4]
+                if tw >= now_wall - window_s:
+                    enc_vals.append(int(enc_ms))
+            enc_active = self.var_enc_stream.get() and self._is_connected()
+            self.var_enc_rate_str.set(_rate_str(enc_vals, "ENC", enc_active))
+        finally:
+            self.root.after(500, self._update_telem_rate_display)
 
     def _build(self) -> None:
         main = ttk.Frame(self.root, padding=8)
@@ -573,53 +646,78 @@ class VescControlGui:
         self.btn_send_raw.pack(side=tk.LEFT)
         self.cmd_widgets.extend([self.raw_entry, self.btn_send_raw])
 
-        log_fr = ttk.LabelFrame(left, text="Log", padding=4)
+        self._build_indicator_strip(left)
+
+        log_fr = ttk.LabelFrame(left, text="Log (quiet by default — TELEM / ENC / OK / READY suppressed)", padding=4)
         log_fr.pack(fill=tk.BOTH, expand=True)
         self.log_text = scrolledtext.ScrolledText(log_fr, height=12, state=tk.DISABLED, wrap=tk.WORD, font=("Consolas", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
-        ttk.Button(log_fr, text="Clear log", command=self._clear_log).pack(anchor=tk.E, pady=(4, 0))
+        log_ctl = ttk.Frame(log_fr)
+        log_ctl.pack(fill=tk.X, pady=(4, 0))
+        ttk.Checkbutton(
+            log_ctl,
+            text="Verbose log (show every TELEM/ENC/OK; hurts rate at <50 ms)",
+            variable=self.var_verbose_log,
+        ).pack(side=tk.LEFT)
+        ttk.Button(log_ctl, text="Clear log", command=self._clear_log).pack(side=tk.RIGHT)
 
-        telem_row = ttk.LabelFrame(
+        streams_fr = ttk.LabelFrame(
             right,
-            text="Live TELEM + plots (GET_VALUES poll; refreshed together with encoder graphs)",
+            text="Live streams + plots (TELEM poll + ENC stream share the graph below)",
             padding=6,
         )
-        telem_row.pack(fill=tk.X, pady=(0, 8))
+        streams_fr.pack(fill=tk.X, pady=(0, 8))
+
+        telem_row = ttk.Frame(streams_fr)
+        telem_row.pack(fill=tk.X)
         ttk.Checkbutton(
             telem_row,
-            text="Live poll",
+            text="Live TELEM poll",
             variable=self.var_live_telem,
             command=self._on_live_telem_toggle,
         ).pack(side=tk.LEFT)
         ttk.Label(telem_row, text="every (ms):").pack(side=tk.LEFT, padx=(8, 0))
-        sb_telem_ms = ttk.Spinbox(telem_row, from_=20, to=5000, increment=10, textvariable=self.var_telem_ms, width=6)
-        sb_telem_ms.pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Label(telem_row, text="X-axis window (s):").pack(side=tk.LEFT)
-        sb_telem_win = ttk.Spinbox(telem_row, from_=5, to=600, increment=5, textvariable=self.var_telem_window_s, width=6)
-        sb_telem_win.pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Button(telem_row, text="Apply window", command=self._apply_graph_windows).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(telem_row, text="Clear graph data", command=self._clear_telem_data).pack(side=tk.LEFT)
-        self.cmd_widgets.extend([sb_telem_ms, sb_telem_win])
+        sb_telem_ms = ttk.Spinbox(telem_row, from_=5, to=5000, increment=5, textvariable=self.var_telem_ms, width=6)
+        sb_telem_ms.pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(telem_row, textvariable=self.var_telem_rate_str, foreground="#06c", width=22).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Checkbutton(
             telem_row,
-            text="Auto-start live poll after connect",
+            text="Auto-start after connect",
             variable=self.var_auto_live_telem,
-        ).pack(side=tk.LEFT, padx=(12, 0))
+        ).pack(side=tk.LEFT)
+        self.cmd_widgets.append(sb_telem_ms)
 
-        enc_row = ttk.LabelFrame(
-            right,
-            text="Encoder (linear m — same as ahaan100/encoder.ino; pushed ~100 Hz, not shown in log)",
-            padding=6,
-        )
-        enc_row.pack(fill=tk.X, pady=(0, 8))
-        ttk.Button(enc_row, text="ENC zero", command=lambda: self._send_line("ENC_RESET")).pack(side=tk.LEFT)
+        enc_row = ttk.Frame(streams_fr)
+        enc_row.pack(fill=tk.X, pady=(6, 0))
         ttk.Checkbutton(
             enc_row,
-            text="Firmware ENC stream",
+            text="Firmware ENC stream (100 Hz target)",
             variable=self.var_enc_stream,
             command=self._on_enc_stream_toggle,
-        ).pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Button(enc_row, text="Clear encoder graph", command=self._clear_enc_data).pack(side=tk.LEFT, padx=(12, 0))
+        ).pack(side=tk.LEFT)
+        ttk.Label(enc_row, textvariable=self.var_enc_rate_str, foreground="#093", width=22).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(enc_row, text="ENC zero", command=lambda: self._send_line("ENC_RESET")).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Separator(enc_row, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=12)
+        ttk.Label(enc_row, text="Graph window (s):").pack(side=tk.LEFT)
+        sb_telem_win = ttk.Spinbox(enc_row, from_=5, to=600, increment=5, textvariable=self.var_telem_window_s, width=6)
+        sb_telem_win.pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Button(enc_row, text="Apply", command=self._apply_graph_windows).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(enc_row, text="Clear graph", command=self._clear_telem_data).pack(side=tk.LEFT)
+        self.cmd_widgets.append(sb_telem_win)
+
+        # CSV export cadence lives with the live-stream settings so the live poll
+        # rate and the exported-grid rate are tuned side by side (they're independent).
+        csv_row = ttk.Frame(streams_fr)
+        csv_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Checkbutton(
+            csv_row,
+            text="CSV on uniform time grid (nearest TELEM/ENC per row; immune to BLE/VESC jitter)",
+            variable=self.var_csv_fixed_grid,
+        ).pack(side=tk.LEFT)
+        ttk.Label(csv_row, text="   CSV row every (ms):").pack(side=tk.LEFT)
+        sb_csv_ms = ttk.Spinbox(csv_row, from_=5, to=10000, increment=5, textvariable=self.var_csv_grid_ms, width=6)
+        sb_csv_ms.pack(side=tk.LEFT, padx=(4, 0))
+        self.cmd_widgets.append(sb_csv_ms)
 
         graph_fr = ttk.LabelFrame(
             right,
@@ -630,12 +728,6 @@ class VescControlGui:
         self._graph_inner = ttk.Frame(graph_fr)
         self._graph_inner.pack(fill=tk.BOTH, expand=True)
         self._build_telem_matplotlib(self._graph_inner)
-
-        enc_graph_fr = ttk.LabelFrame(right, text="Encoder position / velocity vs time (same window as TELEM)", padding=4)
-        enc_graph_fr.pack(fill=tk.BOTH, expand=True)
-        self._enc_graph_inner = ttk.Frame(enc_graph_fr)
-        self._enc_graph_inner.pack(fill=tk.BOTH, expand=True)
-        self._build_enc_matplotlib(self._enc_graph_inner)
 
         self._set_commands_enabled(False)
 
@@ -656,6 +748,155 @@ class VescControlGui:
         self.log_text.delete("1.0", tk.END)
         self.log_text.configure(state=tk.DISABLED)
 
+    # --- Status indicators -------------------------------------------------
+    # Small colored dots that replace scrolling log feedback: at fast polling,
+    # Tk text-widget appends were the main UI-side bottleneck. Indicators cost
+    # one canvas color change per event.
+    _IND_OFF = "#333"
+    _IND_OUTLINE = "#555"
+    _IND_SPECS = [
+        ("ready", "Ready",    "#2a9f2a"),
+        ("motor", "Motor OK", "#2680c2"),
+        ("stop",  "Stop",     "#e08a00"),
+        ("error", "Error",    "#c22222"),
+    ]
+
+    def _build_indicator_strip(self, parent: ttk.Frame) -> None:
+        bar = ttk.LabelFrame(parent, text="Link status (click Error to clear)", padding=4)
+        bar.pack(fill=tk.X, pady=(0, 6))
+        row = ttk.Frame(bar)
+        row.pack(fill=tk.X)
+        bg = row.cget("background") if "background" in row.keys() else None
+        for key, label, _ in self._IND_SPECS:
+            c = tk.Canvas(row, width=14, height=14, highlightthickness=0,
+                          bd=0, bg=bg or "#eeeeee")
+            oid = c.create_oval(2, 2, 12, 12, fill=self._IND_OFF, outline=self._IND_OUTLINE)
+            c.pack(side=tk.LEFT, padx=(0, 2))
+            ttk.Label(row, text=label).pack(side=tk.LEFT, padx=(0, 12))
+            self._indicators[key] = (c, oid)
+            self._indicator_clear_after[key] = None
+        self._indicators["error"][0].bind("<Button-1>", lambda _e: self._clear_error_indicator())
+        # Live run readout ("TEST 3.2 / 10 s" etc.) — refreshed by _tick_run_status.
+        ttk.Label(
+            row,
+            textvariable=self.var_run_status_str,
+            foreground="#06c",
+            font=("TkDefaultFont", 9, "bold"),
+        ).pack(side=tk.RIGHT, padx=(12, 4))
+        ttk.Label(row, text="Run:").pack(side=tk.RIGHT)
+
+    def _set_indicator(self, key: str, on: bool) -> None:
+        ind = self._indicators.get(key)
+        if not ind:
+            return
+        canvas, oid = ind
+        color = dict((k, c) for k, _, c in self._IND_SPECS).get(key, "#888") if on else self._IND_OFF
+        try:
+            canvas.itemconfigure(oid, fill=color)
+        except tk.TclError:
+            pass
+
+    def _pulse_indicator(self, key: str, ms: int) -> None:
+        self._set_indicator(key, True)
+        prev = self._indicator_clear_after.get(key)
+        if prev is not None:
+            try:
+                self.root.after_cancel(prev)
+            except Exception:
+                pass
+        self._indicator_clear_after[key] = self.root.after(
+            ms, lambda k=key: self._pulse_indicator_clear(k)
+        )
+
+    def _pulse_indicator_clear(self, key: str) -> None:
+        self._indicator_clear_after[key] = None
+        # Ready uses its own heartbeat tick; leave it alone here.
+        if key != "ready":
+            self._set_indicator(key, False)
+
+    def _clear_error_indicator(self) -> None:
+        self._error_last_msg = None
+        self._set_indicator("error", False)
+
+    def _tick_run_status(self) -> None:
+        """Update the 'Run: TEST/RUN  elapsed / total s' readout in the link-status strip."""
+        try:
+            start = self._timed_start_wall
+            total = self._timed_total_s
+            if start is not None and total > 0:
+                elapsed = max(0.0, min(time.time() - start, total))
+                kind = "TEST" if self._timed_run_is_test else "RUN"
+                self.var_run_status_str.set(f"{kind}  {elapsed:4.1f} / {total:.1f} s")
+            else:
+                self.var_run_status_str.set("Idle")
+        finally:
+            self.root.after(250, self._tick_run_status)
+
+    def _tick_ready_indicator(self) -> None:
+        """Ready is lit when we've seen a [READY] heartbeat in the last ~7 s (firmware emits every 5 s)."""
+        try:
+            ok = (
+                self._is_connected()
+                and self._ready_last_wall is not None
+                and (time.time() - self._ready_last_wall) <= 7.0
+            )
+            self._set_indicator("ready", ok)
+        finally:
+            self.root.after(1000, self._tick_ready_indicator)
+
+    @staticmethod
+    def _payload_core(payload: str) -> str:
+        """Strip the '>> ' / '<< ' direction prefix used in log formatting."""
+        s = payload.strip()
+        if s.startswith("<< ") or s.startswith(">> "):
+            s = s[3:].strip()
+        return s
+
+    def _is_quiet_log_line(self, payload: str) -> bool:
+        """Lines suppressed from the text pane when Verbose log is off."""
+        s = self._payload_core(payload).upper()
+        if not s:
+            return False
+        if s.startswith("TELEM,") or s.startswith("ENC,"):
+            return True
+        if s.startswith("OK,") or s == "OK":
+            return True
+        if s == "[READY]":
+            return True
+        return False
+
+    def _drive_indicators_from_payload(self, payload: str) -> None:
+        """Map inbound firmware lines to indicator pulses. Only acts on '<<' receives."""
+        s = payload.strip()
+        if not s.startswith("<< "):
+            return
+        core = s[3:].strip()
+        up = core.upper()
+        if up == "[READY]" or up == "OK,BT_CONNECTED":
+            self._ready_last_wall = time.time()
+            self._set_indicator("ready", True)
+            return
+        if up.startswith("ERROR,"):
+            self._error_last_msg = core
+            self._set_indicator("error", True)
+            # ERROR can stand in for a missing TELEM (e.g. ERROR,VESC_TIMEOUT)
+            # so the scheduler isn't stuck waiting for a response that won't come.
+            if "VESC" in up or "TIMEOUT" in up:
+                self._telem_pending_since = None
+            return
+        if up == "OK,STOP":
+            self._pulse_indicator("stop", 800)
+            return
+        if (
+            up.startswith("OK,SET_CURRENT")
+            or up.startswith("OK,SET_DUTY")
+            or up == "OK,SET_BRAKE"
+            or up == "OK,KEEPALIVE"
+            or up.startswith("OK,ENC_")
+        ):
+            self._pulse_indicator("motor", 350)
+            return
+
     def _build_telem_matplotlib(self, parent: ttk.Frame) -> None:
         try:
             from matplotlib.figure import Figure
@@ -668,51 +909,30 @@ class VescControlGui:
             ).pack(expand=True)
             return
 
-        self._fig = Figure(figsize=(5.5, 6.8), constrained_layout=True)
-        ax0 = self._fig.add_subplot(4, 1, 1)
-        ax1 = self._fig.add_subplot(4, 1, 2, sharex=ax0)
-        ax2 = self._fig.add_subplot(4, 1, 3, sharex=ax0)
-        ax3 = self._fig.add_subplot(4, 1, 4, sharex=ax0)
+        self._fig = Figure(figsize=(5.5, 8.5), constrained_layout=True)
+        ax0 = self._fig.add_subplot(5, 1, 1)
+        ax1 = self._fig.add_subplot(5, 1, 2, sharex=ax0)
+        ax2 = self._fig.add_subplot(5, 1, 3, sharex=ax0)
+        ax3 = self._fig.add_subplot(5, 1, 4, sharex=ax0)
+        ax4 = self._fig.add_subplot(5, 1, 5, sharex=ax0)
         ax0.set_ylabel("Pos (m)")
-        ax1.set_ylabel("RPM")
-        ax2.set_ylabel("Vbat")
-        ax3.set_ylabel("A")
-        ax3.set_xlabel("Time in window (s)")
+        ax1.set_ylabel("Vel (m/s)")
+        ax2.set_ylabel("RPM")
+        ax3.set_ylabel("Vbat")
+        ax4.set_ylabel("A")
+        ax4.set_xlabel("Time in window (s)")
         (self._ln_telem_enc_pos,) = ax0.plot([], [], color="tab:green", lw=1.2)
-        (self._ln_rpm,) = ax1.plot([], [], color="tab:blue", lw=1)
-        (self._ln_v,) = ax2.plot([], [], "g-", lw=1)
-        (self._ln_im,) = ax3.plot([], [], "r-", lw=1, label="I motor")
-        (self._ln_iin,) = ax3.plot([], [], "m-", lw=1, label="I in")
-        ax3.legend(loc="upper right", fontsize=7)
-        self._telem_axes = (ax0, ax1, ax2, ax3)
+        (self._ln_enc_vel,) = ax1.plot([], [], color="tab:purple", lw=1)
+        (self._ln_rpm,) = ax2.plot([], [], color="tab:blue", lw=1)
+        (self._ln_v,) = ax3.plot([], [], "g-", lw=1)
+        (self._ln_im,) = ax4.plot([], [], "r-", lw=1, label="I motor")
+        (self._ln_iin,) = ax4.plot([], [], "m-", lw=1, label="I in")
+        ax4.legend(loc="upper right", fontsize=7)
+        self._telem_axes = (ax0, ax1, ax2, ax3, ax4)
+        self._ln_enc_pos = self._ln_telem_enc_pos
 
         self._canvas = FigureCanvasTkAgg(self._fig, master=parent)
         self._canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-    def _build_enc_matplotlib(self, parent: ttk.Frame) -> None:
-        try:
-            from matplotlib.figure import Figure
-            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-        except ImportError:
-            ttk.Label(
-                parent,
-                text="Install matplotlib for encoder plots:\n  pip install matplotlib",
-                justify=tk.CENTER,
-            ).pack(expand=True)
-            return
-
-        self._fig_enc = Figure(figsize=(5.5, 3.2), constrained_layout=True)
-        axp = self._fig_enc.add_subplot(2, 1, 1)
-        axv = self._fig_enc.add_subplot(2, 1, 2, sharex=axp)
-        axp.set_ylabel("Position (m)")
-        axv.set_ylabel("Velocity (m/s)")
-        axv.set_xlabel("Time in window (s)")
-        (self._ln_enc_pos,) = axp.plot([], [], color="tab:blue", lw=1)
-        (self._ln_enc_vel,) = axv.plot([], [], color="tab:purple", lw=1)
-        self._enc_axes = (axp, axv)
-
-        self._canvas_enc = FigureCanvasTkAgg(self._fig_enc, master=parent)
-        self._canvas_enc.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
     def _apply_graph_windows(self) -> None:
         self._redraw_telem_plot()
@@ -776,6 +996,8 @@ class VescControlGui:
         d = parse_telem_line(payload)
         if d is None:
             return
+        # Response received → unblock the next poll tick.
+        self._telem_pending_since = None
         esp = d.get("esp_ms")
         tw = self._wall_from_esp_millis(int(esp)) if esp is not None else time.time()
         self._telem_samples.append(
@@ -817,15 +1039,19 @@ class VescControlGui:
 
         enc_x: List[float] = []
         enc_pos: List[float] = []
+        enc_vel: List[float] = []
         for row in self._enc_samples:
             t_wall = row[0]
             if t_wall < t_start:
                 continue
             enc_x.append(t_wall - t_start)
             enc_pos.append(row[1])
+            enc_vel.append(row[2])
 
         if hasattr(self, "_ln_telem_enc_pos"):
             self._ln_telem_enc_pos.set_data(enc_x, enc_pos)
+        if self._ln_enc_vel is not None:
+            self._ln_enc_vel.set_data(enc_x, enc_vel)
 
         self._ln_rpm.set_data(xs, rpm_l)
         self._ln_v.set_data(xs, v_l)
@@ -864,7 +1090,11 @@ class VescControlGui:
                 item = self._ui_q.get_nowait()
                 if item[0] == "log":
                     payload = item[1]
-                    if not is_enc_log_payload(payload):
+                    self._drive_indicators_from_payload(payload)
+                    show = not is_enc_log_payload(payload)
+                    if show and not self.var_verbose_log.get() and self._is_quiet_log_line(payload):
+                        show = False
+                    if show:
                         self._append_log_safe(payload)
                     self._feed_telem_from_log_line(payload)
                     self._feed_enc_from_log_line(payload)
@@ -876,7 +1106,15 @@ class VescControlGui:
             self._ui_q.put(item)
 
     def _export_timed_run_csv(self, t_end: float, reason: str) -> None:
-        """Write TELEM + ENC rows in capture window; t_rel_s uses ESP32 millis when available."""
+        """Write ONE row per TELEM sample (slowest stream) with the nearest-in-device-time ENC values attached.
+
+        Each row is a time-aligned snapshot on the ESP32 millis() clock: TELEM provides the timestamp
+        (device_ms, t_rel_s) and the encoder fields are filled from the nearest ENC sample within
+        ENC_PAIR_TOL_MS. If there is no TELEM at all in the window, we fall back to one row per ENC
+        sample so the CSV is not empty.
+        """
+        ENC_PAIR_TOL_MS = 50  # ENC streams ~10 ms; anything further is probably a gap, leave blank.
+
         self._flush_pending_log_lines_to_samples()
         t_end = max(t_end, time.time())
         t0_wall = self._csv_timed_capture_start
@@ -894,141 +1132,314 @@ class VescControlGui:
         dev_end = self._estimate_device_ms_at_host_wall(t_end)
         use_dev = dev_start is not None and dev_end is not None
 
-        rows_out: List[Tuple[float, Dict[str, Any]]] = []
-        for row in self._telem_samples:
-            tw, esp_ms, rpm, duty, vb, imo, i_i = row[:7]
+        def _in_window_telem(tw: float, esp_ms: Optional[int]) -> bool:
             if use_dev and esp_ms is not None:
                 e = int(esp_ms)
-                if _u32_diff_ms(e, dev_start) < 0 or _u32_diff_ms(dev_end, e) < 0:
-                    continue
-            elif not (t0_wall <= tw <= t_end):
-                continue
-            if use_dev and esp_ms is not None and dev_start is not None:
-                t_rel = _u32_diff_ms(int(esp_ms), dev_start) / 1000.0
-            else:
-                t_rel = tw - t0_wall
-            rows_out.append(
-                (
-                    tw,
-                    {
-                        "host_unix_s": tw,
-                        "device_ms": int(esp_ms) if esp_ms is not None else "",
-                        "t_rel_s": t_rel,
-                        "stream": "telem",
-                        "rpm": "",
-                        "duty": duty,
-                        "vbat": vb,
-                        "i_motor": imo,
-                        "i_in": i_i,
-                        "enc_millis": "",
-                        "enc_count": "",
-                        "position_m": "",
-                        "velocity_mps": "",
-                    },
-                )
-            )
+                return _u32_diff_ms(e, dev_start) >= 0 and _u32_diff_ms(dev_end, e) >= 0
+            return t0_wall <= tw <= t_end
+
+        def _in_window_enc(tw: float, enc_ms: int) -> bool:
+            if use_dev:
+                e = int(enc_ms)
+                return _u32_diff_ms(e, dev_start) >= 0 and _u32_diff_ms(dev_end, e) >= 0
+            return t0_wall <= tw <= t_end
+
+        # Collect and sort ENC by device_ms for nearest-neighbor pairing.
+        # Also precompute spool RPM per ENC sample (velocity-based; fall back to position delta when idle).
+        enc_sorted: List[Tuple[int, float, int, float, float, float]] = []
         for row in self._enc_samples:
             tw = row[0]
             pos_m, vel_mps, count, enc_ms = row[1], row[2], row[3], row[4]
-            if use_dev:
-                if _u32_diff_ms(int(enc_ms), dev_start) < 0 or _u32_diff_ms(dev_end, int(enc_ms)) < 0:
-                    continue
-            elif not (t0_wall <= tw <= t_end):
+            if not _in_window_enc(tw, int(enc_ms)):
                 continue
-            if use_dev and dev_start is not None:
-                t_rel = _u32_diff_ms(int(enc_ms), dev_start) / 1000.0
-            else:
-                t_rel = tw - t0_wall
-            rows_out.append(
-                (
-                    tw,
-                    {
-                        "host_unix_s": tw,
-                        "device_ms": int(enc_ms),
-                        "t_rel_s": t_rel,
-                        "stream": "enc",
-                        "rpm": 0.0,
-                        "duty": "",
-                        "vbat": "",
-                        "i_motor": "",
-                        "i_in": "",
-                        "enc_millis": enc_ms,
-                        "enc_count": count,
-                        "position_m": pos_m,
-                        "velocity_mps": vel_mps,
-                    },
-                )
-            )
+            enc_sorted.append((int(enc_ms), tw, int(count), float(pos_m), float(vel_mps), 0.0))
+        enc_sorted.sort(key=lambda r: r[0])
 
-        rows_out.sort(key=lambda x: x[0])
-        enc_rows = [(tw, d) for tw, d in rows_out if d.get("stream") == "enc"]
-        enc_rows.sort(key=lambda x: int(x[1]["device_ms"]))
         prev_tw: Optional[float] = None
         prev_pos: Optional[float] = None
         prev_count: Optional[int] = None
-        for tw, d in enc_rows:
-            pos_m = float(d["position_m"])
-            vel_mps = float(d["velocity_mps"])
-            count = int(d["enc_count"])
-            # ENC_RESET zeros count — do not chain position-delta RPM across that discontinuity.
+        for i, (e_ms, tw, count, pos_m, vel_mps, _rpm) in enumerate(enc_sorted):
             if prev_count is not None and count < prev_count - 10:
-                prev_tw, prev_pos = None, None
+                prev_tw, prev_pos = None, None  # ENC_RESET discontinuity
             prev_count = count
             rpm_spool = _spool_rpm_from_linear_velocity_mps(vel_mps)
             if abs(vel_mps) < 1e-5 and prev_tw is not None and prev_pos is not None:
                 rpm_spool = _spool_rpm_from_position_delta(pos_m, prev_pos, tw, prev_tw)
-            d["rpm"] = rpm_spool
+            enc_sorted[i] = (e_ms, tw, count, pos_m, vel_mps, rpm_spool)
             prev_tw, prev_pos = tw, pos_m
 
-        last_enc_rpm: Optional[float] = None
-        for tw, d in rows_out:
-            if d.get("stream") == "enc":
-                last_enc_rpm = float(d["rpm"])
-            elif d.get("stream") == "telem" and last_enc_rpm is not None:
-                d["rpm"] = last_enc_rpm
-        n_telem = sum(1 for _tw, d in rows_out if d.get("stream") == "telem")
-        n_enc = sum(1 for _tw, d in rows_out if d.get("stream") == "enc")
-        out_dir = self._timed_captures_dir()
-        os.makedirs(out_dir, exist_ok=True)
-        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_reason = "".join(c if c.isalnum() or c in "-_" else "_" for c in reason)[:40]
-        path = os.path.join(out_dir, f"timed_run_{stamp}_{safe_reason}.csv")
+        # Nearest ENC neighbor by device_ms using monotonic two-pointer walk (TELEM is ordered in time).
+        def _pair_enc_for(device_ms: int, start_idx: int) -> Tuple[Optional[int], int]:
+            """Return (enc_index_or_None, next_search_start)."""
+            if not enc_sorted:
+                return None, start_idx
+            i = start_idx
+            n = len(enc_sorted)
+            # Advance while next sample is still <= device_ms.
+            while i + 1 < n and _u32_diff_ms(enc_sorted[i + 1][0], device_ms) <= 0:
+                i += 1
+            # i is candidate 1 (<= device_ms), i+1 is candidate 2 (> device_ms) if exists.
+            best = i
+            best_abs = abs(_u32_diff_ms(enc_sorted[i][0], device_ms))
+            if i + 1 < n:
+                d2 = abs(_u32_diff_ms(enc_sorted[i + 1][0], device_ms))
+                if d2 < best_abs:
+                    best = i + 1
+                    best_abs = d2
+            if best_abs > ENC_PAIR_TOL_MS:
+                return None, i
+            return best, i
+
         fieldnames = [
             "host_unix_s",
             "device_ms",
             "t_rel_s",
-            "stream",
-            "rpm",
             "duty",
             "vbat",
             "i_motor",
             "i_in",
-            "enc_millis",
-            "enc_count",
+            "rpm_vesc",
+            "rpm_spool",
             "position_m",
             "velocity_mps",
+            "enc_count",
+            "enc_device_ms",
         ]
+
+        rows_out: List[Dict[str, Any]] = []
+
+        telem_in_window: List[Tuple[float, Optional[int], float, float, float, float, float]] = []
+        for row in self._telem_samples:
+            tw, esp_ms, rpm, duty, vb, imo, i_i = row[:7]
+            if not _in_window_telem(tw, esp_ms):
+                continue
+            telem_in_window.append((tw, esp_ms, rpm, duty, vb, imo, i_i))
+        telem_in_window.sort(key=lambda r: (int(r[1]) if r[1] is not None else -1, r[0]))
+
+        try:
+            grid_ms = max(5, int(self.var_csv_grid_ms.get()))
+        except (tk.TclError, ValueError):
+            grid_ms = 50
+        use_grid = (
+            bool(self.var_csv_fixed_grid.get())
+            and use_dev
+            and dev_start is not None
+            and dev_end is not None
+            and (bool(telem_in_window) or bool(enc_sorted))
+        )
+
+        n_paired = 0
+        n_telem = 0
+        n_enc_rows = 0
+        enc_search_i = 0
+        mode = "telem"
+
+        if use_grid:
+            # Uniform device_ms grid: every row is exactly grid_ms apart regardless
+            # of BLE/VESC jitter. Each grid point takes the nearest TELEM and the
+            # nearest ENC (independent tolerances). Live plots keep using the raw
+            # samples since device_ms is accurate there.
+            import bisect
+            # Worst-case nearest-neighbor distance between an asynchronous TELEM stream
+            # (cadence = poll_ms) and the uniform export grid (cadence = grid_ms) is
+            # ~(grid_ms + poll_ms) / 2, and *doubles* across one missed poll. Pick
+            # tolerance = grid_ms + poll_ms (covers one dropped beat), with a 2*grid_ms
+            # floor so slow polls against a dense grid also get forgiven.
+            try:
+                poll_ms = max(5, int(self.var_telem_ms.get()))
+            except Exception:
+                poll_ms = 100
+            TELEM_TOL_MS = max(grid_ms + poll_ms, 2 * grid_ms, 120)
+            ENC_TOL_MS = max(ENC_PAIR_TOL_MS, grid_ms // 2)
+            mode = "grid"
+
+            telem_pairs: List[Tuple[int, Tuple[float, Optional[int], float, float, float, float, float]]] = sorted(
+                ((int(r[1]), r) for r in telem_in_window if r[1] is not None),
+                key=lambda x: x[0],
+            )
+            telem_keys = [p[0] for p in telem_pairs]
+            enc_keys = [r[0] for r in enc_sorted]
+
+            def _nearest(keys: List[int], target: int) -> Tuple[Optional[int], int]:
+                """Return (index, abs_ms_diff) of nearest key; index is None for empty list."""
+                if not keys:
+                    return None, 0
+                j = bisect.bisect_left(keys, target)
+                best_idx = None
+                best_d = -1
+                for k in (j - 1, j):
+                    if 0 <= k < len(keys):
+                        d = abs(keys[k] - target)
+                        if best_idx is None or d < best_d:
+                            best_idx = k
+                            best_d = d
+                return best_idx, best_d if best_d >= 0 else 0
+
+            span_ms = max(0, _u32_diff_ms(int(dev_end), int(dev_start)))
+            # Safety: cap row count so a runaway clock / huge window can't generate millions of rows.
+            MAX_ROWS = 200_000
+            n_steps = min(MAX_ROWS, span_ms // grid_ms + 1) if span_ms > 0 else 1
+
+            for i in range(int(n_steps) + 1):
+                g_delta = i * grid_ms
+                if g_delta > span_ms:
+                    break
+                g = (int(dev_start) + g_delta) & 0xFFFFFFFF
+                t_rel = g_delta / 1000.0
+
+                t_idx, t_d = _nearest(telem_keys, g)
+                if t_idx is not None and t_d <= TELEM_TOL_MS:
+                    _, (_tw_t, _e_t, rpm_v, duty_v, vbat_v, imo_v, iin_v) = telem_pairs[t_idx]
+                else:
+                    rpm_v = duty_v = vbat_v = imo_v = iin_v = ""
+
+                e_idx, e_d = _nearest(enc_keys, g)
+                if e_idx is not None and e_d <= ENC_TOL_MS:
+                    e_ms, _e_tw, e_count, e_pos, e_vel, e_rpm_spool = enc_sorted[e_idx]
+                    rows_out.append({
+                        "host_unix_s": self._wall_from_esp_millis(g),
+                        "device_ms": int(g),
+                        "t_rel_s": t_rel,
+                        "duty": duty_v,
+                        "vbat": vbat_v,
+                        "i_motor": imo_v,
+                        "i_in": iin_v,
+                        "rpm_vesc": rpm_v,
+                        "rpm_spool": e_rpm_spool,
+                        "position_m": e_pos,
+                        "velocity_mps": e_vel,
+                        "enc_count": e_count,
+                        "enc_device_ms": e_ms,
+                    })
+                    n_paired += 1
+                else:
+                    rows_out.append({
+                        "host_unix_s": self._wall_from_esp_millis(g),
+                        "device_ms": int(g),
+                        "t_rel_s": t_rel,
+                        "duty": duty_v,
+                        "vbat": vbat_v,
+                        "i_motor": imo_v,
+                        "i_in": iin_v,
+                        "rpm_vesc": rpm_v,
+                        "rpm_spool": "",
+                        "position_m": "",
+                        "velocity_mps": "",
+                        "enc_count": "",
+                        "enc_device_ms": "",
+                    })
+            n_telem = len(telem_in_window)
+            n_enc_rows = len(enc_sorted)
+        elif telem_in_window:
+            for tw, esp_ms, rpm, duty, vb, imo, i_i in telem_in_window:
+                if use_dev and esp_ms is not None and dev_start is not None:
+                    device_ms = int(esp_ms)
+                    t_rel = _u32_diff_ms(device_ms, dev_start) / 1000.0
+                else:
+                    device_ms = int(esp_ms) if esp_ms is not None else ""
+                    t_rel = tw - t0_wall
+
+                enc_idx: Optional[int] = None
+                if isinstance(device_ms, int):
+                    enc_idx, enc_search_i = _pair_enc_for(device_ms, enc_search_i)
+
+                if enc_idx is not None:
+                    e_ms, e_tw, e_count, e_pos, e_vel, e_rpm_spool = enc_sorted[enc_idx]
+                    rows_out.append({
+                        "host_unix_s": tw,
+                        "device_ms": device_ms,
+                        "t_rel_s": t_rel,
+                        "duty": duty,
+                        "vbat": vb,
+                        "i_motor": imo,
+                        "i_in": i_i,
+                        "rpm_vesc": rpm,
+                        "rpm_spool": e_rpm_spool,
+                        "position_m": e_pos,
+                        "velocity_mps": e_vel,
+                        "enc_count": e_count,
+                        "enc_device_ms": e_ms,
+                    })
+                    n_paired += 1
+                else:
+                    rows_out.append({
+                        "host_unix_s": tw,
+                        "device_ms": device_ms,
+                        "t_rel_s": t_rel,
+                        "duty": duty,
+                        "vbat": vb,
+                        "i_motor": imo,
+                        "i_in": i_i,
+                        "rpm_vesc": rpm,
+                        "rpm_spool": "",
+                        "position_m": "",
+                        "velocity_mps": "",
+                        "enc_count": "",
+                        "enc_device_ms": "",
+                    })
+            n_telem = len(telem_in_window)
+            n_enc_rows = 0
+        else:
+            for e_ms, e_tw, e_count, e_pos, e_vel, e_rpm_spool in enc_sorted:
+                if use_dev and dev_start is not None:
+                    t_rel = _u32_diff_ms(e_ms, dev_start) / 1000.0
+                else:
+                    t_rel = e_tw - t0_wall
+                rows_out.append({
+                    "host_unix_s": e_tw,
+                    "device_ms": e_ms,
+                    "t_rel_s": t_rel,
+                    "duty": "",
+                    "vbat": "",
+                    "i_motor": "",
+                    "i_in": "",
+                    "rpm_vesc": "",
+                    "rpm_spool": e_rpm_spool,
+                    "position_m": e_pos,
+                    "velocity_mps": e_vel,
+                    "enc_count": e_count,
+                    "enc_device_ms": e_ms,
+                })
+            n_telem = 0
+            n_enc_rows = len(enc_sorted)
+
+        out_dir = self._timed_captures_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        # Filename stamp = wall-clock moment we're actually writing the CSV. Millisecond
+        # precision so two back-to-back exports can't collide / overwrite each other.
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        safe_reason = "".join(c if c.isalnum() or c in "-_" else "_" for c in reason)[:40]
+        path = os.path.join(out_dir, f"timed_run_{stamp}_{safe_reason}.csv")
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=fieldnames)
                 w.writeheader()
-                for _tw, d in rows_out:
+                for d in rows_out:
                     w.writerow(d)
         except OSError as e:
             self._log(f"CSV export failed: {e}")
             return
 
         n = len(rows_out)
-        self._log(f"CSV export ({reason}): {n} rows ({n_telem} telem + {n_enc} enc) → {path}")
-        if n_telem > 0 and n_enc == 0:
+        if mode == "grid":
+            telem_rows_with_data = sum(1 for d in rows_out if d.get("rpm_vesc") not in ("", None))
             self._log(
-                "(CSV: no enc rows in window — turn on Firmware ENC stream, keep Live TELEM poll on; "
-                "position_m is only on stream=enc rows.)"
+                f"CSV export ({reason}, uniform grid {grid_ms} ms): {n} rows "
+                f"(TELEM filled {telem_rows_with_data}/{n} @ ≤{TELEM_TOL_MS} ms tol; "
+                f"ENC paired {n_paired}/{n} @ ≤{ENC_TOL_MS} ms; "
+                f"{n_telem} raw TELEM, {n_enc_rows} raw ENC available) → {path}"
             )
-        elif n_enc > 0:
+        elif n_telem > 0:
             self._log(
-                "(CSV: device_ms = ESP32 millis; t_rel_s from that clock; rpm = spool from ENC; TELEM rows fill rpm from last ENC.)"
+                f"CSV export ({reason}): {n} aligned rows "
+                f"(TELEM cadence; {n_paired}/{n_telem} paired w/ ENC ≤{ENC_PAIR_TOL_MS}ms) → {path}"
             )
+        elif n_enc_rows > 0:
+            self._log(
+                f"CSV export ({reason}): {n} rows (ENC only — Live TELEM was off) → {path}"
+            )
+        else:
+            self._log(f"CSV export ({reason}): no samples in window → {path}")
 
     def _feed_enc_from_log_line(self, payload: str) -> None:
         d = parse_enc_line(payload)
@@ -1047,36 +1458,9 @@ class VescControlGui:
         self._schedule_live_plots_redraw()
 
     def _redraw_enc_plot(self) -> None:
-        if self._fig_enc is None or self._canvas_enc is None or self._ln_enc_pos is None:
-            return
-        try:
-            tw = max(1.0, float(self.var_telem_window_s.get()))
-        except (tk.TclError, ValueError):
-            tw = 30.0
-        t_end = self._plot_time_end()
-        t_start = t_end - tw
-        xs: List[float] = []
-        pos_l: List[float] = []
-        vel_l: List[float] = []
-        for row in self._enc_samples:
-            t_wall, pos_m, vel_mps = row[:3]
-            if t_wall < t_start:
-                continue
-            xs.append(t_wall - t_start)
-            pos_l.append(pos_m)
-            vel_l.append(vel_mps)
-
-        self._ln_enc_pos.set_data(xs, pos_l)
-        self._ln_enc_vel.set_data(xs, vel_l)
-
-        assert self._enc_axes is not None
-        self._enc_axes[0].set_xlim(0.0, tw)
-        if xs:
-            for ax in self._enc_axes:
-                ax.relim()
-                ax.autoscale_view(scalex=False)
-            self._enc_axes[0].set_xlim(0.0, tw)
-        self._canvas_enc.draw_idle()
+        # Encoder position + velocity live on the main figure now (rows 1 + 2);
+        # _redraw_telem_plot refreshes them. Kept as a no-op so existing callers still work.
+        return
 
     def _on_enc_stream_toggle(self) -> None:
         if not self._is_connected():
@@ -1111,12 +1495,34 @@ class VescControlGui:
         if not self._is_connected():
             self.var_live_telem.set(False)
             return
-        self._send_line("GET_VALUES")
         try:
-            ms = max(20, int(self.var_telem_ms.get()))
+            ms = max(5, int(self.var_telem_ms.get()))
         except (tk.TclError, ValueError):
             ms = 200
-        self._telem_poll_after_id = self.root.after(ms, self._telem_poll_tick)
+        ms_s = ms / 1000.0
+
+        now = time.time()
+        # Pile-up guard: if a previous GET_VALUES hasn't been answered yet and
+        # was sent less than ~3× the requested interval (min 300 ms) ago, skip
+        # this send. This lets us ask for 5 ms polling safely — the scheduler
+        # keeps firing but the wire stays at firmware RTT instead of backing up.
+        pending_timeout = max(0.3, ms_s * 3.0)
+        pending = self._telem_pending_since
+        can_send = (pending is None) or ((now - pending) > pending_timeout)
+        if can_send:
+            self._send_line("GET_VALUES")
+            self._telem_pending_since = now
+
+        # Fixed-rate: aim for next_send_wall += ms each tick. If we fell behind
+        # (e.g. main loop was blocked), advance past 'now' without pile-up.
+        target = self._telem_next_send_wall + ms_s
+        if target <= now:
+            # Jumped past: catch up without firing extra requests.
+            k = int((now - target) / ms_s) + 1
+            target += k * ms_s
+        self._telem_next_send_wall = target
+        delay_ms = max(1, int((target - now) * 1000))
+        self._telem_poll_after_id = self.root.after(delay_ms, self._telem_poll_tick)
 
     def _start_telem_polling(self) -> None:
         self._stop_telem_polling()
@@ -1124,6 +1530,8 @@ class VescControlGui:
             self.var_live_telem.set(False)
             messagebox.showinfo("Live TELEM", "Connect to the ESP32 first.")
             return
+        self._telem_next_send_wall = time.time()
+        self._telem_pending_since = None
         self._telem_poll_tick()
 
     def _on_live_telem_toggle(self) -> None:
@@ -1146,7 +1554,14 @@ class VescControlGui:
             while True:
                 kind, payload = self._ui_q.get_nowait()
                 if kind == "log":
-                    if not is_enc_log_payload(payload):
+                    self._drive_indicators_from_payload(payload)
+                    # ENC is always skipped (rate). In non-verbose mode also
+                    # skip TELEM/OK/[READY] — indicators cover them and the
+                    # text widget was the largest UI-side cost at fast polling.
+                    show = not is_enc_log_payload(payload)
+                    if show and not self.var_verbose_log.get() and self._is_quiet_log_line(payload):
+                        show = False
+                    if show:
                         self._append_log_safe(payload)
                     self._feed_telem_from_log_line(payload)
                     self._feed_enc_from_log_line(payload)
@@ -1171,6 +1586,9 @@ class VescControlGui:
                     self._cancel_timed_run()
                     self._stop_telem_polling()
                     self.var_live_telem.set(False)
+                    self._ready_last_wall = None
+                    for k in ("ready", "motor", "stop", "error"):
+                        self._set_indicator(k, False)
                     if self._plots_redraw_after_id is not None:
                         try:
                             self.root.after_cancel(self._plots_redraw_after_id)
@@ -1217,12 +1635,16 @@ class VescControlGui:
         self._timed_deadline = 0.0
         self._timed_ka_interval_s = 0.0
         self._timed_run_is_test = False
+        self._timed_start_wall = None
+        self._timed_total_s = 0.0
 
     def _schedule_timed_run(self, duration_s: float, keepalive_interval_s: float) -> None:
         self._cancel_timed_run()
         if duration_s <= 0:
             return
         self._timed_deadline = time.time() + duration_s
+        self._timed_start_wall = time.time()
+        self._timed_total_s = float(duration_s)
         self._timed_ka_interval_s = max(0.0, keepalive_interval_s)
         dur_ms = int(max(0.05, duration_s) * 1000)
         self._timed_stop_after_id = self.root.after(dur_ms, self._timed_run_fire_stop)
@@ -1248,6 +1670,8 @@ class VescControlGui:
         t_end = time.time()
         reason = "test_stop" if self._timed_run_is_test else "timed_stop"
         self._timed_run_is_test = False
+        self._timed_start_wall = None
+        self._timed_total_s = 0.0
         self._export_timed_run_csv(t_end, reason)
         self._send_line("STOP")
         self._log("(Timed run: sent STOP)")
