@@ -16,10 +16,14 @@
  *   GET_FW                    → FW,...
  *   KEEPALIVE                 → OK,KEEPALIVE
  *   ENC_RESET                 → OK,ENC_RESET (zero encoder count / position)
- *   ENC_STREAM,<0|1>         → OK,ENC_STREAM,... (enable/disable ENC line streaming)
- *   ENC,...                   — streamed ~100 Hz when ENC_STREAM on (BLE):
+ *   ENC_STREAM,<0|1>[,<ms>]  → OK,ENC_STREAM,<on>,<ms> (enable/disable + optional interval; default 10 ms)
+ *   TELEM_STREAM,<0|1>[,<ms>]→ OK,TELEM_STREAM,<on>,<ms> (firmware-pushed TELEM at <ms> cadence;
+ *                               default 30 ms. Replaces polled GET_VALUES — each sample costs one BLE
+ *                               notify instead of a request/response round-trip.)
+ *   ENC,...                   — streamed when ENC_STREAM on (BLE):
  *                               ENC,time_ms,count,position_m,velocity_mps
  *                               (same quadrature + spool geometry as ahaan100/encoder.ino)
+ *   TELEM,...                 — streamed when TELEM_STREAM on (BLE), same payload as GET_VALUES reply.
  *   [READY]                   — periodic heartbeat to BLE when connected
  *
  * BLE UUIDs (Nordic UART Service — works with bleak / nRF Connect):
@@ -79,12 +83,31 @@ static const float   SPOOL_DIA_INCHES   = 4.0f;
 static const float   SPOOL_CIRCUMF_M    = 3.14159265f * SPOOL_DIA_INCHES * 0.0254f;
 static const float   METERS_PER_COUNT   = SPOOL_CIRCUMF_M / (float)COUNTS_PER_REV;
 
-static const uint32_t ENC_SAMPLE_INTERVAL_MS = 10;  // 100 Hz
+// ENC stream interval is runtime-configurable via ENC_STREAM,<on>,<ms>. Default is 10 ms (100 Hz);
+// at a 15 ms BLE connection interval (macOS floor) the link has only ~67 notify slots/s total,
+// so if you also want TELEM streaming slow this to ~20 ms (50 Hz) so ENC doesn't crowd out TELEM.
+#ifndef ENC_STREAM_DEFAULT_MS
+#define ENC_STREAM_DEFAULT_MS 10
+#endif
+static const uint32_t ENC_STREAM_MIN_MS = 1;
+static const uint32_t ENC_STREAM_MAX_MS = 1000;
 
 volatile int32_t g_encoderCount = 0;
 volatile int8_t  g_lastEncoded  = 0;
 bool             g_encResetPending  = false;
 bool             g_encStreamEnabled = true;
+uint32_t         g_encStreamIntervalMs = ENC_STREAM_DEFAULT_MS;
+
+// Firmware-pushed TELEM. When enabled, loop() calls UART.getVescValues() every g_telemStreamIntervalMs
+// and emits one TELEM line — no host GET_VALUES required. Kills one BLE direction per sample vs polling.
+#ifndef TELEM_STREAM_DEFAULT_MS
+#define TELEM_STREAM_DEFAULT_MS 30
+#endif
+static const uint32_t TELEM_STREAM_MIN_MS = 5;
+static const uint32_t TELEM_STREAM_MAX_MS = 5000;
+
+bool      g_telemStreamEnabled = false;
+uint32_t  g_telemStreamIntervalMs = TELEM_STREAM_DEFAULT_MS;
 
 void IRAM_ATTR updateEncoder() {
   int8_t a       = (int8_t)digitalRead(ENC_PIN_A);
@@ -123,7 +146,7 @@ static void pollEncoderStream(uint32_t nowMs) {
     return;
   }
 
-  if (nowMs - lastSampleMs < ENC_SAMPLE_INTERVAL_MS) return;
+  if (nowMs - lastSampleMs < g_encStreamIntervalMs) return;
   lastSampleMs = nowMs;
 
   noInterrupts();
@@ -239,6 +262,69 @@ static float parseFloat(const String& s) {
   return t.toFloat();
 }
 
+// Parse "<on>[,<ms>]" arguments for *_STREAM commands. Returns true if <ms> was present (and
+// already clamped into [min_ms, max_ms] and written back into out_ms); on-flag always goes to out_on.
+static bool parseStreamArgs(const String& args, bool& out_on, uint32_t& out_ms,
+                            uint32_t min_ms, uint32_t max_ms) {
+  int comma = args.indexOf(',');
+  if (comma < 0) {
+    out_on = parseFloat(args) != 0.0f;
+    return false;
+  }
+  out_on = parseFloat(args.substring(0, comma)) != 0.0f;
+  long ms = (long)parseFloat(args.substring(comma + 1));
+  if (ms < (long)min_ms) ms = (long)min_ms;
+  if (ms > (long)max_ms) ms = (long)max_ms;
+  out_ms = (uint32_t)ms;
+  return true;
+}
+
+// Assemble the TELEM line from the current UART.data snapshot and push it to the host.
+// Caller is responsible for having just run UART.getVescValues() successfully.
+static void sendTelemLineNow() {
+  uint32_t espMs = millis();
+  sendHostFmt("TELEM,%lu,%.1f,%.4f,%.2f,%.3f,%.3f,%.1f,%.1f,%ld,%ld,%d",
+      (unsigned long)espMs,
+      UART.data.rpm,
+      UART.data.dutyCycleNow,
+      UART.data.inpVoltage,
+      UART.data.avgMotorCurrent,
+      UART.data.avgInputCurrent,
+      UART.data.tempMosfet,
+      UART.data.tempMotor,
+      UART.data.tachometer,
+      UART.data.tachometerAbs,
+      (int)UART.data.error);
+}
+
+// Firmware-pushed TELEM: mirrors pollEncoderStream but also runs the VESC UART exchange each tick.
+// One BLE notify per sample (vs. polled GET_VALUES which needs host-write + notify = two connection
+// events on top of UART round-trip). A single UART.getVescValues() blocks loop() for ~10 ms at 115200
+// baud, so don't set this below ~15 ms or ENC emission starts to lag.
+static void pollTelemStream(uint32_t nowMs) {
+  static uint32_t lastSampleMs = 0;
+  static bool     lastStreamOn = false;
+
+  if (g_telemStreamEnabled != lastStreamOn) {
+    lastStreamOn = g_telemStreamEnabled;
+    lastSampleMs = 0;
+  }
+  if (!g_telemStreamEnabled) return;
+
+  if (lastSampleMs == 0) {
+    lastSampleMs = nowMs;
+    return;
+  }
+  if (nowMs - lastSampleMs < g_telemStreamIntervalMs) return;
+  lastSampleMs = nowMs;
+
+  if (UART.getVescValues()) {
+    sendTelemLineNow();
+  }
+  // On a bad read we deliberately stay silent and try again next interval — a VESC_TIMEOUT line every
+  // 25 ms would drown the link. The Python side already shows staleness via the "Actual Hz" readout.
+}
+
 static void processCommand(const String& cmd) {
 
   if (cmd == "PING") {
@@ -299,27 +385,28 @@ static void processCommand(const String& cmd) {
   }
 
   if (cmd.startsWith("ENC_STREAM,")) {
-    float on = parseFloat(cmd.substring(11));
-    g_encStreamEnabled = (on != 0.0f);
-    sendHostFmt("OK,ENC_STREAM,%d", g_encStreamEnabled ? 1 : 0);
+    bool on = false;
+    uint32_t ms = g_encStreamIntervalMs;
+    parseStreamArgs(cmd.substring(11), on, ms, ENC_STREAM_MIN_MS, ENC_STREAM_MAX_MS);
+    g_encStreamEnabled = on;
+    g_encStreamIntervalMs = ms;
+    sendHostFmt("OK,ENC_STREAM,%d,%lu", on ? 1 : 0, (unsigned long)g_encStreamIntervalMs);
+    return;
+  }
+
+  if (cmd.startsWith("TELEM_STREAM,")) {
+    bool on = false;
+    uint32_t ms = g_telemStreamIntervalMs;
+    parseStreamArgs(cmd.substring(13), on, ms, TELEM_STREAM_MIN_MS, TELEM_STREAM_MAX_MS);
+    g_telemStreamEnabled = on;
+    g_telemStreamIntervalMs = ms;
+    sendHostFmt("OK,TELEM_STREAM,%d,%lu", on ? 1 : 0, (unsigned long)g_telemStreamIntervalMs);
     return;
   }
 
   if (cmd == "GET_VALUES") {
     if (UART.getVescValues()) {
-      uint32_t espMs = millis();
-      sendHostFmt("TELEM,%lu,%.1f,%.4f,%.2f,%.3f,%.3f,%.1f,%.1f,%ld,%ld,%d",
-        (unsigned long)espMs,
-        UART.data.rpm,
-        UART.data.dutyCycleNow,
-        UART.data.inpVoltage,
-        UART.data.avgMotorCurrent,
-        UART.data.avgInputCurrent,
-        UART.data.tempMosfet,
-        UART.data.tempMotor,
-        UART.data.tachometer,
-        UART.data.tachometerAbs,
-        (int)UART.data.error);
+      sendTelemLineNow();
     } else {
       sendHostLine("ERROR,VESC_TIMEOUT");
     }
@@ -451,6 +538,7 @@ void setup() {
 void loop() {
   uint32_t now = millis();
   pollEncoderStream(now);
+  pollTelemStream(now);
   if (now - g_lastReadyMs >= READY_INTERVAL_MS) {
     g_lastReadyMs = now;
     sendHostLine("[READY]");

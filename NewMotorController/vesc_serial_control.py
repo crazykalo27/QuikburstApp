@@ -265,18 +265,21 @@ async def ble_ping_test(client, link: BleLineLink, log: Callable[[str], None]) -
 HELP_TEXT = """
 Commands (BLE):
   PING, SET_CURRENT,<A>, SET_BRAKE (no args — full brake on firmware), SET_DUTY,<d> (duty capped at 0.20),
-  STOP, GET_VALUES, GET_FW, KEEPALIVE, ENC_RESET, ENC_STREAM,<0|1>
+  STOP, GET_VALUES, GET_FW, KEEPALIVE,
+  ENC_RESET, ENC_STREAM,<0|1>[,<ms>], TELEM_STREAM,<0|1>[,<ms>]
 
-Telemetry: the VESC does NOT push TELEM by itself. Each GET_VALUES request returns one TELEM line
-(TELEM,esp32_ms,... where esp32_ms is ESP millis when sent — same clock as ENC time_ms). The GUI maps
-those device times to a wall timeline (anchor = first sample) so ENC and TELEM align by when they
-occurred on the ESP32, not host receive order. Legacy firmware without esp32_ms still uses host receive time.
-Use "Live TELEM poll" (or auto-start after connect) so TELEM and ENC stream together; plots refresh together.
+Telemetry: TELEM is now FIRMWARE-STREAMED. TELEM_STREAM,1,<ms> tells the ESP32 to emit one TELEM line
+every <ms> ms without being asked — each sample costs one BLE notify instead of a polled request/response
+round-trip, so the practical floor drops from ~100 ms to ~25–30 ms on macOS (one connection event +
+VESC UART). GET_VALUES is still supported as a one-shot on-demand read. The "Firmware TELEM stream"
+checkbox + ms spinbox drives TELEM_STREAM,<on>,<ms>; auto-starts on connect by default.
 
-Encoder: firmware streams ENC,time_ms,count,position_m,velocity_mps at 100 Hz over BLE
-(same quadrature + 4\" spool geometry as ahaan100/encoder.ino). ENC lines are not copied to the
-log (rate). Commands: ENC_RESET (zero), ENC_STREAM,0 | ENC_STREAM,1. When not exporting CSV, OK,ENC_RESET clears live encoder plot memory so the next run reads near zero on the graph. CSV position/velocity appear
-only on stream=enc rows (TELEM rows leave those columns blank); enable Firmware ENC stream on connect.
+Encoder: firmware streams ENC,time_ms,count,position_m,velocity_mps at a configurable rate
+(ENC_STREAM,<on>[,<ms>], default 10 ms / 100 Hz). At a 15 ms BLE connection interval the link has
+only ~67 notify slots/s total, so when you turn TELEM stream on consider bumping ENC to 20 ms (50 Hz)
+so the two streams don't fight for slots. ENC_RESET zeros count. When not exporting CSV, OK,ENC_RESET
+clears live encoder plot memory so the next run reads near zero on the graph. CSV position/velocity
+appear only on stream=enc rows (TELEM rows leave those columns blank); enable Firmware ENC stream on connect.
 Timed CSV: device_ms is ESP32 millis() for that row (TELEM esp32_ms or ENC time_ms); t_rel_s is
 seconds on that same clock from capture start so TELEM and ENC align. host_unix_s is mapped
 synthetic wall time for plotting continuity.
@@ -443,17 +446,21 @@ class VescControlGui:
 
         self.var_live_telem = tk.BooleanVar(value=False)
         self.var_auto_live_telem = tk.BooleanVar(value=True)
-        self.var_telem_ms = tk.IntVar(value=100)
+        # Firmware-pushed TELEM interval (ms). Sent to the ESP32 as TELEM_STREAM,1,<ms>. Each sample
+        # costs one BLE notify instead of a polled request/response, so we default well under the
+        # old ~100 ms RTT floor. Floor is ~15 ms on macOS (BLE connection interval) + ~10 ms VESC UART.
+        self.var_telem_ms = tk.IntVar(value=30)
+        # Firmware ENC stream interval (ms), sent as ENC_STREAM,1,<ms>. Raise it (e.g. 20 ms / 50 Hz)
+        # when TELEM streaming is enabled so the two streams don't fight for BLE notify slots.
+        self.var_enc_ms = tk.IntVar(value=10)
         self.var_telem_rate_str = tk.StringVar(value="Actual: — Hz")
         self.var_enc_rate_str = tk.StringVar(value="ENC: — Hz")
         self.var_telem_window_s = tk.DoubleVar(value=30.0)
-        self._telem_poll_after_id: Optional[str] = None
-        # Fixed-rate scheduler state: next_send_wall drifts forward by exactly
-        # ms/1000 each tick (not response+delay). pending_since gates sends so
-        # we don't queue faster than firmware can answer — when BLE/VESC RTT >
-        # requested interval the effective rate is capped at RTT cleanly.
-        self._telem_next_send_wall: float = 0.0
-        self._telem_pending_since: Optional[float] = None
+        # Debounce traces on the interval spinboxes so dragging the arrow doesn't flood the wire.
+        self._telem_ms_apply_after_id: Optional[str] = None
+        self._enc_ms_apply_after_id: Optional[str] = None
+        self.var_telem_ms.trace_add("write", self._on_telem_ms_changed)
+        self.var_enc_ms.trace_add("write", self._on_enc_ms_changed)
         # (t_wall, rpm, duty, vbat, i_motor, i_in) — VESC eRPM for live plots only
         self._telem_samples: deque = deque(maxlen=25000)
         self._fig: Any = None
@@ -672,7 +679,7 @@ class VescControlGui:
         telem_row.pack(fill=tk.X)
         ttk.Checkbutton(
             telem_row,
-            text="Live TELEM poll",
+            text="Firmware TELEM stream",
             variable=self.var_live_telem,
             command=self._on_live_telem_toggle,
         ).pack(side=tk.LEFT)
@@ -691,12 +698,16 @@ class VescControlGui:
         enc_row.pack(fill=tk.X, pady=(6, 0))
         ttk.Checkbutton(
             enc_row,
-            text="Firmware ENC stream (100 Hz target)",
+            text="Firmware ENC stream",
             variable=self.var_enc_stream,
             command=self._on_enc_stream_toggle,
         ).pack(side=tk.LEFT)
-        ttk.Label(enc_row, textvariable=self.var_enc_rate_str, foreground="#093", width=22).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(enc_row, text="ENC zero", command=lambda: self._send_line("ENC_RESET")).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(enc_row, text="every (ms):").pack(side=tk.LEFT, padx=(8, 0))
+        sb_enc_ms = ttk.Spinbox(enc_row, from_=1, to=1000, increment=1, textvariable=self.var_enc_ms, width=6)
+        sb_enc_ms.pack(side=tk.LEFT, padx=(4, 8))
+        self.cmd_widgets.append(sb_enc_ms)
+        ttk.Label(enc_row, textvariable=self.var_enc_rate_str, foreground="#093", width=22).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(enc_row, text="ENC zero", command=lambda: self._send_line("ENC_RESET")).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Separator(enc_row, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=12)
         ttk.Label(enc_row, text="Graph window (s):").pack(side=tk.LEFT)
         sb_telem_win = ttk.Spinbox(enc_row, from_=5, to=600, increment=5, textvariable=self.var_telem_window_s, width=6)
@@ -879,10 +890,6 @@ class VescControlGui:
         if up.startswith("ERROR,"):
             self._error_last_msg = core
             self._set_indicator("error", True)
-            # ERROR can stand in for a missing TELEM (e.g. ERROR,VESC_TIMEOUT)
-            # so the scheduler isn't stuck waiting for a response that won't come.
-            if "VESC" in up or "TIMEOUT" in up:
-                self._telem_pending_since = None
             return
         if up == "OK,STOP":
             self._pulse_indicator("stop", 800)
@@ -996,8 +1003,6 @@ class VescControlGui:
         d = parse_telem_line(payload)
         if d is None:
             return
-        # Response received → unblock the next poll tick.
-        self._telem_pending_since = None
         esp = d.get("esp_ms")
         tw = self._wall_from_esp_millis(int(esp)) if esp is not None else time.time()
         self._telem_samples.append(
@@ -1436,7 +1441,7 @@ class VescControlGui:
             )
         elif n_enc_rows > 0:
             self._log(
-                f"CSV export ({reason}): {n} rows (ENC only — Live TELEM was off) → {path}"
+                f"CSV export ({reason}): {n} rows (ENC only — Firmware TELEM stream was off) → {path}"
             )
         else:
             self._log(f"CSV export ({reason}): no samples in window → {path}")
@@ -1467,11 +1472,19 @@ class VescControlGui:
             return
         self._sync_enc_stream_to_firmware()
 
+    def _clamp_stream_ms(self, var: tk.IntVar, lo: int, hi: int, fallback: int) -> int:
+        try:
+            ms = int(var.get())
+        except (tk.TclError, ValueError):
+            ms = fallback
+        return max(lo, min(hi, ms))
+
     def _sync_enc_stream_to_firmware(self) -> None:
         if not self._is_connected():
             return
         on = 1 if self.var_enc_stream.get() else 0
-        self._send_line(f"ENC_STREAM,{on}")
+        ms = self._clamp_stream_ms(self.var_enc_ms, 1, 1000, 10)
+        self._send_line(f"ENC_STREAM,{on},{ms}")
 
     def _is_connected(self) -> bool:
         return (
@@ -1480,65 +1493,52 @@ class VescControlGui:
             and self._ble_ready.is_set()
         )
 
-    def _stop_telem_polling(self) -> None:
-        if self._telem_poll_after_id is not None:
-            try:
-                self.root.after_cancel(self._telem_poll_after_id)
-            except Exception:
-                pass
-            self._telem_poll_after_id = None
-
-    def _telem_poll_tick(self) -> None:
-        self._telem_poll_after_id = None
-        if not self.var_live_telem.get():
-            return
+    def _apply_telem_stream(self, on: bool) -> None:
+        """Push TELEM_STREAM,<on>,<ms> to firmware. No host-side scheduler — the ESP32
+        now pushes TELEM without being asked, so the only timing we control is the interval."""
         if not self._is_connected():
-            self.var_live_telem.set(False)
+            if on:
+                self.var_live_telem.set(False)
+                messagebox.showinfo("TELEM stream", "Connect to the ESP32 first.")
             return
-        try:
-            ms = max(5, int(self.var_telem_ms.get()))
-        except (tk.TclError, ValueError):
-            ms = 200
-        ms_s = ms / 1000.0
-
-        now = time.time()
-        # Pile-up guard: if a previous GET_VALUES hasn't been answered yet and
-        # was sent less than ~3× the requested interval (min 300 ms) ago, skip
-        # this send. This lets us ask for 5 ms polling safely — the scheduler
-        # keeps firing but the wire stays at firmware RTT instead of backing up.
-        pending_timeout = max(0.3, ms_s * 3.0)
-        pending = self._telem_pending_since
-        can_send = (pending is None) or ((now - pending) > pending_timeout)
-        if can_send:
-            self._send_line("GET_VALUES")
-            self._telem_pending_since = now
-
-        # Fixed-rate: aim for next_send_wall += ms each tick. If we fell behind
-        # (e.g. main loop was blocked), advance past 'now' without pile-up.
-        target = self._telem_next_send_wall + ms_s
-        if target <= now:
-            # Jumped past: catch up without firing extra requests.
-            k = int((now - target) / ms_s) + 1
-            target += k * ms_s
-        self._telem_next_send_wall = target
-        delay_ms = max(1, int((target - now) * 1000))
-        self._telem_poll_after_id = self.root.after(delay_ms, self._telem_poll_tick)
-
-    def _start_telem_polling(self) -> None:
-        self._stop_telem_polling()
-        if not self._is_connected():
-            self.var_live_telem.set(False)
-            messagebox.showinfo("Live TELEM", "Connect to the ESP32 first.")
-            return
-        self._telem_next_send_wall = time.time()
-        self._telem_pending_since = None
-        self._telem_poll_tick()
+        ms = self._clamp_stream_ms(self.var_telem_ms, 5, 5000, 30)
+        flag = 1 if on else 0
+        self._send_line(f"TELEM_STREAM,{flag},{ms}")
 
     def _on_live_telem_toggle(self) -> None:
-        if self.var_live_telem.get():
-            self._start_telem_polling()
-        else:
-            self._stop_telem_polling()
+        self._apply_telem_stream(self.var_live_telem.get())
+
+    def _on_telem_ms_changed(self, *_args) -> None:
+        # Debounce: spinboxes fire a write for every keystroke / arrow click. Coalesce into one
+        # command ~250 ms after the last change so we don't flood the BLE wire with TELEM_STREAM lines.
+        if self._telem_ms_apply_after_id is not None:
+            try:
+                self.root.after_cancel(self._telem_ms_apply_after_id)
+            except Exception:
+                pass
+        self._telem_ms_apply_after_id = self.root.after(
+            250, self._apply_telem_ms_after_debounce
+        )
+
+    def _apply_telem_ms_after_debounce(self) -> None:
+        self._telem_ms_apply_after_id = None
+        if self._is_connected() and self.var_live_telem.get():
+            self._apply_telem_stream(True)
+
+    def _on_enc_ms_changed(self, *_args) -> None:
+        if self._enc_ms_apply_after_id is not None:
+            try:
+                self.root.after_cancel(self._enc_ms_apply_after_id)
+            except Exception:
+                pass
+        self._enc_ms_apply_after_id = self.root.after(
+            250, self._apply_enc_ms_after_debounce
+        )
+
+    def _apply_enc_ms_after_debounce(self) -> None:
+        self._enc_ms_apply_after_id = None
+        if self._is_connected() and self.var_enc_stream.get():
+            self._sync_enc_stream_to_firmware()
 
     def _try_auto_start_live_telem(self) -> None:
         if not self.var_auto_live_telem.get():
@@ -1546,8 +1546,8 @@ class VescControlGui:
         if not self._is_connected():
             return
         self.var_live_telem.set(True)
-        self._start_telem_polling()
-        self._log("(Auto-started live TELEM poll — use with ENC stream for combined live plots + CSV)")
+        self._apply_telem_stream(True)
+        self._log("(Auto-started firmware TELEM stream — runs on the ESP32; see 'Actual Hz' for the real link rate.)")
 
     def _pump_ui_queue(self) -> None:
         try:
@@ -1584,7 +1584,8 @@ class VescControlGui:
                     self._csv_timed_capture_start = None
                     self._csv_device_ms_start = None
                     self._cancel_timed_run()
-                    self._stop_telem_polling()
+                    # No scheduler to cancel anymore: TELEM stream lives on the ESP32.
+                    # Dropping BLE stops the link; just reflect state in the UI.
                     self.var_live_telem.set(False)
                     self._ready_last_wall = None
                     for k in ("ready", "motor", "stop", "error"):
@@ -1725,7 +1726,7 @@ class VescControlGui:
         self._send_line("STOP")
         self._log(
             "(Test: STOP + CSV always armed for this run (Export checkbox not required); "
-            "enable Live TELEM poll for VESC rows in the file)"
+            "enable Firmware TELEM stream for VESC rows in the file)"
         )
 
     def _send_brake(self) -> None:
@@ -1871,11 +1872,17 @@ class VescControlGui:
             self._set_status("Disconnected")
 
     def _on_disconnect(self) -> None:
+        # Politely tell the firmware to stop streaming before we drop the link so the ESP32 doesn't
+        # keep pushing notifies that nobody reads. Ignored if the write queue is already torn down.
+        if self._is_connected():
+            try:
+                self._apply_telem_stream(False)
+            except Exception:
+                pass
         self._reset_device_time_anchor()
         self._csv_timed_capture_start = None
         self._csv_device_ms_start = None
         self._cancel_timed_run()
-        self._stop_telem_polling()
         self.var_live_telem.set(False)
         if self._ble_thread and self._ble_thread.is_alive():
             self._ble_ready.clear()
