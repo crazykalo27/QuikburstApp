@@ -10,6 +10,12 @@ Browse CSV/Excel time-series captures under NewMotorController.
 - Set X (time) min/max for all plots at once.
 - CSV: Cut overwrites the file with only rows in the current X range (plot zoom or min/max fields).
 - CSV: Delete removes the current file from disk (with confirmation).
+- From position: auto-detect “active” window (flat → moving → flat); show its duration on the
+  position plot and mean i_motor / i_in over that time in the graph and a summary line above.
+- On the i_motor and i_in graphs, a dashed line shows that active-window average (time span
+  t_start…t_stop).
+- Hover over a plot: a vertical line follows the pointer and a label shows time and the series
+  value at that time (linear interpolation between samples).
 """
 
 from __future__ import annotations
@@ -60,6 +66,188 @@ def y_numeric_columns(df: pd.DataFrame, time_col: str) -> list[str]:
     return cols
 
 
+def _pick_position_column(df: pd.DataFrame) -> str | None:
+    if "position_m" in df.columns:
+        return "position_m"
+    for c in df.columns:
+        if "position" in c.lower():
+            return c
+    return None
+
+
+def active_region_from_position(
+    t: np.ndarray,
+    pos: np.ndarray,
+    vel: np.ndarray | None = None,
+) -> dict | None:
+    """Find t_start (flat → move) and t_stop (end of the one-way drop).
+
+    t_stop is the **last** time before either (a) velocity reverses (bounce, wrong-way
+    motion after a one-way test) or (b) sustained return to rest if no bounce.
+
+    Current means use all samples with time in [t_start, t_stop] inclusive.
+    """
+    t = np.asarray(t, dtype=float)
+    pos = np.asarray(pos, dtype=float)
+    m = np.isfinite(t) & np.isfinite(pos)
+    t = t[m]
+    pos = pos[m]
+    if len(t) < 8:
+        return None
+    if vel is not None:
+        v = np.asarray(vel, dtype=float)
+        v = v[m]
+        if not np.all(np.isfinite(v)):
+            v = np.gradient(pos, t, edge_order=1)
+    else:
+        v = np.gradient(pos, t, edge_order=1)
+    v_abs = np.abs(v)
+    # Noise floor: only the initial rest (first ~0.25 s), not a fraction of the whole
+    # file — else long high-speed runs inflate the threshold and we never see "move".
+    t0 = float(t[0])
+    m_early = t <= t0 + 0.25
+    if int(np.count_nonzero(m_early)) >= 3:
+        v_noise = float(np.median(v_abs[m_early])) + 1e-12
+    else:
+        n_w = min(15, len(v_abs) - 1)
+        v_noise = float(np.median(v_abs[: max(1, n_w)])) + 1e-12
+    v_move = max(0.005, 5.0 * v_noise)
+    v_flat = max(1e-5, 1.2 * v_noise)
+    n_sus = max(2, min(5, len(t) // 80 + 1))
+
+    def sustained(mask: np.ndarray, i: int, n: int, want: bool) -> bool:
+        if i + n > len(mask):
+            return False
+        return bool(np.all(mask[i : i + n] == want))
+
+    is_moving = v_abs > v_move
+    is_flat = v_abs < v_flat
+
+    i_start: int | None = None
+    for i in range(0, len(t) - n_sus + 1):
+        if sustained(is_moving, i, n_sus, True):
+            i_start = i
+            break
+    if i_start is None:
+        return None
+
+    t_start = float(t[i_start])
+    # Reference sign of the intended one-way move (e.g. drop direction).
+    n_ref = min(2 * n_sus + 4, max(0, len(t) - i_start))
+    if n_ref < 2:
+        return None
+    ref_sl = v[i_start : i_start + n_ref]
+    med_ref = float(np.median(ref_sl))
+    if abs(med_ref) < v_move * 0.4:
+        for ii in range(i_start, min(i_start + 30, len(t))):
+            if abs(v[ii]) > v_move:
+                med_ref = float(v[ii])
+                break
+    s_ref: float
+    if med_ref > v_flat * 0.5:
+        s_ref = 1.0
+    elif med_ref < -v_flat * 0.5:
+        s_ref = -1.0
+    else:
+        s_ref = 0.0
+
+    def median_opposite_from(i0: int) -> bool:
+        if i0 + n_sus > len(v):
+            return False
+        seg = v[i0 : i0 + n_sus]
+        if float(np.median(np.abs(seg))) < v_move * 0.4:
+            return False
+        med = float(np.median(seg))
+        return med * s_ref < 0.0 and abs(med) > v_move * 0.4
+
+    i_stop: int
+    if s_ref != 0.0:
+        i_rev = None
+        for i in range(i_start + n_sus, len(t) - n_sus + 1):
+            if median_opposite_from(i):
+                i_rev = i
+                break
+        if i_rev is not None and i_rev - 1 >= i_start:
+            i_stop = i_rev - 1
+        else:
+            i_stop = -1
+    else:
+        i_stop = -1
+
+    if i_stop < 0:
+        i_stop = None
+        for i in range(i_start + n_sus, len(t) - n_sus + 1):
+            if sustained(is_flat, i, n_sus, True):
+                i_stop = i
+                break
+        if i_stop is None:
+            i_stop = len(t) - 1
+    t_stop = float(t[i_stop])
+    if t_stop <= t_start:
+        t_stop = float(t[-1])
+    duration_s = t_stop - t_start
+    return {
+        "t_start": t_start,
+        "t_stop": t_stop,
+        "duration_s": duration_s,
+        "i_start": i_start,
+        "i_stop": i_stop,
+    }
+
+
+def mean_currents_in_window(
+    df: pd.DataFrame,
+    time_col: str,
+    t_start: float,
+    t_stop: float,
+) -> tuple[float | None, float | None, int]:
+    """Mean of i_motor and i_in for rows with time in [t_start, t_stop]. Count of rows used."""
+    t = pd.to_numeric(df[time_col], errors="coerce")
+    m = t.notna() & (t >= t_start) & (t <= t_stop)
+    n = int(m.sum())
+    if n == 0:
+        return None, None, 0
+    im, ii = None, None
+    if "i_motor" in df.columns:
+        imo = pd.to_numeric(df["i_motor"], errors="coerce")
+        s = imo[m]
+        if s.notna().any():
+            im = float(s.mean())
+    if "i_in" in df.columns:
+        iin = pd.to_numeric(df["i_in"], errors="coerce")
+        s = iin[m]
+        if s.notna().any():
+            ii = float(s.mean())
+    return im, ii, n
+
+
+def interp_y_at_time(t: np.ndarray, y: np.ndarray, xq: float) -> float:
+    """Linear interpolation of (t,y) at time xq; t need not be sorted."""
+    if not np.isfinite(xq):
+        return float("nan")
+    t = np.asarray(t, float)
+    y = np.asarray(y, float)
+    m = np.isfinite(t) & np.isfinite(y)
+    t, y = t[m], y[m]
+    if t.size < 1:
+        return float("nan")
+    o = np.argsort(t)
+    t, y = t[o], y[o]
+    if t.size == 1:
+        return float(y[0])
+    xq = float(np.clip(xq, t[0], t[-1]))
+    i1 = int(np.searchsorted(t, xq, side="right"))
+    i0 = i1 - 1
+    i0 = int(np.clip(i0, 0, t.size - 1))
+    i1 = int(np.clip(i1, 0, t.size - 1))
+    if i0 == i1:
+        return float(y[i0])
+    t0, t1, y0, y1 = t[i0], t[i1], y[i0], y[i1]
+    if t1 == t0:
+        return float((y0 + y1) / 2.0)
+    return float(y0 + (y1 - y0) * (xq - t0) / (t1 - t0))
+
+
 def load_dataframe(path: Path, sheet: str | None) -> pd.DataFrame:
     suf = path.suffix.lower()
     if suf == ".csv":
@@ -101,6 +289,8 @@ class DataCaptureViewer(tk.Tk):
         # _solo_idx tracks keyboard-driven "solo cycling" through y_cols.
         self._series_visible: dict[str, tk.BooleanVar] = {}
         self._solo_idx: int = 0
+        self._hover_cids: list[int] = []
+        self._hover_track: list[dict] = []
 
         self._build_ui()
         self.bind("<Left>", lambda e: self._prev_file())
@@ -209,6 +399,20 @@ class DataCaptureViewer(tk.Tk):
             highlightthickness=0,
         )
         self._stats_text.pack(fill=tk.X, expand=False)
+
+        self._active_fr = ttk.LabelFrame(
+            top,
+            text="Active region (position: flat → move; end at reverse/bounce or rest)",
+            padding=4,
+        )
+        self._active_fr.pack(fill=tk.X, pady=(4, 0))
+        self._active_lbl = ttk.Label(
+            self._active_fr,
+            text="(no position column or not loaded)",
+            wraplength=900,
+            justify=tk.LEFT,
+        )
+        self._active_lbl.pack(anchor=tk.W)
 
         self._fig = Figure(figsize=(10, 8), dpi=100)
         self._fig.set_layout_engine("constrained")
@@ -419,6 +623,7 @@ class DataCaptureViewer(tk.Tk):
         self._redraw()
 
     def _clear_fig(self) -> None:
+        self._teardown_hover()
         self._fig.clear()
         self._canvas.draw()
 
@@ -581,6 +786,50 @@ class DataCaptureViewer(tk.Tk):
         self._stats_text.insert(tk.END, text)
         self._stats_text.configure(state=tk.DISABLED)
 
+    def _compute_active_region_summary(self) -> dict | None:
+        """Detect flat→move→flat from position; set _active_lbl; return data for plot overlays."""
+        df = self._df
+        if df is None or self._time_col is None:
+            return None
+        pos_col = _pick_position_column(df)
+        if pos_col is None:
+            self._active_lbl.configure(
+                text="No position column (expected position_m, or a column with 'position' in the name).",
+            )
+            return None
+        t = pd.to_numeric(df[self._time_col], errors="coerce").to_numpy()
+        pos = pd.to_numeric(df[pos_col], errors="coerce").to_numpy()
+        vel: np.ndarray | None = None
+        if "velocity_mps" in df.columns:
+            vel = pd.to_numeric(df["velocity_mps"], errors="coerce").to_numpy()
+        ar0 = active_region_from_position(t, pos, vel)
+        if ar0 is None:
+            self._active_lbl.configure(
+                text=f"Position: {pos_col!r} — could not detect flat → motion → flat "
+                "(try clearer rest before/after, or see thresholds in active_region_from_position).",
+            )
+            return None
+        im, ii, n = mean_currents_in_window(df, self._time_col, ar0["t_start"], ar0["t_stop"])
+        out: dict = {
+            **ar0,
+            "pos_col": pos_col,
+            "mean_i_motor": im,
+            "mean_i_in": ii,
+            "n_rows": n,
+        }
+        segs: list[str] = [
+            f"{pos_col}:  t_start={ar0['t_start']:.4f} s,  t_stop={ar0['t_stop']:.4f} s,  "
+            f"Δt={ar0['duration_s']:.4f} s,  n={n} rows  |",
+        ]
+        if im is not None:
+            segs.append(f"  avg i_motor = {im:.4f} A  |")
+        if ii is not None:
+            segs.append(f"  avg i_in = {ii:.4f} A")
+        if im is None and ii is None:
+            segs.append("  (add i_motor, i_in columns or no numeric data in window)")
+        self._active_lbl.configure(text=" ".join(segs))
+        return out
+
     def _effective_xlim(self) -> tuple[float, float]:
         lo, hi = self._t_full
         tmin = self._parse_lim(self._tmin_var.get())
@@ -698,17 +947,81 @@ class DataCaptureViewer(tk.Tk):
         self._sync_file_combo()
         self._load_current_file()
 
+    @staticmethod
+    def _format_hover_value(v: float) -> str:
+        if not np.isfinite(v):
+            return "—"
+        av = abs(v)
+        if av != 0.0 and (av < 1e-3 or av >= 1e5):
+            return f"{v:.4g}"
+        if av >= 100.0:
+            return f"{v:.2f}"
+        if av >= 1.0:
+            return f"{v:.4f}"
+        return f"{v:.5g}"
+
+    def _teardown_hover(self) -> None:
+        for cid in self._hover_cids:
+            try:
+                self._canvas.mpl_disconnect(cid)
+            except Exception:
+                pass
+        self._hover_cids = []
+        self._hover_track = []
+
+    def _on_hover_motion(self, event) -> None:
+        track = self._hover_track
+        if not track:
+            return
+        for h in track:
+            h["vline"].set_visible(False)
+            h["ann"].set_visible(False)
+        if event.inaxes is None or event.xdata is None or not np.isfinite(float(event.xdata)):
+            self._canvas.draw_idle()
+            return
+        h = next((x for x in track if x["ax"] is event.inaxes), None)
+        if h is None:
+            self._canvas.draw_idle()
+            return
+        xq = float(event.xdata)
+        yq = interp_y_at_time(h["t"], h["y"], xq)
+        ax = h["ax"]
+        ylim = ax.get_ylim()
+        h["vline"].set_data([xq, xq], ylim)
+        h["vline"].set_visible(True)
+        tc = self._time_col or "t"
+        h["ann"].set_text(
+            f"{tc} = {self._format_hover_value(xq)}\n{h['col']} = {self._format_hover_value(yq)}"
+        )
+        h["ann"].set_visible(True)
+        self._canvas.draw_idle()
+
+    def _on_hover_leave_figure(self, _event) -> None:
+        for h in self._hover_track or []:
+            h["vline"].set_visible(False)
+            h["ann"].set_visible(False)
+        self._canvas.draw_idle()
+
     def _redraw(self) -> None:
+        self._teardown_hover()
         self._fig.clear()
-        if self._df is None or self._time_col is None or not self._y_cols:
+        if self._df is None or self._time_col is None:
+            self._active_lbl.configure(text="(no data)")
+            ax = self._fig.add_subplot(1, 1, 1)
+            ax.text(0.5, 0.5, "No data loaded", ha="center", va="center")
+            self._canvas.draw()
+            return
+
+        active = self._compute_active_region_summary()
+        df = self._df
+        t = pd.to_numeric(df[self._time_col], errors="coerce")
+        xlim = self._effective_xlim()
+
+        if not self._y_cols:
             ax = self._fig.add_subplot(1, 1, 1)
             ax.text(0.5, 0.5, "No plottable numeric columns", ha="center", va="center")
             self._canvas.draw()
             return
-
-        df = self._df
-        t = pd.to_numeric(df[self._time_col], errors="coerce")
-        xlim = self._effective_xlim()
 
         show = self._visible_cols()
         if not show:
@@ -728,15 +1041,105 @@ class DataCaptureViewer(tk.Tk):
             fontsize=11,
         )
 
+        hover_track: list[dict] = []
         for i, col in enumerate(show):
             ax = axes[i, 0]
             y = pd.to_numeric(df[col], errors="coerce")
             mask = np.isfinite(t) & np.isfinite(y)
             if mask.any():
                 ax.plot(t.values[mask], y.values[mask], linewidth=0.8)
+            t_v = t.values[mask] if bool(mask.any()) else np.array([], dtype=float)
+            y_v = y.values[mask] if bool(mask.any()) else np.array([], dtype=float)
             ax.set_ylabel(col, fontsize=9)
             ax.grid(True, alpha=0.3)
             ax.set_xlim(xlim)
+            if (
+                active is not None
+                and "t_start" in active
+                and "t_stop" in active
+            ):
+                t0, t1 = float(active["t_start"]), float(active["t_stop"])
+                if col == "i_motor" and active.get("mean_i_motor") is not None:
+                    m = float(active["mean_i_motor"])
+                    ax.hlines(
+                        m,
+                        t0,
+                        t1,
+                        colors="darkorange",
+                        linestyles="--",
+                        linewidth=1.4,
+                        zorder=3,
+                    )
+                if col == "i_in" and active.get("mean_i_in") is not None:
+                    m = float(active["mean_i_in"])
+                    ax.hlines(
+                        m,
+                        t0,
+                        t1,
+                        colors="darkviolet",
+                        linestyles="--",
+                        linewidth=1.4,
+                        zorder=3,
+                    )
+            if (
+                active is not None
+                and col == active.get("pos_col")
+                and "t_start" in active
+                and "t_stop" in active
+            ):
+                t0, t1 = float(active["t_start"]), float(active["t_stop"])
+                ax.axvspan(t0, t1, color="C0", alpha=0.12, zorder=0)
+                ax.axvline(t0, color="seagreen", ls="--", lw=1.0, zorder=2)
+                ax.axvline(t1, color="firebrick", ls="--", lw=1.0, zorder=2)
+                dtp = f"{active['duration_s']:.3f} s"
+                lines: list[str] = [f"active Δt = {dtp}"]
+                if active.get("mean_i_motor") is not None:
+                    lines.append(f"avg i_motor = {active['mean_i_motor']:.3f} A")
+                if active.get("mean_i_in") is not None:
+                    lines.append(f"avg i_in = {active['mean_i_in']:.3f} A")
+                ax.text(
+                    0.02,
+                    0.98,
+                    "\n".join(lines),
+                    transform=ax.transAxes,
+                    va="top",
+                    ha="left",
+                    fontsize=8,
+                    bbox=dict(boxstyle="round,pad=0.35", facecolor="wheat", alpha=0.88),
+                    zorder=4,
+                )
+            vline, = ax.plot(
+                [float("nan"), float("nan")],
+                [float("nan"), float("nan")],
+                color="0.2",
+                ls="--",
+                lw=0.95,
+                zorder=50,
+                visible=False,
+            )
+            ann = ax.text(
+                0.98,
+                0.98,
+                "",
+                transform=ax.transAxes,
+                va="top",
+                ha="right",
+                fontsize=7,
+                zorder=51,
+                visible=False,
+                family="monospace",
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="0.45", alpha=0.92),
+            )
+            hover_track.append(
+                {"ax": ax, "t": t_v, "y": y_v, "col": col, "vline": vline, "ann": ann}
+            )
+
+        self._hover_track = hover_track
+        if hover_track:
+            self._hover_cids = [
+                self._canvas.mpl_connect("motion_notify_event", self._on_hover_motion),
+                self._canvas.mpl_connect("figure_leave_event", self._on_hover_leave_figure),
+            ]
 
         axes[-1, 0].set_xlabel(self._time_col)
         self._canvas.draw()

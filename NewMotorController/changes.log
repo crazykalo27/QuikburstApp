@@ -18,3 +18,6 @@
 2026-04-11: NewMotorController pair — removed SET_RPM/eRPM UI and firmware path. SET_BRAKE is now a no-arg command; firmware uses VESC_BRAKE_APPLY_AMPS; STOP clears brake current; GUI brake is button-only with same timed CSV/auto-stop behavior.
 2026-04-11: vesc_serial_control.py — on OK,ENC_RESET clear encoder plot buffers when no CSV capture is armed (keeps in-flight export rows); timed CSV spool rpm no longer chains position-delta across ENC_RESET (count step-down breaks prev).
 2026-04-10: data_capture_viewer.py — Cut overwrites CSV with rows in current X range (plot zoom or min/max); re-zeroes t_rel_s when possible. Delete file removes current CSV from disk and refreshes list.
+2026-04-23: SET_BRAKE,<amps> on wire again — vescUartTest.ino parses optional amps (bare SET_BRAKE = VESC_BRAKE_APPLY_AMPS); vesc_serial_control.py GUI entry + protocol/CSV arm paths; OK,SET_BRAKE* indicator uses startswith.
+2026-04-23: vesc_serial_control.py — TELEM motor current stored for plots/CSV via signed_telem_motor_current (duty then RPM) when the wire value is non-negative magnitude; preserves true negative I from VESC; current subplot gets y=0 reference line.
+2026-04-23: Default TELEM + ENC stream intervals 25 ms (Python + vescUartTest.ino); default CSV grid 50 ms; HELP/comments aligned.

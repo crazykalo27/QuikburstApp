@@ -8,7 +8,7 @@
  * Protocol (newline-terminated; BLE Nordic UART RX writes, TX notifications):
  *   PING                      → PONG,Quikburst
  *   SET_CURRENT,<amps>        → OK,SET_CURRENT,...
- *   SET_BRAKE                 → OK,SET_BRAKE (full brake; no host current arg — see VESC_BRAKE_APPLY_AMPS)
+ *   SET_BRAKE[,<amps>]       → OK,SET_BRAKE[,<amps>] (omit <amps> to use VESC_BRAKE_APPLY_AMPS; VESC clamps)
  *   SET_DUTY,<duty>           → duty clamped to 0…0.20 (20%)
  *   STOP                      → OK,STOP
  *   GET_VALUES                → TELEM,esp32_ms,rpm,duty,vbat,imotor,iin,tmos,tmotor,tach,tachAbs,fault
@@ -16,9 +16,9 @@
  *   GET_FW                    → FW,...
  *   KEEPALIVE                 → OK,KEEPALIVE
  *   ENC_RESET                 → OK,ENC_RESET (zero encoder count / position)
- *   ENC_STREAM,<0|1>[,<ms>]  → OK,ENC_STREAM,<on>,<ms> (enable/disable + optional interval; default 10 ms)
+ *   ENC_STREAM,<0|1>[,<ms>]  → OK,ENC_STREAM,<on>,<ms> (enable/disable + optional interval; default 25 ms)
  *   TELEM_STREAM,<0|1>[,<ms>]→ OK,TELEM_STREAM,<on>,<ms> (firmware-pushed TELEM at <ms> cadence;
- *                               default 30 ms. Replaces polled GET_VALUES — each sample costs one BLE
+ *                               default 25 ms. Replaces polled GET_VALUES — each sample costs one BLE
  *                               notify instead of a request/response round-trip.)
  *   ENC,...                   — streamed when ENC_STREAM on (BLE):
  *                               ENC,time_ms,count,position_m,velocity_mps
@@ -59,7 +59,7 @@
 #define VESC_MAX_DUTY 0.20f
 #endif
 
-// SET_BRAKE applies this brake current over UART; VESC still enforces its own limits. Not sent from host.
+// Default brake current when host sends SET_BRAKE with no comma argument; VESC still enforces its own limits.
 #ifndef VESC_BRAKE_APPLY_AMPS
 #define VESC_BRAKE_APPLY_AMPS 120.0f
 #endif
@@ -83,11 +83,11 @@ static const float   SPOOL_DIA_INCHES   = 4.0f;
 static const float   SPOOL_CIRCUMF_M    = 3.14159265f * SPOOL_DIA_INCHES * 0.0254f;
 static const float   METERS_PER_COUNT   = SPOOL_CIRCUMF_M / (float)COUNTS_PER_REV;
 
-// ENC stream interval is runtime-configurable via ENC_STREAM,<on>,<ms>. Default is 10 ms (100 Hz);
+// ENC stream interval is runtime-configurable via ENC_STREAM,<on>,<ms>. Default is 25 ms (40 Hz);
 // at a 15 ms BLE connection interval (macOS floor) the link has only ~67 notify slots/s total,
-// so if you also want TELEM streaming slow this to ~20 ms (50 Hz) so ENC doesn't crowd out TELEM.
+// so with TELEM on use a similar interval for both (defaults: 25 ms each) so neither stream starves.
 #ifndef ENC_STREAM_DEFAULT_MS
-#define ENC_STREAM_DEFAULT_MS 10
+#define ENC_STREAM_DEFAULT_MS 25
 #endif
 static const uint32_t ENC_STREAM_MIN_MS = 1;
 static const uint32_t ENC_STREAM_MAX_MS = 1000;
@@ -101,7 +101,7 @@ uint32_t         g_encStreamIntervalMs = ENC_STREAM_DEFAULT_MS;
 // Firmware-pushed TELEM. When enabled, loop() calls UART.getVescValues() every g_telemStreamIntervalMs
 // and emits one TELEM line — no host GET_VALUES required. Kills one BLE direction per sample vs polling.
 #ifndef TELEM_STREAM_DEFAULT_MS
-#define TELEM_STREAM_DEFAULT_MS 30
+#define TELEM_STREAM_DEFAULT_MS 25
 #endif
 static const uint32_t TELEM_STREAM_MIN_MS = 5;
 static const uint32_t TELEM_STREAM_MAX_MS = 5000;
@@ -350,11 +350,18 @@ static void processCommand(const String& cmd) {
     return;
   }
 
-  if (cmd == "SET_BRAKE") {
-    UART.setBrakeCurrent(VESC_BRAKE_APPLY_AMPS);
-    g_motorActive = true;
+  if (cmd == "SET_BRAKE" || cmd.startsWith("SET_BRAKE,")) {
+    float amps = VESC_BRAKE_APPLY_AMPS;
+    if (cmd.startsWith("SET_BRAKE,")) {
+      amps = parseFloat(cmd.substring(10));
+    }
+    if (amps < 0.0f) {
+      amps = 0.0f;
+    }
+    UART.setBrakeCurrent(amps);
+    g_motorActive = (amps > 1e-4f);
     updateStatusLeds();
-    sendHostLine("OK,SET_BRAKE");
+    sendHostFmt("OK,SET_BRAKE,%.3f", amps);
     return;
   }
 

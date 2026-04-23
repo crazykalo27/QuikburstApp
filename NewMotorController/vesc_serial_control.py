@@ -90,6 +90,25 @@ def sanitize_vesc_command_line(line: str) -> str:
     return s
 
 
+def signed_telem_motor_current(imo: float, duty: float, rpm: float) -> float:
+    """Best-effort signed motor current for plots/CSV.
+
+    VESC often reports a true signed avg motor current; keep that when already negative.
+    Some UART paths report magnitude only (always ≥ 0); then use duty, else RPM, to match
+    reverse drive (e.g. SET_CURRENT,-1 with negative duty).
+    """
+    if imo < 0.0:
+        return imo
+    a = abs(float(imo))
+    if a < 1e-9:
+        return 0.0
+    if abs(float(duty)) > 1e-5:
+        return math.copysign(a, float(duty))
+    if abs(float(rpm)) >= 1.0:
+        return math.copysign(a, float(rpm))
+    return float(imo)
+
+
 def parse_telem_line(msg: str) -> Optional[Dict[str, Any]]:
     """Parse TELEM from log (optional '<< ' prefix).
 
@@ -264,7 +283,7 @@ async def ble_ping_test(client, link: BleLineLink, log: Callable[[str], None]) -
 
 HELP_TEXT = """
 Commands (BLE):
-  PING, SET_CURRENT,<A>, SET_BRAKE (no args — full brake on firmware), SET_DUTY,<d> (duty capped at 0.20),
+  PING, SET_CURRENT,<A>, SET_BRAKE[,<A>] (omit A for firmware default brake current), SET_DUTY,<d> (duty capped at 0.20),
   STOP, GET_VALUES, GET_FW, KEEPALIVE,
   ENC_RESET, ENC_STREAM,<0|1>[,<ms>], TELEM_STREAM,<0|1>[,<ms>]
 
@@ -275,9 +294,9 @@ VESC UART). GET_VALUES is still supported as a one-shot on-demand read. The "Fir
 checkbox + ms spinbox drives TELEM_STREAM,<on>,<ms>; auto-starts on connect by default.
 
 Encoder: firmware streams ENC,time_ms,count,position_m,velocity_mps at a configurable rate
-(ENC_STREAM,<on>[,<ms>], default 10 ms / 100 Hz). At a 15 ms BLE connection interval the link has
-only ~67 notify slots/s total, so when you turn TELEM stream on consider bumping ENC to 20 ms (50 Hz)
-so the two streams don't fight for slots. ENC_RESET zeros count. When not exporting CSV, OK,ENC_RESET
+(ENC_STREAM,<on>[,<ms>], default 25 ms / 40 Hz). At a 15 ms BLE connection interval the link has
+only ~67 notify slots/s total, so when TELEM + ENC are both on use similar intervals (defaults align).
+ENC_RESET zeros count. When not exporting CSV, OK,ENC_RESET
 clears live encoder plot memory so the next run reads near zero on the graph. CSV position/velocity
 appear only on stream=enc rows (TELEM rows leave those columns blank); enable Firmware ENC stream on connect.
 Timed CSV: device_ms is ESP32 millis() for that row (TELEM esp32_ms or ENC time_ms); t_rel_s is
@@ -304,6 +323,8 @@ def protocol_line_from_user_input(raw: str) -> str:
     if verb == "SET_CURRENT" and len(parts) == 2:
         return f"SET_CURRENT,{parts[1]}"
     if verb == "SET_BRAKE":
+        if len(parts) == 2:
+            return f"SET_BRAKE,{parts[1].strip()}"
         return "SET_BRAKE"
     if verb == "SET_DUTY" and len(parts) == 2:
         d = clamp_duty_str(parts[1])
@@ -424,11 +445,11 @@ class VescControlGui:
         # Default on: resample the capture onto a uniform device_ms grid in the
         # CSV so every row is exactly 'grid ms' apart regardless of BLE/VESC
         # jitter. Grid step is var_csv_grid_ms, independent of TELEM poll; set
-        # it higher than poll ms to downsample (e.g. poll at 30 ms to hit the
-        # BLE floor, write CSV at 100 ms to keep files tidy). Live graphs keep
+        # it higher than poll ms to downsample (e.g. streams at 25 ms, CSV grid
+        # at 50 ms). Live graphs keep
         # using the raw samples since device_ms is accurate there.
         self.var_csv_fixed_grid = tk.BooleanVar(value=True)
-        self.var_csv_grid_ms = tk.IntVar(value=125)
+        self.var_csv_grid_ms = tk.IntVar(value=50)
         self._csv_timed_capture_start: Optional[float] = None
         self._csv_device_ms_start: Optional[int] = None
         self._timed_stop_after_id: Optional[str] = None
@@ -449,10 +470,10 @@ class VescControlGui:
         # Firmware-pushed TELEM interval (ms). Sent to the ESP32 as TELEM_STREAM,1,<ms>. Each sample
         # costs one BLE notify instead of a polled request/response, so we default well under the
         # old ~100 ms RTT floor. Floor is ~15 ms on macOS (BLE connection interval) + ~10 ms VESC UART.
-        self.var_telem_ms = tk.IntVar(value=30)
-        # Firmware ENC stream interval (ms), sent as ENC_STREAM,1,<ms>. Raise it (e.g. 20 ms / 50 Hz)
-        # when TELEM streaming is enabled so the two streams don't fight for BLE notify slots.
-        self.var_enc_ms = tk.IntVar(value=10)
+        self.var_telem_ms = tk.IntVar(value=25)
+        # Firmware ENC stream interval (ms), sent as ENC_STREAM,1,<ms>. Match TELEM cadence (e.g. 25 ms)
+        # when both streams are on so they don't fight for BLE notify slots.
+        self.var_enc_ms = tk.IntVar(value=25)
         self.var_telem_rate_str = tk.StringVar(value="Actual: — Hz")
         self.var_enc_rate_str = tk.StringVar(value="ENC: — Hz")
         self.var_telem_window_s = tk.DoubleVar(value=30.0)
@@ -611,18 +632,13 @@ class VescControlGui:
             self.cmd_widgets.extend([e, b])
 
         self.var_cur = tk.StringVar(value="0")
+        self.var_brake = tk.StringVar(value="120")
         self.var_duty = tk.StringVar(value="0")
 
         self.cmd_widgets.extend([sb_dur, sb_ka])
 
         row_param(3, "Current (A)", self.var_cur, "Set current", "SET_CURRENT")
-        ttk.Label(
-            cmd_fr,
-            text="Brake (no current — duration uses Auto-stop above)",
-        ).grid(row=4, column=0, sticky=tk.W, pady=2)
-        btn_brake = ttk.Button(cmd_fr, text="Set brake", command=self._send_brake)
-        btn_brake.grid(row=4, column=2, sticky=tk.W, pady=2)
-        self.cmd_widgets.append(btn_brake)
+        row_param(4, "Brake current (A)", self.var_brake, "Set brake", "SET_BRAKE")
         row_param(5, f"Duty (0–{MAX_DUTY:.2f} max)", self.var_duty, "Set duty", "SET_DUTY")
 
         quick = ttk.Frame(cmd_fr)
@@ -897,7 +913,7 @@ class VescControlGui:
         if (
             up.startswith("OK,SET_CURRENT")
             or up.startswith("OK,SET_DUTY")
-            or up == "OK,SET_BRAKE"
+            or up.startswith("OK,SET_BRAKE")
             or up == "OK,KEEPALIVE"
             or up.startswith("OK,ENC_")
         ):
@@ -934,6 +950,7 @@ class VescControlGui:
         (self._ln_v,) = ax3.plot([], [], "g-", lw=1)
         (self._ln_im,) = ax4.plot([], [], "r-", lw=1, label="I motor")
         (self._ln_iin,) = ax4.plot([], [], "m-", lw=1, label="I in")
+        ax4.axhline(0.0, color="0.65", lw=0.7, zorder=0)
         ax4.legend(loc="upper right", fontsize=7)
         self._telem_axes = (ax0, ax1, ax2, ax3, ax4)
         self._ln_enc_pos = self._ln_telem_enc_pos
@@ -1005,6 +1022,7 @@ class VescControlGui:
             return
         esp = d.get("esp_ms")
         tw = self._wall_from_esp_millis(int(esp)) if esp is not None else time.time()
+        imo = signed_telem_motor_current(d["i_motor"], d["duty"], d["rpm"])
         self._telem_samples.append(
             (
                 tw,
@@ -1012,7 +1030,7 @@ class VescControlGui:
                 d["rpm"],
                 d["duty"],
                 d["vbat"],
-                d["i_motor"],
+                imo,
                 d["i_in"],
             )
         )
@@ -1118,7 +1136,7 @@ class VescControlGui:
         ENC_PAIR_TOL_MS. If there is no TELEM at all in the window, we fall back to one row per ENC
         sample so the CSV is not empty.
         """
-        ENC_PAIR_TOL_MS = 50  # ENC streams ~10 ms; anything further is probably a gap, leave blank.
+        ENC_PAIR_TOL_MS = 50  # ENC default ~25 ms; anything further is probably a gap, leave blank.
 
         self._flush_pending_log_lines_to_samples()
         t_end = max(t_end, time.time())
@@ -1483,7 +1501,7 @@ class VescControlGui:
         if not self._is_connected():
             return
         on = 1 if self.var_enc_stream.get() else 0
-        ms = self._clamp_stream_ms(self.var_enc_ms, 1, 1000, 10)
+        ms = self._clamp_stream_ms(self.var_enc_ms, 1, 1000, 25)
         self._send_line(f"ENC_STREAM,{on},{ms}")
 
     def _is_connected(self) -> bool:
@@ -1501,7 +1519,7 @@ class VescControlGui:
                 self.var_live_telem.set(False)
                 messagebox.showinfo("TELEM stream", "Connect to the ESP32 first.")
             return
-        ms = self._clamp_stream_ms(self.var_telem_ms, 5, 5000, 30)
+        ms = self._clamp_stream_ms(self.var_telem_ms, 5, 5000, 25)
         flag = 1 if on else 0
         self._send_line(f"TELEM_STREAM,{flag},{ms}")
 
@@ -1692,6 +1710,7 @@ class VescControlGui:
         return (
             u.startswith("SET_CURRENT,")
             or u == "SET_BRAKE"
+            or u.startswith("SET_BRAKE,")
             or u.startswith("SET_DUTY,")
         )
 
@@ -1729,16 +1748,15 @@ class VescControlGui:
             "enable Firmware TELEM stream for VESC rows in the file)"
         )
 
-    def _send_brake(self) -> None:
-        """SET_BRAKE has no host-side magnitude; timed auto-stop still applies."""
-        self._maybe_arm_timed_run()
-        self._send_line("SET_BRAKE")
-
     def _send_motor_param(self, prefix: str, value: str) -> None:
         val = value.strip()
         if prefix == "SET_DUTY":
             val = f"{clamp_duty_str(val):.4f}"
-        line = f"{prefix},{val}"
+            line = f"{prefix},{val}"
+        elif prefix == "SET_BRAKE":
+            line = "SET_BRAKE" if not val else f"SET_BRAKE,{val}"
+        else:
+            line = f"{prefix},{val}"
         self._maybe_arm_timed_run()
         self._send_line(line)
 
