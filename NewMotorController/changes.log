@@ -21,3 +21,9 @@
 2026-04-23: SET_BRAKE,<amps> on wire again — vescUartTest.ino parses optional amps (bare SET_BRAKE = VESC_BRAKE_APPLY_AMPS); vesc_serial_control.py GUI entry + protocol/CSV arm paths; OK,SET_BRAKE* indicator uses startswith.
 2026-04-23: vesc_serial_control.py — TELEM motor current stored for plots/CSV via signed_telem_motor_current (duty then RPM) when the wire value is non-negative magnitude; preserves true negative I from VESC; current subplot gets y=0 reference line.
 2026-04-23: Default TELEM + ENC stream intervals 25 ms (Python + vescUartTest.ino); default CSV grid 50 ms; HELP/comments aligned.
+2026-04-23: vesc_serial_control.py — parse/store TELEM t_mosfet_c + t_motor_c; timed CSV columns t_mosfet_c, t_motor_c; sixth live subplot (MOSFET + motor °C); _telem_sample_unpack for legacy 7-tuples.
+2026-04-23: vesc_serial_control.py — left UI column in a vertical scroll (canvas + scrollbar); PanedWindow left weight=0 / right weight=1 + left minsize ~260; wheel scroll only while pointer over left pane (refcount Enter/Leave).
+2026-04-23: vesc_serial_control.py — connection + commands use grid with stretch column (EW entries), stacked BLE/address/scan rows, 2-col quick buttons, raw line grid; long export option uses tk.Checkbutton wraplength; left_inner column weight so panes can narrow without painting under the graph.
+2026-04-23: vesc_serial_control.py — initial PanedWindow sash at ~40% width (Configure + after idle retry); keeps user-adjustable sash after that.
+2026-04-23: vesc_serial_control.py — signed_telem_input_current for I_in (battery); feed path signs both I_motor and I_in for plot+CSV; amps axis label notes signed.
+2026-04-23: vesc_serial_control.py — regen (I_in < 0): green fill_between to zero + thicker green I_in trace; discharge stays magenta; legend labels discharge vs regen.

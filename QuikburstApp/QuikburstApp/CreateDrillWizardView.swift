@@ -35,9 +35,11 @@ struct CreateDrillWizardView: View {
     }
     
     var body: some View {
-        NavigationStack {
+        ZStack {
+            Theme.backgroundGradient.ignoresSafeArea()
+            NavigationStack {
             VStack(spacing: 0) {
-                // Progress indicator
+                // Progress indicator (same two-step wizard; visuals only refresh)
                 ProgressIndicator(currentStep: currentStep, totalSteps: 2)
                     .padding()
                 
@@ -126,6 +128,7 @@ struct CreateDrillWizardView: View {
                 if let template = editingTemplate {
                     loadTemplate(template)
                 }
+            }
             }
         }
     }
@@ -335,13 +338,24 @@ struct CreateDrillWizardView: View {
 struct ProgressIndicator: View {
     let currentStep: Int
     let totalSteps: Int
-    
+    private let stepLabels = ["Basics", "Configure"]
+
     var body: some View {
-        HStack(spacing: Theme.Spacing.sm) {
+        HStack(spacing: Theme.Spacing.md) {
             ForEach(1...totalSteps, id: \.self) { step in
-                Circle()
-                    .fill(step <= currentStep ? Theme.orange : Color(.systemGray4))
-                    .frame(width: 12, height: 12)
+                VStack(spacing: Theme.Spacing.xs) {
+                    Circle()
+                        .fill(step <= currentStep ? Theme.primaryGradient : LinearGradient(colors: [Color(.systemGray4)], startPoint: .top, endPoint: .bottom))
+                        .frame(width: 14, height: 14)
+                        .overlay(
+                            Circle()
+                                .stroke(Theme.primaryAccent.opacity(step <= currentStep ? 0.7 : 0.15), lineWidth: step <= currentStep ? 2 : 1)
+                        )
+                    Text(stepLabels.indices.contains(step - 1) ? stepLabels[step - 1] : "step \(step)")
+                        .font(Theme.Typography.exo2Caption2.weight(.medium))
+                        .foregroundStyle(step <= currentStep ? Theme.textPrimary.opacity(0.95) : Theme.textTertiary)
+                }
+                .frame(maxWidth: .infinity)
             }
         }
     }

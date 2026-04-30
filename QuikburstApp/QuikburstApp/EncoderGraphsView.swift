@@ -30,15 +30,15 @@ struct LiveEncoderGraphsView: View {
     var body: some View {
         VStack(spacing: 12) {
             Text("Live Data")
-                .font(.headline)
-                .foregroundStyle(.secondary)
+                .font(Theme.Typography.exo2SemiBold(size: 15))
+                .foregroundStyle(Theme.textSecondary.opacity(0.92))
             
             ScrollView {
                 VStack(spacing: 12) {
                 // Position Graph
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Position")
-                        .font(.headline)
+                        .font(Theme.Typography.exo2Subheadline)
                         .foregroundStyle(.green)
                     Chart(chartData, id: \.time) {
                         LineMark(
@@ -60,7 +60,7 @@ struct LiveEncoderGraphsView: View {
                 // Velocity Graph
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Velocity")
-                        .font(.headline)
+                        .font(Theme.Typography.exo2Subheadline)
                         .foregroundStyle(.blue)
                     Chart(chartData, id: \.time) {
                         LineMark(
@@ -82,7 +82,7 @@ struct LiveEncoderGraphsView: View {
                 // RPM Graph
                 VStack(alignment: .leading, spacing: 8) {
                     Text("RPM")
-                        .font(.headline)
+                        .font(Theme.Typography.exo2Subheadline)
                         .foregroundStyle(.purple)
                     Chart(chartData, id: \.time) {
                         LineMark(
@@ -104,7 +104,7 @@ struct LiveEncoderGraphsView: View {
                 // Acceleration Graph
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Acceleration")
-                        .font(.headline)
+                        .font(Theme.Typography.exo2Subheadline)
                         .foregroundStyle(.red)
                     Chart(chartData, id: \.time) {
                         LineMark(

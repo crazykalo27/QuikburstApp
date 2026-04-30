@@ -29,7 +29,10 @@ struct DrillTabView: View {
     }
     
     var body: some View {
-        NavigationStack {
+        ZStack {
+            Theme.backgroundGradient
+                .ignoresSafeArea()
+            NavigationStack {
             VStack(spacing: 0) {
                 // Profile Indicator
                 HStack {
@@ -201,6 +204,7 @@ struct DrillTabView: View {
                     }
                 )
             }
+        }
         }
     }
     

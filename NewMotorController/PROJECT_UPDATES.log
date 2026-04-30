@@ -21,3 +21,9 @@
 2026-04-23: SET_BRAKE accepts optional host amps again — SET_BRAKE,<A> on BLE; bare SET_BRAKE still uses VESC_BRAKE_APPLY_AMPS. Python GUI mirrors SET_CURRENT with a brake current field (default 120 A) + Set brake; CLI `SET_BRAKE 30`; firmware replies OK,SET_BRAKE,<amps>.
 2026-04-23: Live TELEM motor current uses signed_telem_motor_current before deque/CSV so reverse (e.g. -1 A) shows negative when telem is magnitude-only; I_in unchanged; amps subplot has a zero baseline.
 2026-04-23: Default stream cadence TELEM 25 ms + ENC 25 ms (firmware defines + GUI spinboxes); CSV uniform grid default 50 ms.
+2026-04-23: Timed CSV again includes MOSFET and motor temperatures (t_mosfet_c, t_motor_c); live figure adds a shared-x °C panel with both traces.
+2026-04-23: GUI left column is scrollable so widening the graph pane doesn’t clip controls; sash favors the graph (pane weights + min left width).
+2026-04-23: Left panel layout reworked (grid + sticky EW, narrower char widths, wrapped export checkbox) so narrow panes don’t spill under the plots.
+2026-04-23: TELEM I_motor + I_in both passed through signing for live plot and timed CSV; I_in uses duty + signed motor quadrant when the wire value is magnitude-only.
+2026-04-23: Live amps plot highlights regen: semi-transparent green band from 0 to I_in when I_in<0, plus bold green line for that segment; discharge I_in stays magenta.
+2026-04-28 (QuikburstApp iOS): Poster-grade UI scaffolding only—Train tab rework (hero header, branded glass panels, VESC-aligned telemetry dashboard with animated demo waveforms during BLE drill activity, encoder graphs styled); drill library gradient background; wizard gets gradient backdrop + clearer two-step progress labels; drill template sheets show a Charts “phase load ladder” for multi-phase force/torque variation (visualization beside existing Phase cards). Drill authoring flow untouched structurally—same two steps / phase editor.

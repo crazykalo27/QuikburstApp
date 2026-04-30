@@ -59,6 +59,13 @@ struct DrillTemplateDetailView: View {
                             }
                         }
                     }
+
+                    let posterPhases = template.effectivePhases
+                    if !posterPhases.isEmpty {
+                        PosterGlassPanel {
+                            DrillPhasesPosterTimeline(phases: posterPhases)
+                        }
+                    }
                     
                     Divider()
                     
@@ -513,6 +520,13 @@ struct DrillTemplateDetailViewForTrain: View {
                                         .foregroundColor(.secondary)
                                 }
                             }
+                        }
+                    }
+
+                    let effectivePhasesForTrain = template.effectivePhases
+                    if !effectivePhasesForTrain.isEmpty {
+                        PosterGlassPanel {
+                            DrillPhasesPosterTimeline(phases: effectivePhasesForTrain)
                         }
                     }
                     
