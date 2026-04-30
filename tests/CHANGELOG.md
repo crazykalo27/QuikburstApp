@@ -1,6 +1,37 @@
 # Motor + Encoder + Current Test — Change Log
 
+## 2026-04-02
+
+**VESC GUI connect retry**
+- `vesc_serial_control.py`: USB connect wrapped in **try/except** (closes port, queues `disconnected`, shows error) so timeouts/exceptions no longer leave **Connect** disabled with status stuck on “Connecting”. **Disconnected** handler now forces status to **Disconnected**. Serial connect thread outer **try/except** catches unexpected crashes. BLE `BleakClient` uses explicit **20s** connect timeout.
+
+**VESC live TELEM graph**
+- `vesc_serial_control.py`: default keepalive **0.5s**; live **TELEM** graph (matplotlib) with configurable poll interval (ms) and X-axis time window (s). Layout: **left** = connection + commands + log; **right** = TELEM controls + graph full column height (outer horizontal `PanedWindow`). Telemetry is **request/response** (`GET_VALUES`); live mode polls repeatedly. `requirements.txt`: added `matplotlib`.
+
+**VESC GUI timing + duty cap**
+- `vesc_serial_control.py`: auto-stop after N s (0 = until STOP), optional KEEPALIVE interval for VESC UART/APP timeout; applies to motor buttons + matching raw lines. `SET_DUTY` capped at **20%** (matches firmware).
+- `vescUartTest.ino`: `SET_DUTY` clamped to **20%** (`VESC_MAX_DUTY`).
+
+**VESC BLE + Python**
+- `vesc_serial_control.py`: default UI is **tkinter** (USB + BLE, log, all commands, Help). Terminal mode: `--cli`.
+- `vescUartTest.ino`: BLE RX callback uses `String` from `getValue()` for ESP32 Arduino 3.x (not `std::string`).
+- `vescUartTest.ino`: BLE peripheral advertising as **Quikburst**, Nordic UART Service (same text commands as USB). USB `Serial` still works. Added `PING` → `PONG,Quikburst` for link checks.
+- `vesc_serial_control.py`: `--ble` mode scans by name, connects with **bleak**, runs PING/PONG test, then same interactive commands. USB mode also runs PING test by default (`--no-ping-test` to skip). Added `NewMotorController/requirements.txt` (`pyserial`, `bleak`).
+
+**VESC sketch UART pins**
+- `vescUartTest.ino` now uses `Serial2` with configurable `VESC_UART_RX_PIN` / `VESC_UART_TX_PIN` (default GPIO16/GPIO17 for typical RX2/TX2 silkscreen), instead of `D12`/`D11`, which many ESP32 boards do not expose.
+
+## 2026-04-01
+
+**New: VESC UART test pair (NewMotorController/)**
+- Rewrote `vescUartTest.ino` from LCD-only telemetry display into a full serial command bridge. ESP32 accepts text commands over USB (`Serial`) and forwards them to a Flipsky VESC over `Serial1` using the SolidGeek/VescUart library.
+- Supported commands: `SET_CURRENT`, `SET_BRAKE`, `SET_DUTY`, `SET_RPM`, `STOP`, `GET_VALUES`, `GET_FW`, `KEEPALIVE`. Protocol follows the same newline-terminated text style as the motor_encoder_current test pair.
+- Created `vesc_serial_control.py` as the Python companion — interactive CLI with auto port detection, background reader thread, and Ctrl-C safety stop.
+
 ## 2026-03-19
+
+**Signed command plot**
+- Python command subplot now applies `dir_sign` so `cmd_duty_pct` and `cmd_pwm` are shown as signed motor commands. This makes controller reversals and braking effort visible around 0 instead of looking like a constant positive magnitude.
 
 **Signed current setpoint**
 - `CURRENT,...` accepts negative `current_A`; the same P-loop drives toward the signed setpoint (error = setpoint − measured). Python validation and prompts updated; current plot shows a blue setpoint line in current-control mode.
