@@ -210,6 +210,66 @@ def parse_enc_line(msg: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def parse_pictrl_line(msg: str) -> Optional[Dict[str, Any]]:
+    """Parse PICTRL from firmware (PI loop telemetry, optional '<< ' prefix).
+
+    PICTRL,esp32_ms,i_target_a,i_meas_a,i_cmd_a,omega_rps,actual_hz,target_lb
+    """
+    s = msg.strip()
+    if s.startswith("<< "):
+        s = s[3:].strip()
+    if not s.upper().startswith("PICTRL,"):
+        return None
+    parts = s.split(",")
+    if len(parts) < 8:
+        return None
+    try:
+        return {
+            "esp_ms": int(parts[1]),
+            "i_target_a": float(parts[2]),
+            "i_meas_a": float(parts[3]),
+            "i_cmd_a": float(parts[4]),
+            "omega_rps": float(parts[5]),
+            "actual_hz": float(parts[6]),
+            "target_lb": float(parts[7]),
+        }
+    except (ValueError, IndexError):
+        return None
+
+
+def parse_picfg_line(msg: str) -> Optional[Dict[str, Any]]:
+    """Parse PICFG snapshot reply from PI_CONFIG.
+
+    PICFG,Kt,Ke,R,L,Kp,Ki,I_max,amps_per_lb,pole_pairs,target_hz,enabled,target_lb,target_a
+    """
+    s = msg.strip()
+    if s.startswith("<< "):
+        s = s[3:].strip()
+    if not s.upper().startswith("PICFG,"):
+        return None
+    parts = s.split(",")
+    if len(parts) < 14:
+        return None
+    try:
+        return {
+            "Kt": float(parts[1]),
+            "Ke": float(parts[2]),
+            "R": float(parts[3]),
+            "L": float(parts[4]),
+            "Kp": float(parts[5]),
+            "Ki": float(parts[6]),
+            "I_max": float(parts[7]),
+            "amps_per_lb": float(parts[8]),
+            "pole_pairs": int(float(parts[9])),
+            "target_hz": int(float(parts[10])),
+            "enabled": int(float(parts[11])) != 0,
+            "target_lb": float(parts[12]),
+            "target_a": float(parts[13]),
+        }
+    except (ValueError, IndexError):
+        return None
+
+
 def _telem_sample_unpack(row: Tuple[Any, ...]) -> Tuple[Any, ...]:
     """Unpack live TELEM deque row: (t_wall, esp_ms, rpm, duty, vbat, i_motor, i_in, t_mosfet_c, t_motor_c).
 
@@ -236,6 +296,13 @@ def is_enc_log_payload(payload: str) -> bool:
     if s.startswith("<< "):
         s = s[3:].strip()
     return s.upper().startswith("ENC,")
+
+
+def is_pictrl_log_payload(payload: str) -> bool:
+    s = payload.strip()
+    if s.startswith("<< "):
+        s = s[3:].strip()
+    return s.upper().startswith("PICTRL,")
 
 
 # --------------------------------------------------------------------------
@@ -339,7 +406,19 @@ HELP_TEXT = """
 Commands (BLE):
   PING, SET_CURRENT,<A>, SET_BRAKE[,<A>] (omit A for firmware default brake current), SET_DUTY,<d> (duty capped at 0.20),
   STOP, GET_VALUES, GET_FW, KEEPALIVE,
-  ENC_RESET, ENC_STREAM,<0|1>[,<ms>], TELEM_STREAM,<0|1>[,<ms>]
+  ENC_RESET, ENC_STREAM,<0|1>[,<ms>], TELEM_STREAM,<0|1>[,<ms>],
+  PI_ENABLE,<0|1>, PI_FORCE,<lbs>, PI_TARGET,<A>, PI_HZ,<hz>,
+  PI_GAINS,<Kp>,<Ki>, PI_PARAMS,<Kt>,<Ke>,<R>,<L>,
+  PI_LIMITS,<I_max>,<amps_per_lb>,<pole_pairs>, PI_CONFIG
+
+Force Control (PI current loop, runs ON the ESP32):
+The button accepts a FORCE in lbs, NOT a current. A single equation converts force to a current
+target — i_target = amps_per_lb × force (default 2.658 A/lb so 1 lb → 2.658 A) — and the firmware
+runs the PI loop from PI_Dev/PI_ex1.ino at the target Hz, sending setCurrent(i_cmd) each cycle.
+The firmware streams PICTRL,esp32_ms,i_target_a,i_meas_a,i_cmd_a,omega_rps,actual_hz,target_lb
+so the GUI plots commanded vs measured current and reports the loop's true running rate.
+Practical Hz ceiling is the VESC UART read (~10 ms / 115200 baud); pick 50 Hz for headroom.
+PI auto-disables on STOP and on BLE disconnect (motor zeroed).
 
 Telemetry: TELEM is now FIRMWARE-STREAMED. TELEM_STREAM,1,<ms> tells the ESP32 to emit one TELEM line
 every <ms> ms without being asked — each sample costs one BLE notify instead of a polled request/response
@@ -552,6 +631,35 @@ class VescControlGui:
         self._plots_redraw_after_id: Optional[str] = None
         self.var_enc_stream = tk.BooleanVar(value=True)
         self._iin_regen_fill: Any = None
+
+        # ------------------- Force Control / PI current loop -------------------
+        # The PI loop runs on the ESP32 (see vescCurrentIno.ino: pollPiLoop). The
+        # host only sets the target FORCE (lbs); firmware converts to a target
+        # current via i_target = amps_per_lb * force_lbs. Defaults mirror the
+        # firmware so the displayed equation matches what the hardware uses
+        # before the user has clicked PI_CONFIG.
+        self.var_pi_enabled = tk.BooleanVar(value=False)
+        self.var_force_lbs = tk.DoubleVar(value=0.0)
+        self.var_pi_hz = tk.IntVar(value=50)
+        self.var_pi_kt = tk.DoubleVar(value=0.085)
+        self.var_pi_ke = tk.DoubleVar(value=0.0859)
+        self.var_pi_r = tk.DoubleVar(value=0.4)
+        self.var_pi_l = tk.DoubleVar(value=0.0003)
+        self.var_pi_kp = tk.DoubleVar(value=0.5)
+        self.var_pi_ki = tk.DoubleVar(value=3.0)
+        self.var_pi_imax = tk.DoubleVar(value=8.0)
+        self.var_pi_amps_per_lb = tk.DoubleVar(value=2.6585)
+        self.var_pi_pole_pairs = tk.IntVar(value=7)
+        self.var_pi_actual_hz_str = tk.StringVar(value="Actual: — Hz")
+        self.var_pi_eq_str = tk.StringVar(value="i_target = 2.658 A/lb × 0.0 lb = 0.000 A")
+        # PICTRL samples: (t_wall, esp_ms, i_target_a, i_meas_a, i_cmd_a, omega_rps, actual_hz, target_lb)
+        self._pictrl_samples: deque = deque(maxlen=25000)
+        self._pi_force_apply_after_id: Optional[str] = None
+        self._pi_hz_apply_after_id: Optional[str] = None
+        # When True, suppress GET_VALUES / TELEM stream while PI is engaged.
+        # PI cycles already pump the VESC UART; firmware reuses the cached snapshot.
+        self.var_pi_pause_telem = tk.BooleanVar(value=False)
+        self.var_plots_paused = tk.BooleanVar(value=False)
         self._left_canvas: Optional[tk.Canvas] = None
         self._left_canvas_window: Optional[int] = None
         self._left_scroll_hover = 0
@@ -748,18 +856,19 @@ class VescControlGui:
             row=5, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0)
         )
 
-        cmd_fr = ttk.LabelFrame(left_inner, text="Commands (same protocol as firmware)", padding=8)
-        cmd_fr.pack(fill=tk.X, pady=(0, 8))
-        cmd_fr.columnconfigure(1, weight=1)
-
         self.cmd_widgets: List[tk.Widget] = []
 
+        # ── Run / CSV controls (shared by Direct AND Force modes) ──
+        # Auto-stop, keepalive, and CSV export now live at the top level so the
+        # same timing/recording machinery is used whether the user is sending
+        # SET_CURRENT or running the PI force loop. STOP from any path closes
+        # the CSV the same way.
         time_fr = ttk.LabelFrame(
-            cmd_fr,
-            text="Timed motor output (Set current / brake / duty, Test, matching raw motor lines)",
+            left_inner,
+            text="Run timing + CSV (applies to all modes)",
             padding=6,
         )
-        time_fr.grid(row=0, column=0, columnspan=3, sticky=tk.EW, pady=(0, 8))
+        time_fr.pack(fill=tk.X, pady=(0, 8))
         time_fr.columnconfigure(1, weight=1)
         ttk.Label(time_fr, text="Auto-stop after (s), 0 = until STOP:").grid(row=0, column=0, sticky=tk.NW)
         sb_dur = ttk.Spinbox(time_fr, from_=0, to=600, increment=1, textvariable=self.var_run_duration_s, width=8)
@@ -777,13 +886,19 @@ class VescControlGui:
         ).grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
         tk.Checkbutton(
             time_fr,
-            text="Export TELEM + encoder to CSV (motor commands + Test; N>0 s → auto STOP+CSV; N=0 → CSV on STOP)",
+            text="Export TELEM + ENC + PI to CSV (motor commands + Test + Force-engage; N>0 s → auto STOP+CSV; N=0 → CSV on STOP)",
             variable=self.var_export_csv_timed,
-            wraplength=260,
+            wraplength=300,
             justify=tk.LEFT,
             anchor=tk.W,
             highlightthickness=0,
         ).grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
+        self.cmd_widgets.extend([sb_dur, sb_ka])
+
+        # ── Direct command panel (raw VESC current/brake/duty) ──
+        cmd_fr = ttk.LabelFrame(left_inner, text="Direct command (raw VESC: A / brake A / duty)", padding=8)
+        cmd_fr.pack(fill=tk.X, pady=(0, 8))
+        cmd_fr.columnconfigure(1, weight=1)
 
         def row_param(r: int, label: str, var: tk.StringVar, btn_text: str, proto_prefix: str) -> None:
             ttk.Label(cmd_fr, text=label).grid(row=r, column=0, sticky=tk.NW, pady=2)
@@ -801,14 +916,12 @@ class VescControlGui:
         self.var_brake = tk.StringVar(value="120")
         self.var_duty = tk.StringVar(value="0")
 
-        self.cmd_widgets.extend([sb_dur, sb_ka])
-
-        row_param(3, "Current (A)", self.var_cur, "Set current", "SET_CURRENT")
-        row_param(4, "Brake current (A)", self.var_brake, "Set brake", "SET_BRAKE")
-        row_param(5, f"Duty (0–{MAX_DUTY:.2f} max)", self.var_duty, "Set duty", "SET_DUTY")
+        row_param(0, "Current (A)", self.var_cur, "Set current", "SET_CURRENT")
+        row_param(1, "Brake current (A)", self.var_brake, "Set brake", "SET_BRAKE")
+        row_param(2, f"Duty (0–{MAX_DUTY:.2f} max)", self.var_duty, "Set duty", "SET_DUTY")
 
         quick = ttk.Frame(cmd_fr)
-        quick.grid(row=6, column=0, columnspan=3, sticky=tk.EW, pady=(10, 0))
+        quick.grid(row=3, column=0, columnspan=3, sticky=tk.EW, pady=(10, 0))
         quick.columnconfigure(0, weight=1)
         quick.columnconfigure(1, weight=1)
         b_stop = ttk.Button(quick, text="STOP", command=lambda: self._send_wire("STOP"))
@@ -841,7 +954,7 @@ class VescControlGui:
         )
 
         raw_fr = ttk.Frame(cmd_fr)
-        raw_fr.grid(row=7, column=0, columnspan=3, sticky=tk.EW, pady=(10, 0))
+        raw_fr.grid(row=4, column=0, columnspan=3, sticky=tk.EW, pady=(10, 0))
         raw_fr.columnconfigure(1, weight=1)
         ttk.Label(raw_fr, text="Raw line:").grid(row=0, column=0, sticky=tk.W)
         self.raw_entry = ttk.Entry(raw_fr, width=8)
@@ -849,6 +962,9 @@ class VescControlGui:
         self.btn_send_raw = ttk.Button(raw_fr, text="Send", command=self._send_raw)
         self.btn_send_raw.grid(row=0, column=2, sticky=tk.E)
         self.cmd_widgets.extend([self.raw_entry, self.btn_send_raw])
+
+        # ── Force control (PI current loop on the ESP32) ──
+        self._build_force_control_panel(left_inner)
 
         self._build_indicator_strip(left_inner)
 
@@ -909,6 +1025,8 @@ class VescControlGui:
         self.cmd_widgets.append(sb_enc_ms)
         ttk.Label(enc_row, textvariable=self.var_enc_rate_str, foreground="#093", width=22).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(enc_row, text="ENC zero", command=lambda: self._send_line("ENC_RESET")).pack(side=tk.LEFT, padx=(4, 0))
+        self.btn_plot_pause = ttk.Button(enc_row, text="Pause plot", command=self._toggle_plot_pause)
+        self.btn_plot_pause.pack(side=tk.LEFT, padx=(4, 0))
         ttk.Separator(enc_row, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=12)
         ttk.Label(enc_row, text="Graph window (s):").pack(side=tk.LEFT)
         sb_telem_win = ttk.Spinbox(enc_row, from_=5, to=600, increment=5, textvariable=self.var_telem_window_s, width=6)
@@ -1071,6 +1189,8 @@ class VescControlGui:
             return False
         if s.startswith("TELEM,") or s.startswith("ENC,"):
             return True
+        if s.startswith("PICTRL,") or s.startswith("PICFG,"):
+            return True
         if s.startswith("OK,") or s == "OK":
             return True
         if s == "[READY]":
@@ -1101,14 +1221,233 @@ class VescControlGui:
             or up.startswith("OK,SET_BRAKE")
             or up == "OK,KEEPALIVE"
             or up.startswith("OK,ENC_")
+            or up.startswith("OK,PI_")
         ):
             self._pulse_indicator("motor", 350)
             return
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Force Control panel (PI current loop on the ESP32)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _build_force_control_panel(self, parent: ttk.Frame) -> None:
+        """Build the Force Control panel: target FORCE in lbs, the firmware turns
+        it into a current target via i_target = amps_per_lb * lbs and runs the
+        PI loop from PI_Dev/PI_ex1.ino at the chosen Hz."""
+        fr = ttk.LabelFrame(parent, text="Force Control (PI current loop on ESP32)", padding=8)
+        fr.pack(fill=tk.X, pady=(0, 8))
+        fr.columnconfigure(1, weight=1)
+
+        # --- Force input + Engage / Stop ---
+        ttk.Label(fr, text="Force (lbs):").grid(row=0, column=0, sticky=tk.NW, pady=2)
+        force_entry = ttk.Entry(fr, textvariable=self.var_force_lbs, width=8)
+        force_entry.grid(row=0, column=1, sticky=tk.EW, padx=(6, 6), pady=2)
+        self.var_force_lbs.trace_add("write", self._on_force_lbs_changed)
+        self.cmd_widgets.append(force_entry)
+
+        btn_engage = ttk.Button(fr, text="Engage Force", command=self._on_pi_engage)
+        btn_engage.grid(row=0, column=2, sticky=tk.W, pady=2)
+        self.cmd_widgets.append(btn_engage)
+        self.btn_pi_engage = btn_engage
+
+        btn_pi_stop = ttk.Button(fr, text="Stop Force", command=self._on_pi_stop)
+        btn_pi_stop.grid(row=1, column=2, sticky=tk.W, pady=2)
+        self.cmd_widgets.append(btn_pi_stop)
+
+        # Live equation readout — single source of truth shown to the user.
+        eq_lbl = ttk.Label(
+            fr,
+            textvariable=self.var_pi_eq_str,
+            foreground="#06c",
+            font=("TkDefaultFont", 9, "bold"),
+            wraplength=280,
+            justify=tk.LEFT,
+        )
+        eq_lbl.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 4))
+
+        # --- Loop frequency + actual rate readout ---
+        hz_row = ttk.Frame(fr)
+        hz_row.grid(row=2, column=0, columnspan=3, sticky=tk.EW, pady=(8, 4))
+        hz_row.columnconfigure(3, weight=1)
+        ttk.Label(hz_row, text="Loop target (Hz):").grid(row=0, column=0, sticky=tk.W)
+        sb_hz = ttk.Spinbox(hz_row, from_=1, to=500, increment=1,
+                            textvariable=self.var_pi_hz, width=6)
+        sb_hz.grid(row=0, column=1, sticky=tk.W, padx=(4, 8))
+        self.cmd_widgets.append(sb_hz)
+        self.var_pi_hz.trace_add("write", self._on_pi_hz_changed)
+        ttk.Label(
+            hz_row,
+            textvariable=self.var_pi_actual_hz_str,
+            foreground="#093",
+            font=("TkDefaultFont", 9, "bold"),
+            width=22,
+        ).grid(row=0, column=2, sticky=tk.W)
+
+        # --- Constants editor (Kt/Ke/R/L/Kp/Ki/I_max/A-per-lb/pole pairs) ---
+        const_fr = ttk.LabelFrame(fr, text="Loop constants (sent to ESP32 with Apply)", padding=4)
+        const_fr.grid(row=3, column=0, columnspan=3, sticky=tk.EW, pady=(8, 0))
+        const_fr.columnconfigure(1, weight=1)
+        const_fr.columnconfigure(3, weight=1)
+
+        def cfield(r: int, c: int, label: str, var: tk.Variable, width: int = 7) -> None:
+            ttk.Label(const_fr, text=label).grid(row=r, column=c, sticky=tk.W, padx=(0, 4), pady=1)
+            e = ttk.Entry(const_fr, textvariable=var, width=width)
+            e.grid(row=r, column=c + 1, sticky=tk.EW, padx=(0, 8), pady=1)
+            self.cmd_widgets.append(e)
+
+        cfield(0, 0, "Kt (N·m/A)", self.var_pi_kt)
+        cfield(0, 2, "Ke (V·s/rad)", self.var_pi_ke)
+        cfield(1, 0, "R (Ω)", self.var_pi_r)
+        cfield(1, 2, "L (H)", self.var_pi_l)
+        cfield(2, 0, "Kp", self.var_pi_kp)
+        cfield(2, 2, "Ki", self.var_pi_ki)
+        cfield(3, 0, "I_max (A)", self.var_pi_imax)
+        cfield(3, 2, "A per lb", self.var_pi_amps_per_lb)
+        cfield(4, 0, "Pole pairs", self.var_pi_pole_pairs, width=4)
+
+        btn_apply = ttk.Button(const_fr, text="Apply constants",
+                               command=self._apply_pi_constants)
+        btn_apply.grid(row=4, column=2, columnspan=2, sticky=tk.E, padx=(0, 0), pady=(4, 0))
+        self.cmd_widgets.append(btn_apply)
+
+        # Re-run the equation label whenever amps_per_lb changes too — the user is
+        # editing the rule the firmware will use, so the preview should track it.
+        # (Don't send PI_FORCE here: amps_per_lb is uploaded via PI_LIMITS / Apply.)
+        self.var_pi_amps_per_lb.trace_add(
+            "write", lambda *_a: self._update_pi_equation_label()
+        )
+
+        # Initial population so the label isn't blank before the user touches anything.
+        self._update_pi_equation_label()
+
+    # --- PI helpers --------------------------------------------------------
+
+    def _update_pi_equation_label(self) -> None:
+        try:
+            apl = float(self.var_pi_amps_per_lb.get())
+        except (tk.TclError, ValueError):
+            apl = 2.6585
+        try:
+            lbs = float(self.var_force_lbs.get())
+        except (tk.TclError, ValueError):
+            lbs = 0.0
+        amps = apl * lbs
+        self.var_pi_eq_str.set(
+            f"i_target = {apl:.3f} A/lb × {lbs:.2f} lb = {amps:.3f} A"
+        )
+
+    def _on_force_lbs_changed(self, *_args: Any) -> None:
+        self._update_pi_equation_label()
+        # If PI is already engaged, push the new force live (debounced so typing
+        # doesn't flood BLE with PI_FORCE,<x> per keystroke).
+        if not (self._is_connected() and self.var_pi_enabled.get()):
+            return
+        if self._pi_force_apply_after_id is not None:
+            try:
+                self.root.after_cancel(self._pi_force_apply_after_id)
+            except Exception:
+                pass
+        self._pi_force_apply_after_id = self.root.after(200, self._apply_pi_force_after_debounce)
+
+    def _apply_pi_force_after_debounce(self) -> None:
+        self._pi_force_apply_after_id = None
+        if not (self._is_connected() and self.var_pi_enabled.get()):
+            return
+        try:
+            lbs = float(self.var_force_lbs.get())
+        except (tk.TclError, ValueError):
+            lbs = 0.0
+        self._send_line(f"PI_FORCE,{lbs:.4f}")
+
+    def _on_pi_hz_changed(self, *_args: Any) -> None:
+        if self._pi_hz_apply_after_id is not None:
+            try:
+                self.root.after_cancel(self._pi_hz_apply_after_id)
+            except Exception:
+                pass
+        self._pi_hz_apply_after_id = self.root.after(250, self._apply_pi_hz_after_debounce)
+
+    def _apply_pi_hz_after_debounce(self) -> None:
+        self._pi_hz_apply_after_id = None
+        if not self._is_connected():
+            return
+        try:
+            hz = max(1, min(500, int(self.var_pi_hz.get())))
+        except (tk.TclError, ValueError):
+            hz = 50
+        self._send_line(f"PI_HZ,{hz}")
+
+    def _apply_pi_constants(self) -> None:
+        if not self._is_connected():
+            messagebox.showinfo("Not connected", "Connect over Bluetooth first.")
+            return
+
+        def f(var: tk.Variable, default: float) -> float:
+            try:
+                return float(var.get())
+            except (tk.TclError, ValueError):
+                return default
+
+        kt = f(self.var_pi_kt, 0.085)
+        ke = f(self.var_pi_ke, 0.0859)
+        r = f(self.var_pi_r, 0.4)
+        l = f(self.var_pi_l, 0.0003)
+        kp = f(self.var_pi_kp, 0.5)
+        ki = f(self.var_pi_ki, 3.0)
+        imax = f(self.var_pi_imax, 8.0)
+        apl = f(self.var_pi_amps_per_lb, 2.6585)
+        try:
+            pp = max(1, int(self.var_pi_pole_pairs.get()))
+        except (tk.TclError, ValueError):
+            pp = 7
+        self._send_line(f"PI_PARAMS,{kt:.6f},{ke:.6f},{r:.6f},{l:.8f}")
+        self._send_line(f"PI_GAINS,{kp:.6f},{ki:.6f}")
+        self._send_line(f"PI_LIMITS,{imax:.4f},{apl:.6f},{pp}")
+        self._update_pi_equation_label()
+        self._log("(PI: applied gains/params/limits)")
+
+    def _on_pi_engage(self) -> None:
+        """Enable the PI current loop on the ESP32 and arm the timed-run/CSV machinery."""
+        if not self._is_connected():
+            messagebox.showwarning("Not connected", "Connect over Bluetooth first.")
+            return
+        # Push the latest constants + Hz before enabling so the loop starts on the
+        # config the user can see in the UI, not whatever the ESP32 had last.
+        self._apply_pi_constants()
+        try:
+            hz = max(1, min(500, int(self.var_pi_hz.get())))
+        except (tk.TclError, ValueError):
+            hz = 50
+        self._send_line(f"PI_HZ,{hz}")
+        try:
+            lbs = float(self.var_force_lbs.get())
+        except (tk.TclError, ValueError):
+            lbs = 0.0
+        self._send_line(f"PI_FORCE,{lbs:.4f}")
+        self._maybe_arm_timed_run()
+        self._send_line("PI_ENABLE,1")
+        self.var_pi_enabled.set(True)
+        self._log(
+            f"(Force engaged: target={lbs:.2f} lb → {self.var_pi_amps_per_lb.get():.3f} A/lb "
+            f"× lbs at {hz} Hz; PICTRL stream incoming.)"
+        )
+
+    def _on_pi_stop(self) -> None:
+        if self._is_connected():
+            self._send_line("PI_ENABLE,0")
+            self._send_line("STOP")
+        self.var_pi_enabled.set(False)
+        # Timed-run cancellation + CSV finalization piggybacks on _send_wire("STOP")
+        # paths, but Stop Force is a normal-button call and bypasses that. Mirror
+        # the manual-STOP behavior here so the run shows up as a recorded capture.
+        self._export_timed_run_csv(time.time(), "force_stop")
+        self._cancel_timed_run()
 
     def _build_telem_matplotlib(self, parent: ttk.Frame) -> None:
         try:
             from matplotlib.figure import Figure
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            from matplotlib.gridspec import GridSpec
         except ImportError:
             ttk.Label(
                 parent,
@@ -1118,26 +1457,23 @@ class VescControlGui:
             return
 
         self._fig = Figure(figsize=(5.5, 10.0), constrained_layout=True)
-        ax0 = self._fig.add_subplot(6, 1, 1)
-        ax1 = self._fig.add_subplot(6, 1, 2, sharex=ax0)
-        ax2 = self._fig.add_subplot(6, 1, 3, sharex=ax0)
-        ax3 = self._fig.add_subplot(6, 1, 4, sharex=ax0)
-        ax4 = self._fig.add_subplot(6, 1, 5, sharex=ax0)
-        ax5 = self._fig.add_subplot(6, 1, 6, sharex=ax0)
+        # Create GridSpec with height_ratios: Position, Velocity, Vbat (1x each), Current (3x)
+        gs = GridSpec(4, 1, figure=self._fig, height_ratios=[1, 1, 1, 3])
+        ax0 = self._fig.add_subplot(gs[0])
+        ax1 = self._fig.add_subplot(gs[1], sharex=ax0)
+        ax2 = self._fig.add_subplot(gs[2], sharex=ax0)
+        ax3 = self._fig.add_subplot(gs[3], sharex=ax0)
         ax0.set_ylabel("Pos (m)")
         ax1.set_ylabel("Vel (m/s)")
-        ax2.set_ylabel("RPM")
-        ax3.set_ylabel("Vbat")
-        ax4.set_ylabel("A (signed)")
-        ax5.set_ylabel("°C")
-        ax5.set_xlabel("Time in window (s)")
+        ax2.set_ylabel("Vbat")
+        ax3.set_ylabel("A (signed)")
+        ax3.set_xlabel("Time in window (s)")
         (self._ln_telem_enc_pos,) = ax0.plot([], [], color="tab:green", lw=1.2)
         (self._ln_enc_vel,) = ax1.plot([], [], color="tab:purple", lw=1)
-        (self._ln_rpm,) = ax2.plot([], [], color="tab:blue", lw=1)
-        (self._ln_v,) = ax3.plot([], [], "g-", lw=1)
-        (self._ln_im,) = ax4.plot([], [], "r-", lw=1, label="I motor", zorder=3)
-        (self._ln_iin,) = ax4.plot([], [], "m-", lw=1, label="I in (discharge)", zorder=3)
-        (self._ln_iin_regen,) = ax4.plot(
+        (self._ln_v,) = ax2.plot([], [], "g-", lw=1)
+        (self._ln_im,) = ax3.plot([], [], "r-", lw=1, label="I motor", zorder=3)
+        (self._ln_iin,) = ax3.plot([], [], "m-", lw=1, label="I in (discharge)", zorder=3)
+        (self._ln_iin_regen,) = ax3.plot(
             [],
             [],
             color="#00c853",
@@ -1146,12 +1482,19 @@ class VescControlGui:
             zorder=4,
             solid_capstyle="round",
         )
-        ax4.axhline(0.0, color="0.65", lw=0.7, zorder=2)
-        ax4.legend(loc="upper right", fontsize=7)
-        (self._ln_t_mosfet,) = ax5.plot([], [], color="tab:orange", lw=1, label="MOSFET")
-        (self._ln_t_motor,) = ax5.plot([], [], color="tab:cyan", lw=1, label="Motor")
-        ax5.legend(loc="upper right", fontsize=7)
-        self._telem_axes = (ax0, ax1, ax2, ax3, ax4, ax5)
+        # PI controller traces (Force mode). Dashed so they read as references
+        # next to the measured I_motor; share the same axis since they're amps.
+        (self._ln_i_target,) = ax3.plot(
+            [], [], color="#1f77b4", lw=1.2, linestyle="--",
+            label="I target (PI)", zorder=5,
+        )
+        (self._ln_i_cmd,) = ax3.plot(
+            [], [], color="#ff7f0e", lw=1.0, linestyle=":",
+            label="I cmd (PI)", zorder=5,
+        )
+        ax3.axhline(0.0, color="0.65", lw=0.7, zorder=2)
+        ax3.legend(loc="upper right", fontsize=7)
+        self._telem_axes = (ax0, ax1, ax2, ax3)
         self._ln_enc_pos = self._ln_telem_enc_pos
 
         self._canvas = FigureCanvasTkAgg(self._fig, master=parent)
@@ -1163,13 +1506,30 @@ class VescControlGui:
 
     def _clear_telem_data(self) -> None:
         self._telem_samples.clear()
+        self._pictrl_samples.clear()
         self._redraw_telem_plot()
         self._redraw_enc_plot()
 
     def _schedule_live_plots_redraw(self) -> None:
+        if self.var_plots_paused.get():
+            return
         if self._plots_redraw_after_id is not None:
             return
         self._plots_redraw_after_id = self.root.after(LIVE_PLOTS_REDRAW_MS, self._live_plots_redraw_tick)
+
+    def _toggle_plot_pause(self) -> None:
+        paused = not self.var_plots_paused.get()
+        self.var_plots_paused.set(paused)
+        self.btn_plot_pause.config(text="Resume plot" if paused else "Pause plot")
+        if paused and self._plots_redraw_after_id is not None:
+            try:
+                self.root.after_cancel(self._plots_redraw_after_id)
+            except Exception:
+                pass
+            self._plots_redraw_after_id = None
+        if not paused:
+            self._redraw_telem_plot()
+            self._redraw_enc_plot()
 
     def _live_plots_redraw_tick(self) -> None:
         self._plots_redraw_after_id = None
@@ -1203,7 +1563,7 @@ class VescControlGui:
         return (int(ae) + dt_ms) & 0xFFFFFFFF
 
     def _plot_time_end(self) -> float:
-        """Right edge of rolling plot window: follow latest mapped sample so TELEM/ENC share the same time base."""
+        """Right edge of rolling plot window: follow latest mapped sample so TELEM/ENC/PICTRL share the same time base."""
         t_end = time.time()
         for row in self._telem_samples:
             tw = row[0]
@@ -1213,7 +1573,62 @@ class VescControlGui:
             tw = row[0]
             if tw > t_end:
                 t_end = tw
+        for row in self._pictrl_samples:
+            tw = row[0]
+            if tw > t_end:
+                t_end = tw
         return t_end
+
+    def _feed_pictrl_from_log_line(self, payload: str) -> None:
+        d = parse_pictrl_line(payload)
+        if d is None:
+            return
+        esp = d["esp_ms"]
+        tw = self._wall_from_esp_millis(int(esp))
+        self._pictrl_samples.append(
+            (
+                tw,
+                int(esp),
+                float(d["i_target_a"]),
+                float(d["i_meas_a"]),
+                float(d["i_cmd_a"]),
+                float(d["omega_rps"]),
+                float(d["actual_hz"]),
+                float(d["target_lb"]),
+            )
+        )
+        # Display the loop's actual rate as soon as samples arrive.
+        try:
+            hz = float(d["actual_hz"])
+            self.var_pi_actual_hz_str.set(
+                f"Actual: {hz:5.1f} Hz" if hz > 0 else "Actual: — Hz"
+            )
+        except (TypeError, ValueError):
+            pass
+        self._schedule_live_plots_redraw()
+
+    def _feed_picfg_from_log_line(self, payload: str) -> None:
+        """When the firmware echoes its config (PICFG), pull it back into the UI
+        so the constants editor reflects what's actually live on the ESP32."""
+        d = parse_picfg_line(payload)
+        if d is None:
+            return
+        try:
+            self.var_pi_kt.set(d["Kt"])
+            self.var_pi_ke.set(d["Ke"])
+            self.var_pi_r.set(d["R"])
+            self.var_pi_l.set(d["L"])
+            self.var_pi_kp.set(d["Kp"])
+            self.var_pi_ki.set(d["Ki"])
+            self.var_pi_imax.set(d["I_max"])
+            self.var_pi_amps_per_lb.set(d["amps_per_lb"])
+            self.var_pi_pole_pairs.set(d["pole_pairs"])
+            self.var_pi_hz.set(d["target_hz"])
+            self.var_pi_enabled.set(bool(d["enabled"]))
+            self.var_force_lbs.set(d["target_lb"])
+        except tk.TclError:
+            pass
+        self._update_pi_equation_label()
 
     def _feed_telem_from_log_line(self, payload: str) -> None:
         d = parse_telem_line(payload)
@@ -1239,7 +1654,7 @@ class VescControlGui:
         self._schedule_live_plots_redraw()
 
     def _redraw_telem_plot(self) -> None:
-        if self._fig is None or self._canvas is None or not hasattr(self, "_ln_rpm"):
+        if self._fig is None or self._canvas is None or not hasattr(self, "_ln_im"):
             return
         try:
             tw = max(1.0, float(self.var_telem_window_s.get()))
@@ -1248,23 +1663,17 @@ class VescControlGui:
         t_end = self._plot_time_end()
         t_start = t_end - tw
         xs: List[float] = []
-        rpm_l: List[float] = []
         v_l: List[float] = []
         im_l: List[float] = []
         iin_l: List[float] = []
-        tmos_l: List[float] = []
-        tmot_l: List[float] = []
         for row in self._telem_samples:
-            t_wall, _esp_ms, rpm, _duty, vb, imo, i_i, t_mos, t_mot = _telem_sample_unpack(row)
+            t_wall, _esp_ms, _rpm, _duty, vb, imo, i_i, _t_mos, _t_mot = _telem_sample_unpack(row)
             if t_wall < t_start:
                 continue
             xs.append(t_wall - t_start)
-            rpm_l.append(rpm)
             v_l.append(vb)
             im_l.append(imo)
             iin_l.append(i_i)
-            tmos_l.append(t_mos)
-            tmot_l.append(t_mot)
 
         enc_x: List[float] = []
         enc_pos: List[float] = []
@@ -1277,12 +1686,25 @@ class VescControlGui:
             enc_pos.append(row[1])
             enc_vel.append(row[2])
 
+        # PI controller traces (Force mode). Same time base as TELEM/ENC so the
+        # measured I_motor line and the dashed I_target/I_cmd lines line up.
+        pic_x: List[float] = []
+        pic_target: List[float] = []
+        pic_cmd: List[float] = []
+        for row in self._pictrl_samples:
+            t_wall = row[0]
+            if t_wall < t_start:
+                continue
+            pic_x.append(t_wall - t_start)
+            pic_target.append(row[2])
+            pic_cmd.append(row[4])
+
         if hasattr(self, "_ln_telem_enc_pos"):
             self._ln_telem_enc_pos.set_data(enc_x, enc_pos)
         if self._ln_enc_vel is not None:
             self._ln_enc_vel.set_data(enc_x, enc_vel)
 
-        ax4 = self._telem_axes[4]
+        ax3 = self._telem_axes[3]
         if self._iin_regen_fill is not None:
             try:
                 self._iin_regen_fill.remove()
@@ -1303,7 +1725,7 @@ class VescControlGui:
 
         if xs and any(v < -_REGEN_I_IN_EPS for v in iin_l):
             try:
-                self._iin_regen_fill = ax4.fill_between(
+                self._iin_regen_fill = ax3.fill_between(
                     xs,
                     0.0,
                     iin_l,
@@ -1317,19 +1739,19 @@ class VescControlGui:
             except (TypeError, ValueError):
                 self._iin_regen_fill = None
 
-        self._ln_rpm.set_data(xs, rpm_l)
         self._ln_v.set_data(xs, v_l)
         self._ln_im.set_data(xs, im_l)
         self._ln_iin.set_data(xs, iin_dis)
         self._ln_iin_regen.set_data(xs, iin_reg)
-        if hasattr(self, "_ln_t_mosfet"):
-            self._ln_t_mosfet.set_data(xs, tmos_l)
-            self._ln_t_motor.set_data(xs, tmot_l)
+        if hasattr(self, "_ln_i_target"):
+            self._ln_i_target.set_data(pic_x, pic_target)
+            self._ln_i_cmd.set_data(pic_x, pic_cmd)
 
         self._telem_axes[0].set_xlim(0.0, tw)
         has_telem = bool(xs)
         has_enc = bool(enc_x)
-        if has_telem or has_enc:
+        has_pictrl = bool(pic_x)
+        if has_telem or has_enc or has_pictrl:
             for ax in self._telem_axes:
                 ax.relim()
                 ax.autoscale_view(scalex=False)
@@ -1359,13 +1781,18 @@ class VescControlGui:
                 if item[0] == "log":
                     payload = item[1]
                     self._drive_indicators_from_payload(payload)
-                    show = not is_enc_log_payload(payload)
+                    show = not (
+                        is_enc_log_payload(payload)
+                        or is_pictrl_log_payload(payload)
+                    )
                     if show and not self.var_verbose_log.get() and self._is_quiet_log_line(payload):
                         show = False
                     if show:
                         self._append_log_safe(payload)
                     self._feed_telem_from_log_line(payload)
                     self._feed_enc_from_log_line(payload)
+                    self._feed_pictrl_from_log_line(payload)
+                    self._feed_picfg_from_log_line(payload)
                 else:
                     deferred.append(item)
         except queue.Empty:
@@ -1474,7 +1901,51 @@ class VescControlGui:
             "velocity_mps",
             "enc_count",
             "enc_device_ms",
+            # Force / PI mode columns. Blank when PI was off for that row.
+            "force_target_lb",
+            "i_target_a",
+            "i_cmd_a",
+            "omega_rps",
         ]
+
+        # Sort PICTRL samples by device_ms for the same nearest-neighbor walk
+        # we use on ENC. Tolerance is wider than ENC because PICTRL can be
+        # decimated by the firmware (≤100 Hz emit).
+        PIC_PAIR_TOL_MS = 100
+        pic_sorted: List[Tuple[int, float, float, float, float]] = []
+        for row in self._pictrl_samples:
+            tw, esp_ms = row[0], int(row[1])
+            if use_dev:
+                if not (
+                    _u32_diff_ms(esp_ms, dev_start) >= 0
+                    and _u32_diff_ms(dev_end, esp_ms) >= 0
+                ):
+                    continue
+            else:
+                if not (t0_wall <= tw <= t_end):
+                    continue
+            # row = (tw, esp_ms, i_target, i_meas, i_cmd, omega, actual_hz, target_lb)
+            pic_sorted.append((esp_ms, float(row[7]), float(row[2]), float(row[4]), float(row[5])))
+        pic_sorted.sort(key=lambda r: r[0])
+
+        def _pic_blank() -> Dict[str, Any]:
+            return {
+                "force_target_lb": "",
+                "i_target_a": "",
+                "i_cmd_a": "",
+                "omega_rps": "",
+            }
+
+        def _pic_fields_for(idx: Optional[int]) -> Dict[str, Any]:
+            if idx is None or not pic_sorted:
+                return _pic_blank()
+            _ms, lb, it, ic, om = pic_sorted[idx]
+            return {
+                "force_target_lb": lb,
+                "i_target_a": it,
+                "i_cmd_a": ic,
+                "omega_rps": om,
+            }
 
         rows_out: List[Dict[str, Any]] = []
 
@@ -1683,6 +2154,37 @@ class VescControlGui:
             n_telem = 0
             n_enc_rows = len(enc_sorted)
 
+        # ---------- Fold PI/Force columns into every row by device_ms ----------
+        # Each row already carries a device_ms timestamp from the path that
+        # built it; merging PI fields here keeps the per-mode dict literals
+        # above untouched and works whether PI was on or off in this run.
+        n_pi_paired = 0
+        if pic_sorted:
+            import bisect as _bisect
+            pic_keys_csv = [r[0] for r in pic_sorted]
+            for d in rows_out:
+                dms = d.get("device_ms", "")
+                if not isinstance(dms, int):
+                    d.update(_pic_blank())
+                    continue
+                j = _bisect.bisect_left(pic_keys_csv, dms)
+                best_idx: Optional[int] = None
+                best_d = -1
+                for k in (j - 1, j):
+                    if 0 <= k < len(pic_keys_csv):
+                        diff = abs(_u32_diff_ms(pic_keys_csv[k], dms))
+                        if best_idx is None or diff < best_d:
+                            best_idx = k
+                            best_d = diff
+                if best_idx is not None and best_d >= 0 and best_d <= PIC_PAIR_TOL_MS:
+                    d.update(_pic_fields_for(best_idx))
+                    n_pi_paired += 1
+                else:
+                    d.update(_pic_blank())
+        else:
+            for d in rows_out:
+                d.update(_pic_blank())
+
         out_dir = self._timed_captures_dir()
         os.makedirs(out_dir, exist_ok=True)
         # Filename stamp = wall-clock moment we're actually writing the CSV. Millisecond
@@ -1701,25 +2203,29 @@ class VescControlGui:
             return
 
         n = len(rows_out)
+        pi_suffix = (
+            f" | PI paired {n_pi_paired}/{n} @ ≤{PIC_PAIR_TOL_MS} ms ({len(pic_sorted)} raw)"
+            if pic_sorted else ""
+        )
         if mode == "grid":
             telem_rows_with_data = sum(1 for d in rows_out if d.get("rpm_vesc") not in ("", None))
             self._log(
                 f"CSV export ({reason}, uniform grid {grid_ms} ms): {n} rows "
                 f"(TELEM filled {telem_rows_with_data}/{n} @ ≤{TELEM_TOL_MS} ms tol; "
                 f"ENC paired {n_paired}/{n} @ ≤{ENC_TOL_MS} ms; "
-                f"{n_telem} raw TELEM, {n_enc_rows} raw ENC available) → {path}"
+                f"{n_telem} raw TELEM, {n_enc_rows} raw ENC available{pi_suffix}) → {path}"
             )
         elif n_telem > 0:
             self._log(
                 f"CSV export ({reason}): {n} aligned rows "
-                f"(TELEM cadence; {n_paired}/{n_telem} paired w/ ENC ≤{ENC_PAIR_TOL_MS}ms) → {path}"
+                f"(TELEM cadence; {n_paired}/{n_telem} paired w/ ENC ≤{ENC_PAIR_TOL_MS}ms{pi_suffix}) → {path}"
             )
         elif n_enc_rows > 0:
             self._log(
-                f"CSV export ({reason}): {n} rows (ENC only — Firmware TELEM stream was off) → {path}"
+                f"CSV export ({reason}): {n} rows (ENC only — Firmware TELEM stream was off{pi_suffix}) → {path}"
             )
         else:
-            self._log(f"CSV export ({reason}): no samples in window → {path}")
+            self._log(f"CSV export ({reason}): no samples in window{pi_suffix} → {path}")
 
     def _feed_enc_from_log_line(self, payload: str) -> None:
         d = parse_enc_line(payload)
@@ -1830,16 +2336,22 @@ class VescControlGui:
                 kind, payload = self._ui_q.get_nowait()
                 if kind == "log":
                     self._drive_indicators_from_payload(payload)
-                    # ENC is always skipped (rate). In non-verbose mode also
-                    # skip TELEM/OK/[READY] — indicators cover them and the
-                    # text widget was the largest UI-side cost at fast polling.
-                    show = not is_enc_log_payload(payload)
+                    # ENC + PICTRL are always skipped from the text pane (rates
+                    # are too high). In non-verbose mode also skip TELEM/OK/
+                    # [READY] — indicators cover them and the text widget was
+                    # the largest UI-side cost at fast polling.
+                    show = not (
+                        is_enc_log_payload(payload)
+                        or is_pictrl_log_payload(payload)
+                    )
                     if show and not self.var_verbose_log.get() and self._is_quiet_log_line(payload):
                         show = False
                     if show:
                         self._append_log_safe(payload)
                     self._feed_telem_from_log_line(payload)
                     self._feed_enc_from_log_line(payload)
+                    self._feed_pictrl_from_log_line(payload)
+                    self._feed_picfg_from_log_line(payload)
                     # Fresh plot after hardware zero — only when not holding samples for an active CSV window.
                     if (
                         self._csv_timed_capture_start is None
@@ -1862,6 +2374,11 @@ class VescControlGui:
                     # No scheduler to cancel anymore: TELEM stream lives on the ESP32.
                     # Dropping BLE stops the link; just reflect state in the UI.
                     self.var_live_telem.set(False)
+                    # PI loop self-disables on the ESP32 when BLE drops (see
+                    # vescCurrentIno.ino:pollPiLoop link-loss safety); mirror
+                    # that in the UI so a reconnect doesn't show stale state.
+                    self.var_pi_enabled.set(False)
+                    self.var_pi_actual_hz_str.set("Actual: — Hz")
                     self._ready_last_wall = None
                     for k in ("ready", "motor", "stop", "error"):
                         self._set_indicator(k, False)
@@ -2154,11 +2671,21 @@ class VescControlGui:
                 self._apply_telem_stream(False)
             except Exception:
                 pass
+            # If the PI loop is engaged, disable it cleanly before the link drops.
+            # The firmware also self-disables on link loss, but doing it here lets
+            # the user-facing CSV / state finalize cleanly.
+            if self.var_pi_enabled.get():
+                try:
+                    self._send_line("PI_ENABLE,0")
+                except Exception:
+                    pass
         self._reset_device_time_anchor()
         self._csv_timed_capture_start = None
         self._csv_device_ms_start = None
         self._cancel_timed_run()
         self.var_live_telem.set(False)
+        self.var_pi_enabled.set(False)
+        self.var_pi_actual_hz_str.set("Actual: — Hz")
         if self._ble_thread and self._ble_thread.is_alive():
             self._ble_ready.clear()
             self._ble_cmd_q.put(("close",))
@@ -2169,6 +2696,11 @@ class VescControlGui:
         if line.strip().upper() == "STOP":
             self._export_timed_run_csv(time.time(), "manual_stop")
             self._cancel_timed_run()
+            # Firmware STOP also disables the PI loop (vescCurrentIno.ino),
+            # so mirror that in the UI immediately rather than waiting for echo.
+            if self.var_pi_enabled.get():
+                self.var_pi_enabled.set(False)
+                self.var_pi_actual_hz_str.set("Actual: — Hz")
         self._send_line(line)
 
     def _send_raw(self) -> None:
