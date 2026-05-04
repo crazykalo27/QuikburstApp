@@ -490,6 +490,7 @@ class VescControlGui:
         self._ble_running = threading.Event()
         self._ble_ready = threading.Event()
         self.status = tk.StringVar(value="Disconnected")
+        self.var_safety_stop_reason = tk.StringVar(value="Last stop: none")
         self.ble_name = tk.StringVar(value="Quikburst")
         self.ble_addr = tk.StringVar(value="")
         self.scan_timeout = tk.DoubleVar(value=12.0)
@@ -668,9 +669,9 @@ class VescControlGui:
         outer.pack(fill=tk.BOTH, expand=True)
 
         left_pane = ttk.Frame(outer)
-        outer.add(left_pane, weight=0)
+        outer.add(left_pane, weight=2)
         right = ttk.Frame(outer)
-        outer.add(right, weight=1)
+        outer.add(right, weight=3)
 
         def _place_initial_sash(_event: Any = None) -> None:
             if self._initial_sash_placed:
@@ -988,6 +989,7 @@ class VescControlGui:
             self._indicators[key] = (c, oid)
             self._indicator_clear_after[key] = None
         self._indicators["error"][0].bind("<Button-1>", lambda _e: self._clear_error_indicator())
+        ttk.Label(row, textvariable=self.var_safety_stop_reason, foreground="#c22").pack(side=tk.RIGHT, padx=(0, 12))
         # Live run readout ("TEST 3.2 / 10 s" etc.) — refreshed by _tick_run_status.
         ttk.Label(
             row,
@@ -1091,6 +1093,11 @@ class VescControlGui:
         if up.startswith("ERROR,"):
             self._error_last_msg = core
             self._set_indicator("error", True)
+            if up.startswith("ERROR,SAFETY_STOP,"):
+                self.var_safety_stop_reason.set(f"Last stop: {core[17:]}")
+            else:
+                self.var_safety_stop_reason.set(f"Error: {core[6:]}")
+            self._set_status(core)
             return
         if up == "OK,STOP":
             self._pulse_indicator("stop", 800)

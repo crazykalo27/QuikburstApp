@@ -240,7 +240,7 @@ def parse_pictrl_line(msg: str) -> Optional[Dict[str, Any]]:
 def parse_picfg_line(msg: str) -> Optional[Dict[str, Any]]:
     """Parse PICFG snapshot reply from PI_CONFIG.
 
-    PICFG,Kt,Ke,R,L,Kp,Ki,I_max,amps_per_lb,pole_pairs,target_hz,enabled,target_lb,target_a
+    PICFG,Kt,Ke,R,L,Kp,Ki,I_max,I_int_max,amps_per_lb,pole_pairs,target_hz,enabled,target_lb,target_a
     """
     s = msg.strip()
     if s.startswith("<< "):
@@ -248,7 +248,7 @@ def parse_picfg_line(msg: str) -> Optional[Dict[str, Any]]:
     if not s.upper().startswith("PICFG,"):
         return None
     parts = s.split(",")
-    if len(parts) < 14:
+    if len(parts) < 15:
         return None
     try:
         return {
@@ -259,12 +259,13 @@ def parse_picfg_line(msg: str) -> Optional[Dict[str, Any]]:
             "Kp": float(parts[5]),
             "Ki": float(parts[6]),
             "I_max": float(parts[7]),
-            "amps_per_lb": float(parts[8]),
-            "pole_pairs": int(float(parts[9])),
-            "target_hz": int(float(parts[10])),
-            "enabled": int(float(parts[11])) != 0,
-            "target_lb": float(parts[12]),
-            "target_a": float(parts[13]),
+            "I_int_max": float(parts[8]),
+            "amps_per_lb": float(parts[9]),
+            "pole_pairs": int(float(parts[10])),
+            "target_hz": int(float(parts[11])),
+            "enabled": int(float(parts[12])) != 0,
+            "target_lb": float(parts[13]),
+            "target_a": float(parts[14]),
         }
     except (ValueError, IndexError):
         return None
@@ -409,7 +410,7 @@ Commands (BLE):
   ENC_RESET, ENC_STREAM,<0|1>[,<ms>], TELEM_STREAM,<0|1>[,<ms>],
   PI_ENABLE,<0|1>, PI_FORCE,<lbs>, PI_TARGET,<A>, PI_HZ,<hz>,
   PI_GAINS,<Kp>,<Ki>, PI_PARAMS,<Kt>,<Ke>,<R>,<L>,
-  PI_LIMITS,<I_max>,<amps_per_lb>,<pole_pairs>, PI_CONFIG
+  PI_LIMITS,<I_max>,<I_int_max>,<amps_per_lb>,<pole_pairs>, PI_CONFIG
 
 Force Control (PI current loop, runs ON the ESP32):
 The button accepts a FORCE in lbs, NOT a current. A single equation converts force to a current
@@ -569,6 +570,7 @@ class VescControlGui:
         self._ble_running = threading.Event()
         self._ble_ready = threading.Event()
         self.status = tk.StringVar(value="Disconnected")
+        self.var_safety_stop_reason = tk.StringVar(value="Last stop: none")
         self.ble_name = tk.StringVar(value="Quikburst")
         self.ble_addr = tk.StringVar(value="")
         self.scan_timeout = tk.DoubleVar(value=12.0)
@@ -648,6 +650,7 @@ class VescControlGui:
         self.var_pi_kp = tk.DoubleVar(value=0.5)
         self.var_pi_ki = tk.DoubleVar(value=3.0)
         self.var_pi_imax = tk.DoubleVar(value=8.0)
+        self.var_pi_iint_max = tk.DoubleVar(value=5.0)
         self.var_pi_amps_per_lb = tk.DoubleVar(value=2.6585)
         self.var_pi_pole_pairs = tk.IntVar(value=7)
         self.var_pi_actual_hz_str = tk.StringVar(value="Actual: — Hz")
@@ -1106,6 +1109,7 @@ class VescControlGui:
             self._indicators[key] = (c, oid)
             self._indicator_clear_after[key] = None
         self._indicators["error"][0].bind("<Button-1>", lambda _e: self._clear_error_indicator())
+        ttk.Label(row, textvariable=self.var_safety_stop_reason, foreground="#c22").pack(side=tk.RIGHT, padx=(0, 12))
         # Live run readout ("TEST 3.2 / 10 s" etc.) — refreshed by _tick_run_status.
         ttk.Label(
             row,
@@ -1146,6 +1150,7 @@ class VescControlGui:
 
     def _clear_error_indicator(self) -> None:
         self._error_last_msg = None
+        self.var_safety_stop_reason.set("Last stop: none")
         self._set_indicator("error", False)
 
     def _tick_run_status(self) -> None:
@@ -1211,6 +1216,10 @@ class VescControlGui:
         if up.startswith("ERROR,"):
             self._error_last_msg = core
             self._set_indicator("error", True)
+            if up.startswith("ERROR,SAFETY_STOP,"):
+                self.var_safety_stop_reason.set(f"Last stop: {core[17:]}")
+            else:
+                self.var_safety_stop_reason.set(f"Error: {core[6:]}")
             return
         if up == "OK,STOP":
             self._pulse_indicator("stop", 800)
@@ -1303,11 +1312,12 @@ class VescControlGui:
         cfield(2, 2, "Ki", self.var_pi_ki)
         cfield(3, 0, "I_max (A)", self.var_pi_imax)
         cfield(3, 2, "A per lb", self.var_pi_amps_per_lb)
-        cfield(4, 0, "Pole pairs", self.var_pi_pole_pairs, width=4)
+        cfield(4, 0, "I_int_max (A)", self.var_pi_iint_max)
+        cfield(4, 2, "Pole pairs", self.var_pi_pole_pairs, width=4)
 
         btn_apply = ttk.Button(const_fr, text="Apply constants",
                                command=self._apply_pi_constants)
-        btn_apply.grid(row=4, column=2, columnspan=2, sticky=tk.E, padx=(0, 0), pady=(4, 0))
+        btn_apply.grid(row=5, column=2, columnspan=2, sticky=tk.E, padx=(0, 0), pady=(4, 0))
         self.cmd_widgets.append(btn_apply)
 
         # Re-run the equation label whenever amps_per_lb changes too — the user is
@@ -1395,6 +1405,7 @@ class VescControlGui:
         kp = f(self.var_pi_kp, 0.5)
         ki = f(self.var_pi_ki, 3.0)
         imax = f(self.var_pi_imax, 8.0)
+        iint_max = f(self.var_pi_iint_max, 5.0)
         apl = f(self.var_pi_amps_per_lb, 2.6585)
         try:
             pp = max(1, int(self.var_pi_pole_pairs.get()))
@@ -1402,7 +1413,7 @@ class VescControlGui:
             pp = 7
         self._send_line(f"PI_PARAMS,{kt:.6f},{ke:.6f},{r:.6f},{l:.8f}")
         self._send_line(f"PI_GAINS,{kp:.6f},{ki:.6f}")
-        self._send_line(f"PI_LIMITS,{imax:.4f},{apl:.6f},{pp}")
+        self._send_line(f"PI_LIMITS,{imax:.4f},{iint_max:.4f},{apl:.6f},{pp}")
         self._update_pi_equation_label()
         self._log("(PI: applied gains/params/limits)")
 
@@ -1621,6 +1632,7 @@ class VescControlGui:
             self.var_pi_kp.set(d["Kp"])
             self.var_pi_ki.set(d["Ki"])
             self.var_pi_imax.set(d["I_max"])
+            self.var_pi_iint_max.set(d["I_int_max"])
             self.var_pi_amps_per_lb.set(d["amps_per_lb"])
             self.var_pi_pole_pairs.set(d["pole_pairs"])
             self.var_pi_hz.set(d["target_hz"])

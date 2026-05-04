@@ -9,7 +9,7 @@
  *   PING                      → PONG,Quikburst
  *   SET_CURRENT,<amps>        → OK,SET_CURRENT,...
  *   SET_BRAKE[,<amps>]       → OK,SET_BRAKE[,<amps>] (omit <amps> to use VESC_BRAKE_APPLY_AMPS; VESC clamps)
- *   SET_DUTY,<duty>           → duty clamped to 0…0.20 (20%)
+ *   SET_DUTY,<duty>           → duty clamped to 0…0.25 (25%)
  *   STOP                      → OK,STOP
  *   GET_VALUES                → TELEM,esp32_ms,rpm,duty,vbat,imotor,iin,tmos,tmotor,tach,tachAbs,fault
  *                               (esp32_ms = millis() when line is sent; same clock as ENC time_ms)
@@ -32,8 +32,8 @@
  *   PI_HZ,<hz>                → OK,PI_HZ,<hz>              (target loop frequency, 1–500)
  *   PI_GAINS,<Kp>,<Ki>        → OK,PI_GAINS,<Kp>,<Ki>
  *   PI_PARAMS,<Kt>,<Ke>,<R>,<L> → OK,PI_PARAMS,...
- *   PI_LIMITS,<I_max>,<amps_per_lb>,<pole_pairs> → OK,PI_LIMITS,...
- *   PI_CONFIG                 → PICFG,Kt,Ke,R,L,Kp,Ki,I_max,amps_per_lb,pole_pairs,target_hz,enabled,target_lb,target_a
+ *   PI_LIMITS,<I_max>,<I_int_max>,<amps_per_lb>,<pole_pairs> → OK,PI_LIMITS,...
+ *   PI_CONFIG                 → PICFG,Kt,Ke,R,L,Kp,Ki,I_max,I_int_max,amps_per_lb,pole_pairs,target_hz,enabled,target_lb,target_a
  *   PICTRL,...                — streamed from PI loop:
  *                               PICTRL,esp32_ms,i_target_a,i_meas_a,i_cmd_a,omega_rps,actual_hz,target_lb
  *   [READY]                   — periodic heartbeat to BLE when connected
@@ -68,7 +68,7 @@
 
 // Max duty cycle for SET_DUTY (fraction 0–1); matches Python GUI cap.
 #ifndef VESC_MAX_DUTY
-#define VESC_MAX_DUTY 0.20f
+#define VESC_MAX_DUTY 0.25f
 #endif
 
 // Default brake current when host sends SET_BRAKE with no comma argument; VESC still enforces its own limits.
@@ -141,6 +141,7 @@ struct PiCfg {
   float Kp;          // A/A
   float Ki;          // A/(A·s)
   float I_max;       // A       — symmetric saturation limit (signed)
+  float I_int_max;   // A       — symmetric integrator clamp limit (signed)
   float amps_per_lb; // A/lb    — force → current scale (CLEAR EQUATION)
   int   pole_pairs;  // VESC RPM is electrical; mechanical = eRPM / pole_pairs
   uint32_t target_hz;
@@ -154,6 +155,7 @@ static PiCfg g_pi = {
   /*Kp*/ 0.5f,
   /*Ki*/ 3.0f,
   /*I_max*/ 8.0f,
+  /*I_int_max*/ 5.0f,
   /*amps_per_lb*/ 4.44822f*2.0f*0.0254f/0.085f,    // Fdes*4.44822[N/lbf]*2[in]*0.0254[m/in]/Kt[Nm/A]
   /*pole_pairs*/ 7,
   /*target_hz*/ 50
@@ -175,6 +177,12 @@ static uint32_t g_piLastUartMs    = 0;       // shared with TELEM (avoid double-
 static float g_piIMeas = 0.0f;
 static float g_piOmega = 0.0f;
 static float g_piICmd  = 0.0f;
+
+static uint32_t g_encoderLastSeenMs = 0;
+static float    g_lastEncoderVelMps = 0.0f;
+static uint32_t g_velocityOverLimitSinceMs = 0;
+static uint32_t g_currentOverLimitSinceMs  = 0;
+static bool     g_safetyStopEngaged = false;
 
 void IRAM_ATTR updateEncoder() {
   int8_t a       = (int8_t)digitalRead(ENC_PIN_A);
@@ -210,6 +218,8 @@ static void pollEncoderStream(uint32_t nowMs) {
     interrupts();
     lastPosM  = (float)c0 * METERS_PER_COUNT;
     lastPosMs = nowMs;
+    g_lastEncoderVelMps = 0.0f;
+    g_encoderLastSeenMs = nowMs;
     return;
   }
 
@@ -236,6 +246,8 @@ static void pollEncoderStream(uint32_t nowMs) {
 
   lastPosM  = posM;
   lastPosMs = nowMs;
+  g_lastEncoderVelMps = velMps;
+  g_encoderLastSeenMs = nowMs;
 }
 
 static constexpr char BLE_DEVICE_NAME[] = "Quikburst";
@@ -404,6 +416,26 @@ static void pollTelemStream(uint32_t nowMs) {
 // PI controller core (verbatim port of PI_Dev/PI_ex1.ino, with editable gains)
 // ---------------------------------------------------------------------------
 
+static void hardStopMotor() {
+  UART.setCurrent(0.0f);
+  UART.setBrakeCurrent(0.0f);
+  g_motorActive = false;
+  updateStatusLeds();
+}
+
+static void triggerSafetyStop(const char* reason) {
+  if (g_safetyStopEngaged) return;
+  g_safetyStopEngaged = true;
+  g_piEnabled = false;
+  hardStopMotor();
+  sendHostFmt("ERROR,SAFETY_STOP,%s", reason);
+}
+
+static void enforceSafetyStop() {
+  if (!g_safetyStopEngaged) return;
+  hardStopMotor();
+}
+
 static void resetPiController() {
   g_piIntegrator   = 0.0f;
   g_piTPrevS       = -1.0f;
@@ -439,6 +471,8 @@ static float piCurrentController(float i_measured, float omega, float t_s, float
   } else {
     g_piIntegrator += g_pi.Ki * e * dt;
   }
+  if (g_piIntegrator >  g_pi.I_int_max) g_piIntegrator =  g_pi.I_int_max;
+  if (g_piIntegrator < -g_pi.I_int_max) g_piIntegrator = -g_pi.I_int_max;
   return i_cmd;
 }
 
@@ -446,6 +480,10 @@ static float piCurrentController(float i_measured, float omega, float t_s, float
 // All blocking work (UART read, BLE notify) happens here so the loop() body
 // stays simple and the PI cadence stays observable from the actual_hz field.
 static void pollPiLoop(uint32_t nowMs, uint32_t nowUs) {
+  if (g_safetyStopEngaged) {
+    enforceSafetyStop();
+    return;
+  }
   if (!g_piEnabled) return;
 
   // Link-loss safety: PI sends setCurrent every cycle, so the VESC's APP/UART
@@ -484,6 +522,46 @@ static void pollPiLoop(uint32_t nowMs, uint32_t nowUs) {
   float omega   = rpm_m * 2.0f * 3.14159265358979f / 60.0f;
   float i_meas  = UART.data.avgMotorCurrent;
 
+  // Safety constraint: if duty cycle reaches or exceeds the 25% hard ceiling, stop.
+  if (UART.data.dutyCycleNow >= VESC_MAX_DUTY) {
+    triggerSafetyStop("DUTY_OVER_LIMIT");
+    enforceSafetyStop();
+    return;
+  }
+
+  // Safety constraint: if velocity exceeds 11 m/s for 1 second, stop.
+  if (fabsf(g_lastEncoderVelMps) > 11.0f) {
+    if (g_velocityOverLimitSinceMs == 0) {
+      g_velocityOverLimitSinceMs = nowMs;
+    } else if (nowMs - g_velocityOverLimitSinceMs >= 1000) {
+      triggerSafetyStop("VELOCITY_OVER_11MPS");
+      enforceSafetyStop();
+      return;
+    }
+  } else {
+    g_velocityOverLimitSinceMs = 0;
+  }
+
+  // Safety constraint: if motor current stays high for 1 second, stop.
+  if (fabsf(i_meas) >= 30.0f) {
+    if (g_currentOverLimitSinceMs == 0) {
+      g_currentOverLimitSinceMs = nowMs;
+    } else if (nowMs - g_currentOverLimitSinceMs >= 1000) {
+      triggerSafetyStop("CURRENT_OVER_30A");
+      enforceSafetyStop();
+      return;
+    }
+  } else {
+    g_currentOverLimitSinceMs = 0;
+  }
+
+  // Safety constraint: if the encoder stops providing stream data for 5 seconds while current is present, stop.
+  if (g_encStreamEnabled && g_encoderLastSeenMs != 0 && (nowMs - g_encoderLastSeenMs) >= 5000 && fabsf(i_meas) > 0.5f) {
+    triggerSafetyStop("ENCODER_LOST_WITH_CURRENT");
+    enforceSafetyStop();
+    return;
+  }
+
   float i_cmd = piCurrentController(i_meas, omega, t_s, g_piTargetAmps);
 
   UART.setCurrent(i_cmd);
@@ -510,10 +588,10 @@ static void pollPiLoop(uint32_t nowMs, uint32_t nowUs) {
 
 // PICFG snapshot reply (for PI_CONFIG).
 static void sendPiConfigLine() {
-  sendHostFmt("PICFG,%.4f,%.4f,%.4f,%.6f,%.4f,%.4f,%.3f,%.4f,%d,%lu,%d,%.3f,%.4f",
+  sendHostFmt("PICFG,%.4f,%.4f,%.4f,%.6f,%.4f,%.4f,%.3f,%.4f,%.4f,%d,%lu,%d,%.3f,%.4f",
       g_pi.Kt, g_pi.Ke, g_pi.R, g_pi.L,
       g_pi.Kp, g_pi.Ki,
-      g_pi.I_max, g_pi.amps_per_lb,
+      g_pi.I_max, g_pi.I_int_max, g_pi.amps_per_lb,
       g_pi.pole_pairs, (unsigned long)g_pi.target_hz,
       g_piEnabled ? 1 : 0,
       g_piTargetLbs, g_piTargetAmps);
@@ -570,6 +648,9 @@ static void processCommand(const String& cmd) {
     UART.setDuty(duty);
     g_motorActive = (duty > 1e-5f);
     updateStatusLeds();
+    if (duty >= VESC_MAX_DUTY) {
+      triggerSafetyStop("DUTY_OVER_LIMIT");
+    }
     sendHostFmt("OK,SET_DUTY,%.4f", duty);
     return;
   }
@@ -706,21 +787,28 @@ static void processCommand(const String& cmd) {
   }
 
   if (cmd.startsWith("PI_LIMITS,")) {
-    // PI_LIMITS,I_max,amps_per_lb,pole_pairs
+    // PI_LIMITS,I_max,I_int_max,amps_per_lb,pole_pairs
     String s = cmd.substring(10);
     int c1 = s.indexOf(',');
     int c2 = (c1 >= 0) ? s.indexOf(',', c1 + 1) : -1;
-    if (c1 > 0 && c2 > c1) {
+    int c3 = (c2 >= 0) ? s.indexOf(',', c2 + 1) : -1;
+    if (c1 > 0 && c2 > c1 && c3 > c2) {
+      g_pi.I_max       = parseFloat(s.substring(0, c1));
+      g_pi.I_int_max   = parseFloat(s.substring(c1 + 1, c2));
+      g_pi.amps_per_lb = parseFloat(s.substring(c2 + 1, c3));
+      g_pi.pole_pairs  = (int)parseFloat(s.substring(c3 + 1));
+    } else if (c1 > 0 && c2 > c1) {
       g_pi.I_max       = parseFloat(s.substring(0, c1));
       g_pi.amps_per_lb = parseFloat(s.substring(c1 + 1, c2));
       g_pi.pole_pairs  = (int)parseFloat(s.substring(c2 + 1));
-      // Re-evaluate target current so the next loop tick uses the new scale.
-      g_piTargetAmps = g_pi.amps_per_lb * g_piTargetLbs;
-      sendHostFmt("OK,PI_LIMITS,%.3f,%.4f,%d",
-          g_pi.I_max, g_pi.amps_per_lb, g_pi.pole_pairs);
     } else {
       sendHostLine("ERROR,PI_LIMITS_BAD_ARGS");
+      return;
     }
+    // Re-evaluate target current so the next loop tick uses the new scale.
+    g_piTargetAmps = g_pi.amps_per_lb * g_piTargetLbs;
+    sendHostFmt("OK,PI_LIMITS,%.3f,%.3f,%.4f,%d",
+        g_pi.I_max, g_pi.I_int_max, g_pi.amps_per_lb, g_pi.pole_pairs);
     return;
   }
 
