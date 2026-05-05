@@ -35,7 +35,7 @@
  *   PI_LIMITS,<I_max>,<I_int_max>,<amps_per_lb>,<pole_pairs> → OK,PI_LIMITS,...
  *   PI_CONFIG                 → PICFG,Kt,Ke,R,L,Kp,Ki,I_max,I_int_max,amps_per_lb,pole_pairs,target_hz,enabled,target_lb,target_a
  *   PICTRL,...                — streamed from PI loop:
- *                               PICTRL,esp32_ms,i_target_a,i_meas_a,i_cmd_a,omega_rps,actual_hz,target_lb
+ *                               PICTRL,esp32_ms,i_target_a,i_meas_a,i_cmd_a,omega_rps,actual_hz,target_lb,i_error_a,i_ff_a,i_int_a,i_cmd_unsat_a,back_emf_a
  *   [READY]                   — periodic heartbeat to BLE when connected
  *
  * BLE UUIDs (Nordic UART Service — works with bleak / nRF Connect):
@@ -95,6 +95,14 @@ static const float   SPOOL_DIA_INCHES   = 4.0f;
 static const float   SPOOL_CIRCUMF_M    = 3.14159265f * SPOOL_DIA_INCHES * 0.0254f;
 static const float   METERS_PER_COUNT   = SPOOL_CIRCUMF_M / (float)COUNTS_PER_REV;
 
+// Spool radius for omega calculation: v = omega * r  →  omega = v / r
+// Motor has 1:1 ratio with spool, so motor omega == spool omega.
+static const float   SPOOL_RADIUS_M     = (SPOOL_DIA_INCHES * 0.0254f) / 2.0f;
+
+// Velocity update interval for the PI feedforward — independent of BLE emit rate.
+// At 5 ms (200 Hz) this is comfortably faster than the ~90 Hz PI loop.
+static const uint32_t ENC_VEL_UPDATE_MS = 5;
+
 // ENC stream interval is runtime-configurable via ENC_STREAM,<on>,<ms>. Default is 25 ms (40 Hz);
 // at a 15 ms BLE connection interval (macOS floor) the link has only ~67 notify slots/s total,
 // so with TELEM on use a similar interval for both (defaults: 25 ms each) so neither stream starves.
@@ -129,6 +137,9 @@ uint32_t  g_telemStreamIntervalMs = TELEM_STREAM_DEFAULT_MS;
 // PI law from PI_ex1.ino with anti-windup back-calculation. setCurrent(i_cmd)
 // is sent to the VESC each cycle.
 //
+// Omega is derived from the rope encoder (1:1 spool-to-motor ratio) rather than
+// VESC RPM, which reads zero during backdrive / passive generation.
+//
 // Practical Hz floor is the VESC UART read (~10 ms / 115200 baud), so 50 Hz is
 // tight, 100 Hz is the ceiling, and PICTRL emit is decimated to ≤ ~100 Hz so
 // BLE doesn't choke when the loop runs faster than that.
@@ -143,7 +154,7 @@ struct PiCfg {
   float I_max;       // A       — symmetric saturation limit (signed)
   float I_int_max;   // A       — symmetric integrator clamp limit (signed)
   float amps_per_lb; // A/lb    — force → current scale (CLEAR EQUATION)
-  int   pole_pairs;  // VESC RPM is electrical; mechanical = eRPM / pole_pairs
+  int   pole_pairs;  // kept for reference; omega now comes from encoder not VESC RPM
   uint32_t target_hz;
 };
 
@@ -173,15 +184,24 @@ static uint32_t g_piEmitDecimCnt  = 0;
 static uint32_t g_piEmitEveryN    = 1;
 static uint32_t g_piLastUartMs    = 0;       // shared with TELEM (avoid double-read)
 
+// Runtime toggle: reset integrator when i_target crosses zero
+static bool g_piResetIntOnCrossing = true;
+
 // Latest snapshot for any external consumer (TELEM passthrough, debug)
 static float g_piIMeas = 0.0f;
 static float g_piOmega = 0.0f;
 static float g_piICmd  = 0.0f;
+static float g_piError = 0.0f;
+static float g_piFF = 0.0f;
+static float g_piICmdUnsat = 0.0f;
+static float g_piBackEmf = 0.0f;
+static float g_piTargetAmpsPrev = 0.0f;      // previous i_target for zero-crossing detection
 
 static uint32_t g_encoderLastSeenMs = 0;
 static float    g_lastEncoderVelMps = 0.0f;
 static uint32_t g_velocityOverLimitSinceMs = 0;
 static uint32_t g_currentOverLimitSinceMs  = 0;
+static uint32_t g_negativeCurrentStartMs   = 0;
 static bool     g_safetyStopEngaged = false;
 
 void IRAM_ATTR updateEncoder() {
@@ -196,21 +216,54 @@ void IRAM_ATTR updateEncoder() {
   g_lastEncoded = encoded;
 }
 
+// ---------------------------------------------------------------------------
+// pollEncoderStream
+//
+// Two independent timers:
+//   1. Fast velocity update (ENC_VEL_UPDATE_MS = 5 ms / 200 Hz):
+//      Updates g_lastEncoderVelMps so the PI feedforward always has a fresh
+//      omega estimate, regardless of BLE emit rate.
+//   2. Slow BLE emit (g_encStreamIntervalMs, default 25 ms / 40 Hz):
+//      Sends ENC,... lines over BLE. Rate-limited by BLE link capacity.
+//      The velocity value emitted uses the fast-updated g_lastEncoderVelMps.
+// ---------------------------------------------------------------------------
 static void pollEncoderStream(uint32_t nowMs) {
-  static uint32_t lastSampleMs = 0;
-  static float    lastPosM     = 0.0f;
-  static uint32_t lastPosMs    = 0;
-  static bool     lastStreamOn = false;
+  static uint32_t lastSampleMs    = 0;   // BLE emit timer
+  static uint32_t lastVelUpdateMs = 0;   // fast velocity timer
+  static float    lastPosForVelM  = 0.0f;
+  static float    lastPosM        = 0.0f;
+  static uint32_t lastPosMs       = 0;
+  static bool     lastStreamOn    = false;
 
   if (g_encStreamEnabled != lastStreamOn) {
-    lastStreamOn = g_encStreamEnabled;
-    lastSampleMs = 0;
+    lastStreamOn    = g_encStreamEnabled;
+    lastSampleMs    = 0;
+    lastVelUpdateMs = 0;
   }
 
   if (!g_encStreamEnabled) {
     return;
   }
 
+  // --- Fast velocity update (200 Hz) --------------------------------------
+  // Always runs when stream is enabled so g_lastEncoderVelMps stays current
+  // for the PI loop even when BLE emit is gated.
+  if (lastVelUpdateMs == 0 || (nowMs - lastVelUpdateMs) >= ENC_VEL_UPDATE_MS) {
+    noInterrupts();
+    int32_t countFast = g_encoderCount;
+    interrupts();
+    float posNow = (float)countFast * METERS_PER_COUNT;
+    if (lastVelUpdateMs != 0) {
+      float dt_s = (float)(nowMs - lastVelUpdateMs) / 1000.0f;
+      if (dt_s > 0.0f)
+        g_lastEncoderVelMps = (posNow - lastPosForVelM) / dt_s;
+    }
+    lastPosForVelM  = posNow;
+    lastVelUpdateMs = nowMs;
+    g_encoderLastSeenMs = nowMs;
+  }
+
+  // --- Slow BLE emit (g_encStreamIntervalMs, default 25 ms) ---------------
   if (lastSampleMs == 0) {
     lastSampleMs = nowMs;
     noInterrupts();
@@ -218,8 +271,6 @@ static void pollEncoderStream(uint32_t nowMs) {
     interrupts();
     lastPosM  = (float)c0 * METERS_PER_COUNT;
     lastPosMs = nowMs;
-    g_lastEncoderVelMps = 0.0f;
-    g_encoderLastSeenMs = nowMs;
     return;
   }
 
@@ -246,8 +297,6 @@ static void pollEncoderStream(uint32_t nowMs) {
 
   lastPosM  = posM;
   lastPosMs = nowMs;
-  g_lastEncoderVelMps = velMps;
-  g_encoderLastSeenMs = nowMs;
 }
 
 static constexpr char BLE_DEVICE_NAME[] = "Quikburst";
@@ -457,9 +506,23 @@ static float piCurrentController(float i_measured, float omega, float t_s, float
   g_piTPrevS = t_s;
   if (dt <= 0.0f) return i_target;
 
-  float e    = i_target - i_measured;
-  float i_ff = i_target - (g_pi.Ke * omega) / g_pi.R;
-  float i_cmd_unsat = i_ff + g_pi.Kp * e + g_piIntegrator;
+  float back_emf_current = (g_pi.Ke * omega) / g_pi.R;
+  g_piBackEmf = back_emf_current;
+
+  float e;
+  float i_ff; //lowkey not even using this
+  
+  if (fabsf(i_target) <= 0.1f) {
+    e = i_target - i_measured;
+    i_ff = 0.0f;
+  } else {
+    e = i_target - back_emf_current - i_measured;
+    i_ff = i_target - back_emf_current;
+  }
+
+  float i_cmd_unsat = g_pi.Kp * e + g_piIntegrator;
+  //  float i_cmd_unsat = i_ff + g_pi.Kp * e + g_piIntegrator;
+
 
   float i_cmd = i_cmd_unsat;
   if (i_cmd >  g_pi.I_max) i_cmd =  g_pi.I_max;
@@ -473,6 +536,10 @@ static float piCurrentController(float i_measured, float omega, float t_s, float
   }
   if (g_piIntegrator >  g_pi.I_int_max) g_piIntegrator =  g_pi.I_int_max;
   if (g_piIntegrator < -g_pi.I_int_max) g_piIntegrator = -g_pi.I_int_max;
+
+  g_piError = e;
+  g_piFF = i_ff;
+  g_piICmdUnsat = i_cmd_unsat;
   return i_cmd;
 }
 
@@ -517,10 +584,26 @@ static void pollPiLoop(uint32_t nowMs, uint32_t nowUs) {
   }
   g_piLastUartMs = nowMs;
 
-  float rpm_e   = UART.data.rpm;
-  float rpm_m   = (g_pi.pole_pairs > 0) ? rpm_e / (float)g_pi.pole_pairs : rpm_e;
-  float omega   = rpm_m * 2.0f * 3.14159265358979f / 60.0f;
-  float i_meas  = UART.data.avgMotorCurrent;
+  // Derive omega from rope encoder (1:1 spool-to-motor ratio).
+  // VESC reports zero RPM during backdrive/passive generation so the encoder
+  // is the only reliable velocity source for feedforward back-EMF cancellation.
+  float omega  = fabsf(g_lastEncoderVelMps) / SPOOL_RADIUS_M;
+  float i_meas = UART.data.avgMotorCurrent;
+
+  // Safety constraint: if motor current is sustained negative for >= 1 second, stop.
+  // It's OK for i_cmd to command negative current (back-EMF should keep i_meas positive),
+  // but sustained negative i_meas indicates unsafe runaway state.
+  if (i_meas < 0.0f) {
+    if (g_negativeCurrentStartMs == 0) {
+      g_negativeCurrentStartMs = nowMs;
+    } else if (nowMs - g_negativeCurrentStartMs >= 1000) {
+      triggerSafetyStop("SUSTAINED_NEGATIVE_CURRENT");
+      enforceSafetyStop();
+      return;
+    }
+  } else {
+    g_negativeCurrentStartMs = 0;
+  }
 
   // Safety constraint: if duty cycle reaches or exceeds the 25% hard ceiling, stop.
   if (UART.data.dutyCycleNow >= VESC_MAX_DUTY) {
@@ -562,6 +645,16 @@ static void pollPiLoop(uint32_t nowMs, uint32_t nowUs) {
     return;
   }
 
+  // Detect i_target sign change BEFORE running controller.
+  // Resets integrator so accumulated error from the previous regime doesn't
+  // carry over and cause a spike at the zero crossing.
+  bool target_crossed_zero = (g_piTargetAmpsPrev >= 0.0f && g_piTargetAmps < 0.0f) ||
+                             (g_piTargetAmpsPrev <= 0.0f && g_piTargetAmps > 0.0f);
+  if (target_crossed_zero && g_piResetIntOnCrossing) {
+    g_piIntegrator = 0.0f;
+  }
+  g_piTargetAmpsPrev = g_piTargetAmps;
+
   float i_cmd = piCurrentController(i_meas, omega, t_s, g_piTargetAmps);
 
   UART.setCurrent(i_cmd);
@@ -579,22 +672,24 @@ static void pollPiLoop(uint32_t nowMs, uint32_t nowUs) {
   if (++g_piEmitDecimCnt >= g_piEmitEveryN) {
     g_piEmitDecimCnt = 0;
     float actual_hz = (g_piPeriodEmaUs > 0) ? (1000000.0f / (float)g_piPeriodEmaUs) : 0.0f;
-    sendHostFmt("PICTRL,%lu,%.4f,%.4f,%.4f,%.3f,%.2f,%.3f",
+    sendHostFmt("PICTRL,%lu,%.4f,%.4f,%.4f,%.3f,%.2f,%.3f,%.4f,%.4f,%.4f,%.4f,%.4f",
         (unsigned long)nowMs,
         g_piTargetAmps, i_meas, i_cmd, omega,
-        actual_hz, g_piTargetLbs);
+        actual_hz, g_piTargetLbs,
+        g_piError, g_piFF, g_piIntegrator, g_piICmdUnsat, g_piBackEmf);
   }
 }
 
 // PICFG snapshot reply (for PI_CONFIG).
 static void sendPiConfigLine() {
-  sendHostFmt("PICFG,%.4f,%.4f,%.4f,%.6f,%.4f,%.4f,%.3f,%.4f,%.4f,%d,%lu,%d,%.3f,%.4f",
+  sendHostFmt("PICFG,%.4f,%.4f,%.4f,%.6f,%.4f,%.4f,%.3f,%.4f,%.4f,%d,%lu,%d,%.3f,%.4f,%d",
       g_pi.Kt, g_pi.Ke, g_pi.R, g_pi.L,
       g_pi.Kp, g_pi.Ki,
       g_pi.I_max, g_pi.I_int_max, g_pi.amps_per_lb,
       g_pi.pole_pairs, (unsigned long)g_pi.target_hz,
       g_piEnabled ? 1 : 0,
-      g_piTargetLbs, g_piTargetAmps);
+      g_piTargetLbs, g_piTargetAmps,
+      g_piResetIntOnCrossing ? 1 : 0);
 }
 
 static void processCommand(const String& cmd) {
@@ -762,6 +857,7 @@ static void processCommand(const String& cmd) {
       g_pi.Kp = parseFloat(args.substring(0, comma));
       g_pi.Ki = parseFloat(args.substring(comma + 1));
       sendHostFmt("OK,PI_GAINS,%.4f,%.4f", g_pi.Kp, g_pi.Ki);
+      sendPiConfigLine();
     } else {
       sendHostLine("ERROR,PI_GAINS_BAD_ARGS");
     }
@@ -780,6 +876,7 @@ static void processCommand(const String& cmd) {
       g_pi.R  = parseFloat(s.substring(c2 + 1, c3));
       g_pi.L  = parseFloat(s.substring(c3 + 1));
       sendHostFmt("OK,PI_PARAMS,%.4f,%.4f,%.4f,%.6f", g_pi.Kt, g_pi.Ke, g_pi.R, g_pi.L);
+      sendPiConfigLine();
     } else {
       sendHostLine("ERROR,PI_PARAMS_BAD_ARGS");
     }
@@ -809,6 +906,14 @@ static void processCommand(const String& cmd) {
     g_piTargetAmps = g_pi.amps_per_lb * g_piTargetLbs;
     sendHostFmt("OK,PI_LIMITS,%.3f,%.3f,%.4f,%d",
         g_pi.I_max, g_pi.I_int_max, g_pi.amps_per_lb, g_pi.pole_pairs);
+    sendPiConfigLine();
+    return;
+  }
+
+  if (cmd.startsWith("PI_RESET_INT,")) {
+    bool on = parseFloat(cmd.substring(13)) != 0.0f;
+    g_piResetIntOnCrossing = on;
+    sendHostFmt("OK,PI_RESET_INT,%d", on ? 1 : 0);
     return;
   }
 

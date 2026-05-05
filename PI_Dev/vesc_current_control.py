@@ -213,7 +213,8 @@ def parse_enc_line(msg: str) -> Optional[Dict[str, Any]]:
 def parse_pictrl_line(msg: str) -> Optional[Dict[str, Any]]:
     """Parse PICTRL from firmware (PI loop telemetry, optional '<< ' prefix).
 
-    PICTRL,esp32_ms,i_target_a,i_meas_a,i_cmd_a,omega_rps,actual_hz,target_lb
+    PICTRL,esp32_ms,i_target_a,i_meas_a,i_cmd_a,omega_rps,actual_hz,target_lb,
+           i_error_a,i_ff_a,i_int_a,i_cmd_unsat_a,back_emf_a,back_emf_a
     """
     s = msg.strip()
     if s.startswith("<< "):
@@ -224,7 +225,7 @@ def parse_pictrl_line(msg: str) -> Optional[Dict[str, Any]]:
     if len(parts) < 8:
         return None
     try:
-        return {
+        out = {
             "esp_ms": int(parts[1]),
             "i_target_a": float(parts[2]),
             "i_meas_a": float(parts[3]),
@@ -232,7 +233,20 @@ def parse_pictrl_line(msg: str) -> Optional[Dict[str, Any]]:
             "omega_rps": float(parts[5]),
             "actual_hz": float(parts[6]),
             "target_lb": float(parts[7]),
+            "i_error_a": None,
+            "i_ff_a": None,
+            "i_int_a": None,
+            "i_cmd_unsat_a": None,
+            "back_emf_a": None,
         }
+        if len(parts) >= 12:
+            out["i_error_a"] = float(parts[8])
+            out["i_ff_a"] = float(parts[9])
+            out["i_int_a"] = float(parts[10])
+            out["i_cmd_unsat_a"] = float(parts[11])
+        if len(parts) >= 13:
+            out["back_emf_a"] = float(parts[12])
+        return out
     except (ValueError, IndexError):
         return None
 
@@ -416,7 +430,7 @@ Force Control (PI current loop, runs ON the ESP32):
 The button accepts a FORCE in lbs, NOT a current. A single equation converts force to a current
 target — i_target = amps_per_lb × force (default 2.658 A/lb so 1 lb → 2.658 A) — and the firmware
 runs the PI loop from PI_Dev/PI_ex1.ino at the target Hz, sending setCurrent(i_cmd) each cycle.
-The firmware streams PICTRL,esp32_ms,i_target_a,i_meas_a,i_cmd_a,omega_rps,actual_hz,target_lb
+The firmware streams PICTRL,esp32_ms,i_target_a,i_meas_a,i_cmd_a,omega_rps,actual_hz,target_lb,i_error_a,i_ff_a,i_int_a,i_cmd_unsat_a,back_emf_a
 so the GUI plots commanded vs measured current and reports the loop's true running rate.
 Practical Hz ceiling is the VESC UART read (~10 ms / 115200 baud); pick 50 Hz for headroom.
 PI auto-disables on STOP and on BLE disconnect (motor zeroed).
@@ -655,7 +669,7 @@ class VescControlGui:
         self.var_pi_pole_pairs = tk.IntVar(value=7)
         self.var_pi_actual_hz_str = tk.StringVar(value="Actual: — Hz")
         self.var_pi_eq_str = tk.StringVar(value="i_target = 2.658 A/lb × 0.0 lb = 0.000 A")
-        # PICTRL samples: (t_wall, esp_ms, i_target_a, i_meas_a, i_cmd_a, omega_rps, actual_hz, target_lb)
+        # PICTRL samples: (t_wall, esp_ms, i_target_a, i_meas_a, i_cmd_a, omega_rps, actual_hz, target_lb, i_error_a, i_ff_a, i_int_a, i_cmd_unsat_a, back_emf_a)
         self._pictrl_samples: deque = deque(maxlen=25000)
         self._pi_force_apply_after_id: Optional[str] = None
         self._pi_hz_apply_after_id: Optional[str] = None
@@ -1414,8 +1428,9 @@ class VescControlGui:
         self._send_line(f"PI_PARAMS,{kt:.6f},{ke:.6f},{r:.6f},{l:.8f}")
         self._send_line(f"PI_GAINS,{kp:.6f},{ki:.6f}")
         self._send_line(f"PI_LIMITS,{imax:.4f},{iint_max:.4f},{apl:.6f},{pp}")
+        self._send_line("PI_CONFIG")
         self._update_pi_equation_label()
-        self._log("(PI: applied gains/params/limits)")
+        self._log("(PI: applied gains/params/limits; requested firmware config echo)")
 
     def _on_pi_engage(self) -> None:
         """Enable the PI current loop on the ESP32 and arm the timed-run/CSV machinery."""
@@ -1448,6 +1463,7 @@ class VescControlGui:
             self._send_line("PI_ENABLE,0")
             self._send_line("STOP")
         self.var_pi_enabled.set(False)
+        self._pictrl_samples.clear()
         # Timed-run cancellation + CSV finalization piggybacks on _send_wire("STOP")
         # paths, but Stop Force is a normal-button call and bypasses that. Mirror
         # the manual-STOP behavior here so the run shows up as a recorded capture.
@@ -1467,18 +1483,20 @@ class VescControlGui:
             ).pack(expand=True)
             return
 
-        self._fig = Figure(figsize=(5.5, 10.0), constrained_layout=True)
-        # Create GridSpec with height_ratios: Position, Velocity, Vbat (1x each), Current (3x)
-        gs = GridSpec(4, 1, figure=self._fig, height_ratios=[1, 1, 1, 3])
+        self._fig = Figure(figsize=(5.5, 11.0), constrained_layout=True)
+        # Create GridSpec with height_ratios: Position, Velocity, Vbat, Current (2x), PI internals (2x)
+        gs = GridSpec(5, 1, figure=self._fig, height_ratios=[1, 1, 1, 2, 2])
         ax0 = self._fig.add_subplot(gs[0])
         ax1 = self._fig.add_subplot(gs[1], sharex=ax0)
         ax2 = self._fig.add_subplot(gs[2], sharex=ax0)
         ax3 = self._fig.add_subplot(gs[3], sharex=ax0)
+        ax4 = self._fig.add_subplot(gs[4], sharex=ax0)
         ax0.set_ylabel("Pos (m)")
         ax1.set_ylabel("Vel (m/s)")
         ax2.set_ylabel("Vbat")
         ax3.set_ylabel("A (signed)")
-        ax3.set_xlabel("Time in window (s)")
+        ax4.set_ylabel("PI internal (A)")
+        ax4.set_xlabel("Time in window (s)")
         (self._ln_telem_enc_pos,) = ax0.plot([], [], color="tab:green", lw=1.2)
         (self._ln_enc_vel,) = ax1.plot([], [], color="tab:purple", lw=1)
         (self._ln_v,) = ax2.plot([], [], "g-", lw=1)
@@ -1505,7 +1523,12 @@ class VescControlGui:
         )
         ax3.axhline(0.0, color="0.65", lw=0.7, zorder=2)
         ax3.legend(loc="upper right", fontsize=7)
-        self._telem_axes = (ax0, ax1, ax2, ax3)
+        (self._ln_i_ff,) = ax4.plot([], [], color="#ff7f0e", lw=1.0, linestyle="-.", label="I ff", zorder=3)
+        (self._ln_i_int,) = ax4.plot([], [], color="#8c564b", lw=1.0, linestyle="-", label="I int", zorder=3)
+        (self._ln_i_error,) = ax4.plot([], [], color="#17becf", lw=1.0, linestyle=(0, (3, 1, 1, 1)), label="I error", zorder=3)
+        ax4.axhline(0.0, color="0.65", lw=0.7, zorder=2)
+        ax4.legend(loc="upper right", fontsize=7)
+        self._telem_axes = (ax0, ax1, ax2, ax3, ax4)
         self._ln_enc_pos = self._ln_telem_enc_pos
 
         self._canvas = FigureCanvasTkAgg(self._fig, master=parent)
@@ -1606,6 +1629,11 @@ class VescControlGui:
                 float(d["omega_rps"]),
                 float(d["actual_hz"]),
                 float(d["target_lb"]),
+                d.get("i_error_a"),
+                d.get("i_ff_a"),
+                d.get("i_int_a"),
+                d.get("i_cmd_unsat_a"),
+                d.get("back_emf_a"),
             )
         )
         # Display the loop's actual rate as soon as samples arrive.
@@ -1703,6 +1731,9 @@ class VescControlGui:
         pic_x: List[float] = []
         pic_target: List[float] = []
         pic_cmd: List[float] = []
+        pic_error: List[float] = []
+        pic_ff: List[float] = []
+        pic_int: List[float] = []
         for row in self._pictrl_samples:
             t_wall = row[0]
             if t_wall < t_start:
@@ -1710,6 +1741,9 @@ class VescControlGui:
             pic_x.append(t_wall - t_start)
             pic_target.append(row[2])
             pic_cmd.append(row[4])
+            pic_error.append(row[8] if row[8] is not None else float('nan'))
+            pic_ff.append(row[9] if row[9] is not None else float('nan'))
+            pic_int.append(row[10] if row[10] is not None else float('nan'))
 
         if hasattr(self, "_ln_telem_enc_pos"):
             self._ln_telem_enc_pos.set_data(enc_x, enc_pos)
@@ -1758,16 +1792,25 @@ class VescControlGui:
         if hasattr(self, "_ln_i_target"):
             self._ln_i_target.set_data(pic_x, pic_target)
             self._ln_i_cmd.set_data(pic_x, pic_cmd)
+        if hasattr(self, "_ln_i_ff"):
+            self._ln_i_ff.set_data(pic_x, pic_ff)
+            self._ln_i_int.set_data(pic_x, pic_int)
+            self._ln_i_error.set_data(pic_x, pic_error)
 
         self._telem_axes[0].set_xlim(0.0, tw)
         has_telem = bool(xs)
         has_enc = bool(enc_x)
         has_pictrl = bool(pic_x)
         if has_telem or has_enc or has_pictrl:
-            for ax in self._telem_axes:
+            for ax in self._telem_axes[:4]:
                 ax.relim()
                 ax.autoscale_view(scalex=False)
-            self._telem_axes[0].set_xlim(0.0, tw)
+            if has_pictrl:
+                pic_ax = self._telem_axes[4]
+                pic_ax.relim()
+                pic_ax.autoscale_view(scalex=False)
+            else:
+                self._telem_axes[4].set_ylim(-1.0, 1.0)
         self._canvas.draw_idle()
 
     def _clear_enc_data(self) -> None:
@@ -1918,13 +1961,17 @@ class VescControlGui:
             "i_target_a",
             "i_cmd_a",
             "omega_rps",
+            "i_error_a",
+            "i_ff_a",
+            "i_int_a",
+            "i_cmd_unsat_a",
         ]
 
         # Sort PICTRL samples by device_ms for the same nearest-neighbor walk
         # we use on ENC. Tolerance is wider than ENC because PICTRL can be
         # decimated by the firmware (≤100 Hz emit).
         PIC_PAIR_TOL_MS = 100
-        pic_sorted: List[Tuple[int, float, float, float, float]] = []
+        pic_sorted: List[Tuple[int, float, float, float, float, Any, Any, Any, Any]] = []
         for row in self._pictrl_samples:
             tw, esp_ms = row[0], int(row[1])
             if use_dev:
@@ -1936,8 +1983,18 @@ class VescControlGui:
             else:
                 if not (t0_wall <= tw <= t_end):
                     continue
-            # row = (tw, esp_ms, i_target, i_meas, i_cmd, omega, actual_hz, target_lb)
-            pic_sorted.append((esp_ms, float(row[7]), float(row[2]), float(row[4]), float(row[5])))
+            # row = (tw, esp_ms, i_target, i_meas, i_cmd, omega, actual_hz, target_lb, i_error, i_ff, i_int, i_cmd_unsat)
+            pic_sorted.append((
+                esp_ms,
+                float(row[7]),
+                float(row[2]),
+                float(row[4]),
+                float(row[5]),
+                row[8] if row[8] is not None else "",
+                row[9] if row[9] is not None else "",
+                row[10] if row[10] is not None else "",
+                row[11] if row[11] is not None else "",
+            ))
         pic_sorted.sort(key=lambda r: r[0])
 
         def _pic_blank() -> Dict[str, Any]:
@@ -1946,17 +2003,25 @@ class VescControlGui:
                 "i_target_a": "",
                 "i_cmd_a": "",
                 "omega_rps": "",
+                "i_error_a": "",
+                "i_ff_a": "",
+                "i_int_a": "",
+                "i_cmd_unsat_a": "",
             }
 
         def _pic_fields_for(idx: Optional[int]) -> Dict[str, Any]:
             if idx is None or not pic_sorted:
                 return _pic_blank()
-            _ms, lb, it, ic, om = pic_sorted[idx]
+            _ms, lb, it, ic, om, ie, iff, ii, iu = pic_sorted[idx]
             return {
                 "force_target_lb": lb,
                 "i_target_a": it,
                 "i_cmd_a": ic,
                 "omega_rps": om,
+                "i_error_a": ie,
+                "i_ff_a": iff,
+                "i_int_a": ii,
+                "i_cmd_unsat_a": iu,
             }
 
         rows_out: List[Dict[str, Any]] = []
