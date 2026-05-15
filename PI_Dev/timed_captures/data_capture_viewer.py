@@ -291,6 +291,8 @@ class DataCaptureViewer(tk.Tk):
         self._solo_idx: int = 0
         self._hover_cids: list[int] = []
         self._hover_track: list[dict] = []
+        self._avg_selection: dict[str, object] | None = None
+        self._avg_click_cid: int | None = None
 
         self._build_ui()
         self.bind("<Left>", lambda e: self._prev_file())
@@ -421,6 +423,7 @@ class DataCaptureViewer(tk.Tk):
         self._canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self._toolbar = NavigationToolbar2Tk(self._canvas, self)
         self._toolbar.update()
+        self._avg_click_cid = self._canvas.mpl_connect("button_press_event", self._on_click_event)
 
     def _display_path(self, p: Path) -> str:
         try:
@@ -555,6 +558,7 @@ class DataCaptureViewer(tk.Tk):
 
         try:
             self._df = load_dataframe(path, self._current_sheet)
+            self._avg_selection = None
         except Exception as e:
             messagebox.showerror("Load error", f"{path.name}:\n{e}")
             self._df = None
@@ -573,6 +577,7 @@ class DataCaptureViewer(tk.Tk):
         path = self._files[self._index]
         try:
             self._df = load_dataframe(path, self._current_sheet)
+            self._avg_selection = None
         except Exception as e:
             messagebox.showerror("Load error", f"{path.name}:\n{e}")
             self._df = None
@@ -969,6 +974,99 @@ class DataCaptureViewer(tk.Tk):
         self._hover_cids = []
         self._hover_track = []
 
+    def _reset_avg_selection(self) -> None:
+        self._avg_selection = None
+
+    def _compute_average_for_range(self, col: str, t0: float, t1: float) -> tuple[float | None, int]:
+        if self._df is None or self._time_col is None or col not in self._df.columns:
+            return None, 0
+        t = pd.to_numeric(self._df[self._time_col], errors="coerce")
+        y = pd.to_numeric(self._df[col], errors="coerce")
+        lo, hi = float(min(t0, t1)), float(max(t0, t1))
+        mask = np.isfinite(t) & np.isfinite(y) & (t >= lo) & (t <= hi)
+        n = int(mask.sum())
+        if n == 0:
+            return None, 0
+        return float(y[mask].mean()), n
+
+    def _find_selection_column(self, ax) -> str | None:
+        return next((h["col"] for h in self._hover_track if h["ax"] is ax), None)
+
+    def _on_click_event(self, event) -> None:
+        if event.button != 1 or event.inaxes is None or self._df is None or self._time_col is None:
+            return
+        if event.xdata is None or not np.isfinite(float(event.xdata)):
+            return
+        col = self._find_selection_column(event.inaxes)
+        if col is None:
+            return
+        x = float(event.xdata)
+        if self._avg_selection is None:
+            self._avg_selection = {"col": col, "t0": x}
+            self._redraw()
+            return
+        if self._avg_selection.get("t1") is not None:
+            self._avg_selection = None
+            self._redraw()
+            return
+        if self._avg_selection["col"] != col:
+            self._avg_selection = {"col": col, "t0": x}
+            self._redraw()
+            return
+        self._avg_selection["t1"] = x
+        self._redraw()
+
+    def _draw_avg_selection(self, show: list[str], axes: np.ndarray) -> None:
+        if self._avg_selection is None or self._df is None or self._time_col is None:
+            return
+        col = self._avg_selection.get("col")
+        if col not in show:
+            return
+        try:
+            idx = show.index(col)
+        except ValueError:
+            return
+        ax = axes[idx, 0]
+        t0 = float(self._avg_selection["t0"])
+        t1 = self._avg_selection.get("t1")
+        ax.axvline(t0, color="seagreen", ls="--", lw=1.2, zorder=4)
+        if t1 is None:
+            ax.text(
+                0.98,
+                0.02,
+                "avg start",
+                transform=ax.transAxes,
+                va="bottom",
+                ha="right",
+                fontsize=8,
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.9),
+                zorder=5,
+            )
+            return
+        t1 = float(t1)
+        lo, hi = float(min(t0, t1)), float(max(t0, t1))
+        ax.axvspan(lo, hi, color="lightblue", alpha=0.14, zorder=0)
+        ax.axvline(lo, color="seagreen", ls="--", lw=1.2, zorder=4)
+        ax.axvline(hi, color="firebrick", ls="--", lw=1.2, zorder=4)
+        mean, n = self._compute_average_for_range(col, t0, t1)
+        if mean is not None:
+            ax.hlines(mean, lo, hi, colors="navy", linestyles=":", linewidth=1.3, zorder=4)
+            msg = f"avg {mean:.5g} ({n} pts)"
+        else:
+            msg = "No data in range"
+        ax.text(
+            0.98,
+            0.02,
+            msg,
+            transform=ax.transAxes,
+            va="bottom",
+            ha="right",
+            fontsize=8,
+            color="navy",
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.9),
+            zorder=5,
+        )
+
     def _on_hover_motion(self, event) -> None:
         track = self._hover_track
         if not track:
@@ -1141,6 +1239,7 @@ class DataCaptureViewer(tk.Tk):
                 self._canvas.mpl_connect("figure_leave_event", self._on_hover_leave_figure),
             ]
 
+        self._draw_avg_selection(show, axes)
         axes[-1, 0].set_xlabel(self._time_col)
         self._canvas.draw()
 

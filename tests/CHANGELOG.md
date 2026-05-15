@@ -1,5 +1,36 @@
 # Motor + Encoder + Current Test — Change Log
 
+## 2026-05-06
+
+**Setpoint-gated motion flow**
+- `vesc_current_control.py`: added a `Setpoint` UI button and setpoint status readout. Motion/force commands are now blocked in the host until a setpoint is captured.
+- `vescNewCurrent.ino`: added `SETPOINT` command support and firmware-side setpoint enforcement so motion commands are refused until setpoint is set.
+
+**Approach behavior near setpoint**
+- `vescNewCurrent.ino`: added simple proportional slow-down based on encoder position when within 2 m of setpoint, plus setpoint-reached detection.
+- `vescNewCurrent.ino` + `vesc_current_control.py`: when setpoint is reached, firmware emits a non-error info event and repeated STOP acknowledgements; UI reflects this as a stop event (not a safety error).
+
+**Error reset without app restart**
+- `vescNewCurrent.ino`: added `SAFETY_RESET` (alias `CLEAR_ERROR`) to clear latched safety-stop state and controller internals so commands can run again immediately.
+- `vesc_current_control.py`: clicking the Error indicator now sends `SAFETY_RESET` and clears UI stop/error state on `OK,SAFETY_RESET`.
+
+**Timed run: distance + time stop**
+- `vesc_current_control.py`: Run timing panel now includes "Auto-stop after distance (m)" (default 10 m). During timed runs, either condition can end the run: distance threshold OR time threshold (whichever happens first).
+- Time-based stop remains active as fallback if distance is not reached.
+
+**Rewind feature**
+- `vesc_current_control.py`: added manual `Rewind` button and `Auto-rewind at end of run` checkbox.
+- Rewind sequence: `SET_BRAKE,<brake_A>` for 2s, then `STOP`, then `SET_DUTY,0.03` pull-in until firmware setpoint stop is reached.
+
+**iOS Train tab protocol alignment**
+- `QuikburstApp/QuikburstApp/TrainTabView.swift`: rebuilt Train UI around `vescNewCurrent.ino` text commands over BLE (`SETPOINT`, `SET_DUTY`, `SET_CURRENT`, `SET_BRAKE`, `STOP`, `ENC_STREAM`, `TELEM_STREAM`).
+- Added Train/Monitor sections with forced setpoint gate, force-to-current preview (`2.658 A/lb`), optional distance stop, auto-rewind, manual rewind, hold-to-pull control, and monitor charts (position, velocity, motor current).
+- Runs now finalize into a post-stop data popup and are persisted to app history via `SessionResultStore` with encoder traces and derived metrics.
+
+**Setpoint override spool-in**
+- `vesc_current_control.py`: added `Override spool-in (hold)` button that commands spool-in at `0.05` duty on press and sends `STOP` on release.
+- `vescNewCurrent.ino`: added `OVERRIDE_SPOOL_IN,<duty>` command to bypass setpoint-gated command checks for manual spool-in recovery use cases.
+
 ## 2026-04-02
 
 **VESC GUI connect retry**

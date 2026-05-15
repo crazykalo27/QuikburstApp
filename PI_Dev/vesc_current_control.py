@@ -420,7 +420,9 @@ async def ble_ping_test(client, link: BleLineLink, log: Callable[[str], None]) -
 HELP_TEXT = """
 Commands (BLE):
   PING, SET_CURRENT,<A>, SET_BRAKE[,<A>] (omit A for firmware default brake current), SET_DUTY,<d> (duty capped at 0.20),
-  STOP, GET_VALUES, GET_FW, KEEPALIVE,
+  SET_NUNCHUCK,<0-255> (0=brake, 127=neutral, 255=full forward),
+  OVERRIDE_SPOOL_IN,<duty> (bypass setpoint requirement for manual spool-in),
+  STOP, SAFETY_RESET (or CLEAR_ERROR), GET_VALUES, GET_FW, KEEPALIVE,
   ENC_RESET, ENC_STREAM,<0|1>[,<ms>], TELEM_STREAM,<0|1>[,<ms>],
   PI_ENABLE,<0|1>, PI_FORCE,<lbs>, PI_TARGET,<A>, PI_HZ,<hz>,
   PI_GAINS,<Kp>,<Ki>, PI_PARAMS,<Kt>,<Ke>,<R>,<L>,
@@ -478,6 +480,13 @@ def protocol_line_from_user_input(raw: str) -> str:
     if verb == "SET_DUTY" and len(parts) == 2:
         d = clamp_duty_str(parts[1])
         return f"SET_DUTY,{d:.4f}"
+    if verb == "SET_NUNCHUCK" and len(parts) == 2:
+        try:
+            nv = int(float(parts[1]))
+            nv = max(0, min(255, nv))
+        except ValueError:
+            nv = 127
+        return f"SET_NUNCHUCK,{nv}"
     if verb == "ENC_RESET":
         return "ENC_RESET"
     if verb == "ENC_STREAM" and len(parts) == 2:
@@ -585,12 +594,15 @@ class VescControlGui:
         self._ble_ready = threading.Event()
         self.status = tk.StringVar(value="Disconnected")
         self.var_safety_stop_reason = tk.StringVar(value="Last stop: none")
+        self.var_setpoint_status = tk.StringVar(value="Setpoint: not set")
         self.ble_name = tk.StringVar(value="Quikburst")
         self.ble_addr = tk.StringVar(value="")
         self.scan_timeout = tk.DoubleVar(value=12.0)
         self.var_ping = tk.BooleanVar(value=True)
         self.var_run_duration_s = tk.DoubleVar(value=5.0)
+        self.var_run_distance_m = tk.DoubleVar(value=10.0)
         self.var_keepalive_s = tk.DoubleVar(value=0.5)
+        self.var_auto_rewind = tk.BooleanVar(value=False)
         self.var_export_csv_timed = tk.BooleanVar(value=False)
         # Default on: resample the capture onto a uniform device_ms grid in the
         # CSV so every row is exactly 'grid ms' apart regardless of BLE/VESC
@@ -606,7 +618,15 @@ class VescControlGui:
         self._timed_keepalive_after_id: Optional[str] = None
         self._timed_deadline = 0.0
         self._timed_ka_interval_s = 0.0
+        self._timed_distance_limit_m = 0.0
+        self._timed_start_pos_m: Optional[float] = None
+        self._timed_upper_pos_limit_m: Optional[float] = None
+        self._timed_lower_pos_limit_m: Optional[float] = None
         self._timed_run_is_test = False
+        self._rewind_after_id: Optional[str] = None
+        self._rewind_active = False
+        self._override_hold_active = False
+        self._override_keepalive_after_id: Optional[str] = None
         # Wall-clock anchor + duration for the live "TEST / RUN  3.2 / 10 s" readout.
         self._timed_start_wall: Optional[float] = None
         self._timed_total_s: float = 0.0
@@ -690,6 +710,8 @@ class VescControlGui:
         self._indicator_clear_after: Dict[str, Optional[str]] = {}
         self._ready_last_wall: Optional[float] = None
         self._error_last_msg: Optional[str] = None
+        self._setpoint_ready = False
+        self._last_enc_position_m: Optional[float] = None
 
         self._build()
         self.root.after(20, self._pump_ui_queue)
@@ -893,6 +915,9 @@ class VescControlGui:
         ttk.Label(time_fr, text="Keepalive every (s), 0 = off:").grid(row=1, column=0, sticky=tk.NW)
         sb_ka = ttk.Spinbox(time_fr, from_=0, to=30, increment=0.5, textvariable=self.var_keepalive_s, width=8)
         sb_ka.grid(row=1, column=1, sticky=tk.W, padx=(6, 0), pady=(0, 4))
+        ttk.Label(time_fr, text="Auto-stop after distance (m), 0 = off:").grid(row=2, column=0, sticky=tk.NW)
+        sb_dist = ttk.Spinbox(time_fr, from_=0, to=500, increment=0.5, textvariable=self.var_run_distance_m, width=8)
+        sb_dist.grid(row=2, column=1, sticky=tk.W, padx=(6, 0), pady=(0, 4))
         ttk.Label(
             time_fr,
             text="Short runouts are usually VESC APP/UART timeout — keepalive 0.5–2s helps. Cap is host + firmware.",
@@ -900,7 +925,7 @@ class VescControlGui:
             foreground="#444",
             wraplength=260,
             justify=tk.LEFT,
-        ).grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
         tk.Checkbutton(
             time_fr,
             text="Export TELEM + ENC + PI to CSV (motor commands + Test + Force-engage; N>0 s → auto STOP+CSV; N=0 → CSV on STOP)",
@@ -909,8 +934,15 @@ class VescControlGui:
             justify=tk.LEFT,
             anchor=tk.W,
             highlightthickness=0,
-        ).grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
-        self.cmd_widgets.extend([sb_dur, sb_ka])
+        ).grid(row=4, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
+        tk.Checkbutton(
+            time_fr,
+            text="Auto-rewind at end of run",
+            variable=self.var_auto_rewind,
+            anchor=tk.W,
+            highlightthickness=0,
+        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        self.cmd_widgets.extend([sb_dur, sb_ka, sb_dist])
 
         # ── Direct command panel (raw VESC current/brake/duty) ──
         cmd_fr = ttk.LabelFrame(left_inner, text="Direct command (raw VESC: A / brake A / duty)", padding=8)
@@ -932,21 +964,31 @@ class VescControlGui:
         self.var_cur = tk.StringVar(value="0")
         self.var_brake = tk.StringVar(value="120")
         self.var_duty = tk.StringVar(value="0")
+        self.var_nunchuck = tk.StringVar(value="127")
 
         row_param(0, "Current (A)", self.var_cur, "Set current", "SET_CURRENT")
         row_param(1, "Brake current (A)", self.var_brake, "Set brake", "SET_BRAKE")
         row_param(2, f"Duty (0–{MAX_DUTY:.2f} max)", self.var_duty, "Set duty", "SET_DUTY")
+        row_param(3, "Nunchuck (0–255)", self.var_nunchuck, "Set nunchuck", "SET_NUNCHUCK")
 
         quick = ttk.Frame(cmd_fr)
-        quick.grid(row=3, column=0, columnspan=3, sticky=tk.EW, pady=(10, 0))
+        quick.grid(row=4, column=0, columnspan=3, sticky=tk.EW, pady=(10, 0))
         quick.columnconfigure(0, weight=1)
         quick.columnconfigure(1, weight=1)
+        quick.columnconfigure(2, weight=1)
+        quick.columnconfigure(3, weight=1)
         b_stop = ttk.Button(quick, text="STOP", command=lambda: self._send_wire("STOP"))
         b_stop.grid(row=0, column=0, padx=(0, 4), pady=(0, 4), sticky=tk.EW)
         self.cmd_widgets.append(b_stop)
         btn_test = ttk.Button(quick, text="Test", command=self._on_test_freewheel_record)
         btn_test.grid(row=0, column=1, padx=(4, 0), pady=(0, 4), sticky=tk.EW)
         self.cmd_widgets.append(btn_test)
+        btn_setpoint = ttk.Button(quick, text="Setpoint", command=self._on_setpoint_capture)
+        btn_setpoint.grid(row=0, column=2, padx=(4, 0), pady=(0, 4), sticky=tk.EW)
+        self.cmd_widgets.append(btn_setpoint)
+        btn_rewind = ttk.Button(quick, text="Rewind", command=self._on_rewind_button)
+        btn_rewind.grid(row=0, column=3, padx=(4, 0), pady=(0, 4), sticky=tk.EW)
+        self.cmd_widgets.append(btn_rewind)
         q_r = 1
         q_c = 0
         for text, wire in (
@@ -969,6 +1011,18 @@ class VescControlGui:
             pady=(4, 0),
             sticky=tk.EW,
         )
+        btn_override_spool = ttk.Button(quick, text="Override spool-in (hold)")
+        btn_override_spool.grid(
+            row=q_r + 1,
+            column=0,
+            columnspan=2,
+            pady=(4, 0),
+            sticky=tk.EW,
+        )
+        btn_override_spool.bind("<ButtonPress-1>", self._on_setpoint_override_spool_press)
+        btn_override_spool.bind("<ButtonRelease-1>", self._on_setpoint_override_spool_release)
+        btn_override_spool.bind("<Leave>", self._on_setpoint_override_spool_release)
+        self.cmd_widgets.append(btn_override_spool)
 
         raw_fr = ttk.Frame(cmd_fr)
         raw_fr.grid(row=4, column=0, columnspan=3, sticky=tk.EW, pady=(10, 0))
@@ -1051,6 +1105,7 @@ class VescControlGui:
         ttk.Button(enc_row, text="Apply", command=self._apply_graph_windows).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(enc_row, text="Clear graph", command=self._clear_telem_data).pack(side=tk.LEFT)
         self.cmd_widgets.append(sb_telem_win)
+        ttk.Label(enc_row, textvariable=self.var_setpoint_status, foreground="#06c").pack(side=tk.RIGHT, padx=(8, 0))
 
         # CSV export cadence lives with the live-stream settings so the live poll
         # rate and the exported-grid rate are tuned side by side (they're independent).
@@ -1166,6 +1221,8 @@ class VescControlGui:
         self._error_last_msg = None
         self.var_safety_stop_reason.set("Last stop: none")
         self._set_indicator("error", False)
+        if self._is_connected():
+            self._send_line("SAFETY_RESET")
 
     def _tick_run_status(self) -> None:
         """Update the 'Run: TEST/RUN  elapsed / total s' readout in the link-status strip."""
@@ -1235,6 +1292,25 @@ class VescControlGui:
             else:
                 self.var_safety_stop_reason.set(f"Error: {core[6:]}")
             return
+        if up == "OK,SAFETY_RESET":
+            self._error_last_msg = None
+            self.var_safety_stop_reason.set("Last stop: none")
+            self._set_indicator("error", False)
+            return
+        if up.startswith("WARN,SETPOINT_REQUIRED"):
+            self.var_setpoint_status.set("Setpoint: required before motion commands")
+            self._set_indicator("error", True)
+            return
+        if up.startswith("OK,SETPOINT"):
+            self._setpoint_ready = True
+            self.var_setpoint_status.set(core.replace("OK,", "Setpoint set: "))
+            self._set_indicator("error", False)
+            return
+        if up.startswith("INFO,SETPOINT_REACHED"):
+            self.var_safety_stop_reason.set("Last stop: setpoint reached")
+            self._pulse_indicator("stop", 1000)
+            self._rewind_active = False
+            return
         if up == "OK,STOP":
             self._pulse_indicator("stop", 800)
             return
@@ -1242,6 +1318,7 @@ class VescControlGui:
             up.startswith("OK,SET_CURRENT")
             or up.startswith("OK,SET_DUTY")
             or up.startswith("OK,SET_BRAKE")
+            or up.startswith("OK,SET_NUNCHUCK")
             or up == "OK,KEEPALIVE"
             or up.startswith("OK,ENC_")
             or up.startswith("OK,PI_")
@@ -1437,6 +1514,8 @@ class VescControlGui:
         if not self._is_connected():
             messagebox.showwarning("Not connected", "Connect over Bluetooth first.")
             return
+        if not self._ensure_setpoint_ready():
+            return
         # Push the latest constants + Hz before enabling so the loop starts on the
         # config the user can see in the UI, not whatever the ESP32 had last.
         self._apply_pi_constants()
@@ -1459,6 +1538,7 @@ class VescControlGui:
         )
 
     def _on_pi_stop(self) -> None:
+        self._cancel_rewind_sequence()
         if self._is_connected():
             self._send_line("PI_ENABLE,0")
             self._send_line("STOP")
@@ -2308,6 +2388,8 @@ class VescControlGui:
         d = parse_enc_line(payload)
         if d is None:
             return
+        self._last_enc_position_m = float(d["position_m"])
+        self._timed_run_check_distance_stop()
         tw = self._wall_from_esp_millis(int(d["time_ms"]))
         self._enc_samples.append(
             (
@@ -2439,6 +2521,9 @@ class VescControlGui:
                     self.status.set(payload)
                 elif kind == "connected":
                     self._reset_device_time_anchor()
+                    self._setpoint_ready = False
+                    self._last_enc_position_m = None
+                    self.var_setpoint_status.set("Setpoint: not set")
                     self._apply_connected_state(True)
                 elif kind == "post_connect_enc":
                     self._sync_enc_stream_to_firmware()
@@ -2456,6 +2541,9 @@ class VescControlGui:
                     # that in the UI so a reconnect doesn't show stale state.
                     self.var_pi_enabled.set(False)
                     self.var_pi_actual_hz_str.set("Actual: — Hz")
+                    self._setpoint_ready = False
+                    self._last_enc_position_m = None
+                    self.var_setpoint_status.set("Setpoint: not set")
                     self._ready_last_wall = None
                     for k in ("ready", "motor", "stop", "error"):
                         self._set_indicator(k, False)
@@ -2504,11 +2592,20 @@ class VescControlGui:
             self._timed_keepalive_after_id = None
         self._timed_deadline = 0.0
         self._timed_ka_interval_s = 0.0
+        self._timed_distance_limit_m = 0.0
+        self._timed_start_pos_m = None
+        self._timed_upper_pos_limit_m = None
+        self._timed_lower_pos_limit_m = None
         self._timed_run_is_test = False
         self._timed_start_wall = None
         self._timed_total_s = 0.0
 
-    def _schedule_timed_run(self, duration_s: float, keepalive_interval_s: float) -> None:
+    def _schedule_timed_run(
+        self,
+        duration_s: float,
+        keepalive_interval_s: float,
+        distance_limit_m: float,
+    ) -> None:
         self._cancel_timed_run()
         if duration_s <= 0:
             return
@@ -2516,16 +2613,27 @@ class VescControlGui:
         self._timed_start_wall = time.time()
         self._timed_total_s = float(duration_s)
         self._timed_ka_interval_s = max(0.0, keepalive_interval_s)
+        self._timed_distance_limit_m = max(0.0, distance_limit_m)
+        self._timed_start_pos_m = self._last_enc_position_m
+        if self._timed_start_pos_m is not None and self._timed_distance_limit_m > 0:
+            self._timed_upper_pos_limit_m = self._timed_start_pos_m + self._timed_distance_limit_m
+            self._timed_lower_pos_limit_m = self._timed_start_pos_m - self._timed_distance_limit_m
+        else:
+            self._timed_upper_pos_limit_m = None
+            self._timed_lower_pos_limit_m = None
         dur_ms = int(max(0.05, duration_s) * 1000)
         self._timed_stop_after_id = self.root.after(dur_ms, self._timed_run_fire_stop)
         if self._timed_ka_interval_s > 0:
             ka_ms = max(200, int(self._timed_ka_interval_s * 1000))
             self._timed_keepalive_after_id = self.root.after(ka_ms, self._timed_run_keepalive_tick)
-            self._log(
-                f"(Timed: STOP in {duration_s:.1f}s; KEEPALIVE every {self._timed_ka_interval_s:.1f}s)"
-            )
+            self._log(f"(Timed: STOP in {duration_s:.1f}s; KEEPALIVE every {self._timed_ka_interval_s:.1f}s)")
         else:
             self._log(f"(Timed: STOP in {duration_s:.1f}s; no keepalive)")
+        if self._timed_distance_limit_m > 0:
+            self._log(
+                f"(Timed: distance stop armed at start±{self._timed_distance_limit_m:.2f} m"
+                f"{'' if self._timed_start_pos_m is not None else '; waiting for ENC sample'})"
+            )
 
     def _timed_run_fire_stop(self) -> None:
         self._timed_stop_after_id = None
@@ -2545,6 +2653,39 @@ class VescControlGui:
         self._export_timed_run_csv(t_end, reason)
         self._send_line("STOP")
         self._log("(Timed run: sent STOP)")
+        self._maybe_auto_rewind_after_run(reason)
+
+    def _timed_run_check_distance_stop(self) -> None:
+        if self._timed_distance_limit_m <= 0:
+            return
+        if self._timed_start_wall is None:
+            return
+        cur = self._last_enc_position_m
+        if cur is None:
+            return
+        if self._timed_start_pos_m is None:
+            self._timed_start_pos_m = cur
+            self._timed_upper_pos_limit_m = cur + self._timed_distance_limit_m
+            self._timed_lower_pos_limit_m = cur - self._timed_distance_limit_m
+            return
+        upper = self._timed_upper_pos_limit_m
+        lower = self._timed_lower_pos_limit_m
+        if upper is None or lower is None:
+            upper = self._timed_start_pos_m + self._timed_distance_limit_m
+            lower = self._timed_start_pos_m - self._timed_distance_limit_m
+            self._timed_upper_pos_limit_m = upper
+            self._timed_lower_pos_limit_m = lower
+        if cur < upper and cur > lower:
+            return
+        self._export_timed_run_csv(time.time(), "distance_stop")
+        self._cancel_timed_run()
+        self._send_line("STOP")
+        which = "upper" if cur >= upper else "lower"
+        self._log(
+            f"(Timed run: distance stop ({which} bound) at pos={cur:.2f} m; "
+            f"limits=[{lower:.2f}, {upper:.2f}] m)"
+        )
+        self._maybe_auto_rewind_after_run("distance_stop")
 
     def _timed_run_keepalive_tick(self) -> None:
         self._timed_keepalive_after_id = None
@@ -2563,13 +2704,124 @@ class VescControlGui:
             or u == "SET_BRAKE"
             or u.startswith("SET_BRAKE,")
             or u.startswith("SET_DUTY,")
+            or u.startswith("SET_NUNCHUCK,")
         )
+
+    @staticmethod
+    def _line_requires_setpoint(line: str) -> bool:
+        u = line.strip().upper()
+        return (
+            VescControlGui._line_starts_motor_set(u)
+            or u.startswith("PI_ENABLE,1")
+            or u.startswith("PI_FORCE,")
+            or u.startswith("PI_TARGET,")
+        )
+
+    def _ensure_setpoint_ready(self) -> bool:
+        if self._setpoint_ready:
+            return True
+        self.var_setpoint_status.set("Setpoint: press Setpoint before commands")
+        messagebox.showwarning("Setpoint required", "Press Setpoint before sending motion commands.")
+        return False
+
+    def _on_setpoint_capture(self) -> None:
+        if not self._is_connected():
+            messagebox.showwarning("Not connected", "Connect over Bluetooth first.")
+            return
+        if self._last_enc_position_m is None:
+            messagebox.showwarning("No encoder data", "Wait for ENC stream samples, then press Setpoint.")
+            return
+        self._send_line("SETPOINT")
+
+    def _cancel_rewind_sequence(self) -> None:
+        if self._rewind_after_id is not None:
+            try:
+                self.root.after_cancel(self._rewind_after_id)
+            except Exception:
+                pass
+            self._rewind_after_id = None
+        self._rewind_active = False
+
+    def _start_rewind_sequence(self, source: str) -> None:
+        if self._rewind_active:
+            self._log("(Rewind already active)")
+            return
+        if not self._is_connected():
+            self._log("(Rewind skipped: not connected)")
+            return
+        if not self._ensure_setpoint_ready():
+            self._log("(Rewind skipped: setpoint not set)")
+            return
+        try:
+            brake_amps = max(0.0, float(self.var_brake.get()))
+        except (tk.TclError, ValueError):
+            brake_amps = 120.0
+        self._rewind_active = True
+        self._send_line(f"SET_BRAKE,{brake_amps:.3f}")
+        self._log(f"(Rewind: brake current {brake_amps:.2f} A for 2.0 s [{source}])")
+        self._rewind_after_id = self.root.after(2000, self._rewind_phase2_pull_in)
+
+    def _rewind_phase2_pull_in(self) -> None:
+        self._rewind_after_id = None
+        if not self._rewind_active:
+            return
+        if not self._is_connected():
+            self._rewind_active = False
+            return
+        self._send_line("STOP")
+        self._send_line("SET_DUTY,0.1200")
+        self._log("(Rewind: STOP then pull-in at duty 0.03 until setpoint stop)")
+
+    def _maybe_auto_rewind_after_run(self, reason: str) -> None:
+        if not self.var_auto_rewind.get():
+            return
+        self._start_rewind_sequence(f"auto:{reason}")
+
+    def _on_rewind_button(self) -> None:
+        self._start_rewind_sequence("manual_button")
+
+    def _cancel_override_hold_keepalive(self) -> None:
+        if self._override_keepalive_after_id is not None:
+            try:
+                self.root.after_cancel(self._override_keepalive_after_id)
+            except Exception:
+                pass
+            self._override_keepalive_after_id = None
+        self._override_hold_active = False
+
+    def _override_hold_keepalive_tick(self) -> None:
+        self._override_keepalive_after_id = None
+        if not self._override_hold_active or not self._is_connected():
+            return
+        self._send_line("KEEPALIVE")
+        self._override_keepalive_after_id = self.root.after(500, self._override_hold_keepalive_tick)
+
+    def _on_setpoint_override_spool_press(self, _event: Any = None) -> None:
+        if not self._is_connected():
+            return
+        if self._override_hold_active:
+            return
+        self._override_hold_active = True
+        self._send_line("OVERRIDE_SPOOL_IN,0.1200")
+        self._log("(Setpoint override: spool-in at duty 0.12 while held; keepalive active)")
+        self._send_line("KEEPALIVE")
+        self._override_keepalive_after_id = self.root.after(500, self._override_hold_keepalive_tick)
+
+    def _on_setpoint_override_spool_release(self, _event: Any = None) -> None:
+        self._cancel_override_hold_keepalive()
+        if not self._is_connected():
+            return
+        self._send_line("STOP")
 
     def _maybe_arm_timed_run(self, *, force_csv: bool = False, from_test: bool = False) -> None:
         try:
             dur = float(self.var_run_duration_s.get())
         except (tk.TclError, ValueError):
             dur = 0.0
+        try:
+            dist_m = float(self.var_run_distance_m.get())
+        except (tk.TclError, ValueError):
+            dist_m = 0.0
         try:
             ka = float(self.var_keepalive_s.get())
         except (tk.TclError, ValueError):
@@ -2581,7 +2833,7 @@ class VescControlGui:
             self._csv_timed_capture_start = None
             self._csv_device_ms_start = None
         if dur > 0:
-            self._schedule_timed_run(dur, max(0.0, ka))
+            self._schedule_timed_run(dur, max(0.0, ka), max(0.0, dist_m))
         else:
             self._cancel_timed_run()
         # After schedule (its internal cancel must not wipe this): mark Test runs for CSV filename/reason.
@@ -2600,12 +2852,21 @@ class VescControlGui:
         )
 
     def _send_motor_param(self, prefix: str, value: str) -> None:
+        if not self._ensure_setpoint_ready():
+            return
         val = value.strip()
         if prefix == "SET_DUTY":
             val = f"{clamp_duty_str(val):.4f}"
             line = f"{prefix},{val}"
         elif prefix == "SET_BRAKE":
             line = "SET_BRAKE" if not val else f"SET_BRAKE,{val}"
+        elif prefix == "SET_NUNCHUCK":
+            try:
+                nunchuck_val = int(float(val))
+                nunchuck_val = max(0, min(255, nunchuck_val))
+            except ValueError:
+                nunchuck_val = 127
+            line = f"{prefix},{nunchuck_val}"
         else:
             line = f"{prefix},{val}"
         self._maybe_arm_timed_run()
@@ -2760,6 +3021,8 @@ class VescControlGui:
         self._csv_timed_capture_start = None
         self._csv_device_ms_start = None
         self._cancel_timed_run()
+        self._cancel_rewind_sequence()
+        self._cancel_override_hold_keepalive()
         self.var_live_telem.set(False)
         self.var_pi_enabled.set(False)
         self.var_pi_actual_hz_str.set("Actual: — Hz")
@@ -2771,6 +3034,8 @@ class VescControlGui:
 
     def _send_wire(self, line: str) -> None:
         if line.strip().upper() == "STOP":
+            self._cancel_rewind_sequence()
+            self._cancel_override_hold_keepalive()
             self._export_timed_run_csv(time.time(), "manual_stop")
             self._cancel_timed_run()
             # Firmware STOP also disables the PI loop (vescCurrentIno.ino),
@@ -2785,7 +3050,11 @@ class VescControlGui:
         if not raw:
             return
         line = sanitize_vesc_command_line(protocol_line_from_user_input(raw))
+        if self._line_requires_setpoint(line) and not self._ensure_setpoint_ready():
+            return
         if line.strip().upper() == "STOP":
+            self._cancel_rewind_sequence()
+            self._cancel_override_hold_keepalive()
             self._export_timed_run_csv(time.time(), "manual_stop")
             self._cancel_timed_run()
             self._send_line("STOP")
