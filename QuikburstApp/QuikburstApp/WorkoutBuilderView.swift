@@ -144,7 +144,9 @@ struct WorkoutBuilderView: View {
                     )
                     items.append(newItem)
                 }
+                .supportsKeyboardDismiss()
             }
+            .supportsKeyboardDismiss()
             .onAppear {
                 if let workout = editingWorkout {
                     loadWorkout(workout)
@@ -265,6 +267,7 @@ struct WorkoutItemEditorRow: View {
                     onUpdate(updated)
                 }
             )
+            .supportsKeyboardDismiss()
         }
     }
 }
@@ -323,6 +326,7 @@ struct WorkoutItemEditorSheet: View {
                 }
             }
         }
+        .supportsKeyboardDismiss()
     }
 }
 
@@ -384,6 +388,7 @@ struct RestPeriodRow: View {
                     onUpdate(updated)
                 }
             )
+            .supportsKeyboardDismiss()
         }
     }
 }
@@ -419,6 +424,7 @@ struct RestPeriodEditorSheet: View {
                 }
             }
         }
+        .supportsKeyboardDismiss()
     }
 }
 

@@ -149,6 +149,7 @@ struct UserEditView: View {
                 }
             }
         }
+        .supportsKeyboardDismiss()
     }
     
     private var heightUnit: String {

@@ -108,8 +108,10 @@ struct DrillEditorView: View {
                     selectedProfileId: $selectedTorqueProfileId,
                     profileStore: profileStore
                 )
+                .supportsKeyboardDismiss()
             }
         }
+        .supportsKeyboardDismiss()
     }
     
     private func loadDrill(_ drill: Drill) {

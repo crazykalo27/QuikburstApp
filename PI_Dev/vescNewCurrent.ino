@@ -7,6 +7,8 @@
  *
  * Protocol (newline-terminated; BLE Nordic UART RX writes, TX notifications):
  *   PING                      → PONG,Quikburst
+ *   GET_STATUS                → OK,STATUS,<setpoint>,<armed>,<safety>,<pos_m>
+ *                               (setpoint/armed/safety are 0 or 1)
  *   SET_CURRENT,<amps>        → OK,SET_CURRENT,...
  *   SET_BRAKE[,<amps>]       → OK,SET_BRAKE[,<amps>] (omit <amps> to use VESC_BRAKE_APPLY_AMPS; VESC clamps)
  *   SET_DUTY,<duty>           → duty clamped to 0…0.25 (25%)
@@ -208,12 +210,40 @@
  static const uint32_t SAFETY_MONITOR_MS    = 25;
  static bool     g_safetyStopEngaged = false;
  
- // Setpoint guard + approach handling
- static bool  g_setpointDefined = false;
- static float g_setpointPosM = 0.0f;
- static bool  g_setpointApproachActive = false;
- static uint8_t g_setpointStopBurstRemaining = 0;
- static uint32_t g_setpointStopBurstLastMs = 0;
+// Setpoint guard + approach handling
+static bool  g_setpointDefined = false;
+static float g_setpointPosM = 0.0f;
+static bool  g_setpointApproachActive = false;
+static uint8_t g_setpointStopBurstRemaining = 0;
+static uint32_t g_setpointStopBurstLastMs = 0;
+
+// Armed tension: encoder velocity sign — positive = payout/out, negative = wind-in.
+//   vel >= +0.25 m/s → 1 A; vel <= -0.5 m/s → 3 A; else 4.5 A (from position-derived g_lastEncoderVelMps).
+#ifndef VESC_ARM_PULL_AMPS
+#define VESC_ARM_PULL_AMPS 4.5f
+#endif
+#ifndef VESC_ARM_PULL_SLOW_AMPS
+#define VESC_ARM_PULL_SLOW_AMPS 3.0f
+#endif
+#ifndef VESC_ARM_PAYOUT_AMPS
+#define VESC_ARM_PAYOUT_AMPS 1.0f
+#endif
+#ifndef VESC_ARM_HOLD_AMPS
+#define VESC_ARM_HOLD_AMPS VESC_ARM_PULL_AMPS
+#endif
+static const float ARM_WIND_IN_FAST_MPS          = 0.5f;
+static const float ARM_WIND_IN_FAST_RELEASE_MPS  = 0.45f;
+static const float ARM_PAYOUT_LIGHT_MPS          = 0.25f;
+static const float ARM_VEL_STATIONARY_MPS        = 0.10f;
+static const uint32_t ARM_APPLY_MS               = 25;
+static uint32_t g_armApplyLastMs = 0;
+static bool  g_systemArmed = false;
+static float g_armHoldAmps = VESC_ARM_PULL_AMPS;
+static bool  g_setpointHoldActive = false;
+static bool  g_userMotionOverride = false;
+static bool  g_overrideSpoolHoldActive = false;  // true after OVERRIDE_SPOOL_IN until STOP/clear
+static bool  g_armSuppressResumeOnce = false;
+static bool  g_armWindInLimited = false;
  
  enum DirectCommandMode : uint8_t {
    DIRECT_CMD_NONE = 0,
@@ -226,11 +256,15 @@
  static float g_directBaseCmd = 0.0f;
  static uint32_t g_directApplyLastMs = 0;
  
- static const float SETPOINT_SLOWDOWN_START_M = 2.0f;
- static const float SETPOINT_REACHED_TOL_M = 1.0f;
- static const uint32_t SETPOINT_DIRECT_APPLY_MS = 25;
- static const uint32_t SETPOINT_STOP_BURST_MS = 60;
- static const uint8_t SETPOINT_STOP_BURST_COUNT = 4;
+static const float SETPOINT_REACHED_TOL_M = 0.5f;
+// Armed-only: wind-in past setpoint (encoder −vel / decreasing position) beyond this → full abort.
+static const float ARM_WIND_IN_OVERSHOOT_M = 0.5f;
+static const uint8_t ARM_ABORT_STOP_BURST_COUNT = 8;
+// Host link watchdog disabled — override hold / manual spool-in must not abort when BLE is quiet.
+// static const uint32_t HOST_LINK_TIMEOUT_MS = 10000;
+static const uint32_t SETPOINT_DIRECT_APPLY_MS = 25;
+static const uint32_t SETPOINT_STOP_BURST_MS = 60;
+static const uint8_t SETPOINT_STOP_BURST_COUNT = 4;
  
  void IRAM_ATTR updateEncoder() {
    int8_t a       = (int8_t)digitalRead(ENC_PIN_A);
@@ -432,8 +466,9 @@
  
  static BLEServer* g_server = nullptr;
  static BLECharacteristic* g_txChar = nullptr;
- static bool g_bleConnected = false;
- // After a central disconnects, restart advertising from loop() once this deadline passes
+static bool g_bleConnected = false;
+static uint32_t g_hostLastRxMs = 0;  // last app→ESP32 BLE write (any RX byte)
+// After a central disconnects, restart advertising from loop() once this deadline passes
  // (avoids doing heavy BLE work inside the disconnect callback; fixes reconnect without power cycle).
  static uint32_t g_bleAdvRestartAtMs = 0;
  
@@ -586,15 +621,37 @@
  // PI controller core (verbatim port of PI_Dev/PI_ex1.ino, with editable gains)
  // ---------------------------------------------------------------------------
  
- static void hardStopMotor() {
-   UART.setCurrent(0.0f);
-   UART.setBrakeCurrent(0.0f);
-   g_motorActive = false;
-   g_directMode = DIRECT_CMD_NONE;
-   g_directBaseCmd = 0.0f;
-   g_setpointApproachActive = false;
-   updateStatusLeds();
- }
+static void clearMotionOverrideState() {
+  g_userMotionOverride = false;
+  g_setpointHoldActive = false;
+  g_overrideSpoolHoldActive = false;
+}
+
+static void hardStopMotor() {
+  UART.setCurrent(0.0f);
+  UART.setBrakeCurrent(0.0f);
+  g_motorActive = false;
+  g_directMode = DIRECT_CMD_NONE;
+  g_directBaseCmd = 0.0f;
+  g_setpointApproachActive = false;
+  clearMotionOverrideState();
+  updateStatusLeds();
+}
+
+static void resetArmVelocityState();
+static float computeArmedCurrentAmps(float posNowM);
+static void applyArmedCurrent(float posNowM);
+static void enterSetpointHold(float posNowM);
+static void handleSetpointProximity(float posNowM);
+static void markUserMotionOverride();
+static void pollArmedMaintain(uint32_t nowMs);
+static bool checkArmedWindInOvershoot(float posNow);
+static void triggerArmedWindInOvershootAbort(float posNow);
+static void markHostRxActivity(uint32_t nowMs);
+static bool hostMotionRequiresAppLink();
+static bool systemAbortOnDisconnect();
+static void triggerFullSystemAbort(const char* reason);
+static void pollHostLinkSafety(uint32_t nowMs);
  
  static float currentEncoderPosM() {
    noInterrupts();
@@ -603,23 +660,188 @@
    return (float)count * METERS_PER_COUNT;
  }
  
- static float setpointScaleFromDistance(float distM) {
-   if (distM <= SETPOINT_REACHED_TOL_M) return 0.0f;
-   if (distM >= SETPOINT_SLOWDOWN_START_M) return 1.0f;
-   float s = distM / SETPOINT_SLOWDOWN_START_M;
-   if (s < 0.10f) s = 0.10f;
-   if (s > 1.0f) s = 1.0f;
-   return s;
- }
- 
- static void queueSetpointReachedStop(float posNowM) {
-   hardStopMotor();
-   g_piEnabled = false;
-   g_setpointStopBurstRemaining = SETPOINT_STOP_BURST_COUNT;
-   g_setpointStopBurstLastMs = 0;
-   sendHostFmt("INFO,SETPOINT_REACHED,%.5f", posNowM);
-   sendHostLine("OK,STOP");
- }
+static void resetArmVelocityState() {
+  g_armWindInLimited = false;
+}
+
+static float computeArmedCurrentAmps(float posNowM) {
+  (void)posNowM;
+  // g_lastEncoderVelMps: + = rope paying out, - = winding in (200 Hz from encoder position).
+  float vel = g_lastEncoderVelMps;
+
+  if (fabsf(vel) < ARM_VEL_STATIONARY_MPS) {
+    g_armWindInLimited = false;
+    return VESC_ARM_PULL_AMPS;
+  }
+
+  if (vel >= ARM_PAYOUT_LIGHT_MPS) {
+    g_armWindInLimited = false;
+    return VESC_ARM_PAYOUT_AMPS;
+  }
+
+  if (vel <= -ARM_WIND_IN_FAST_MPS) {
+    g_armWindInLimited = true;
+  } else if (vel >= -ARM_WIND_IN_FAST_RELEASE_MPS) {
+    g_armWindInLimited = false;
+  }
+  if (g_armWindInLimited) {
+    return VESC_ARM_PULL_SLOW_AMPS;
+  }
+  return VESC_ARM_PULL_AMPS;
+}
+
+static void applyArmedCurrent(float posNowM) {
+  float amps = computeArmedCurrentAmps(posNowM);
+  UART.setBrakeCurrent(0.0f);
+  UART.setCurrent(amps);
+  g_motorActive = (amps > 1e-4f);
+  g_directMode = DIRECT_CMD_CURRENT;
+  g_directBaseCmd = amps;
+}
+
+static void enterSetpointHold(float posNowM) {
+  if (g_piEnabled) {
+    g_piEnabled = false;
+    resetPiController();
+  }
+  g_setpointStopBurstRemaining = 0;
+  g_setpointHoldActive = true;
+  g_userMotionOverride = false;
+  g_setpointApproachActive = false;
+  applyArmedCurrent(posNowM);
+  updateStatusLeds();
+  sendHostFmt("INFO,SETPOINT_HOLD,%.5f", posNowM);
+}
+
+static void handleSetpointProximity(float posNowM) {
+  if (g_systemArmed) {
+    enterSetpointHold(posNowM);
+  } else {
+    queueSetpointReachedStop(posNowM);
+  }
+}
+
+static void markUserMotionOverride() {
+  g_userMotionOverride = true;
+  g_setpointHoldActive = false;
+}
+
+static void queueSetpointReachedStop(float posNowM) {
+  hardStopMotor();
+  g_piEnabled = false;
+  g_setpointStopBurstRemaining = SETPOINT_STOP_BURST_COUNT;
+  g_setpointStopBurstLastMs = 0;
+  sendHostFmt("INFO,SETPOINT_REACHED,%.5f", posNowM);
+  sendHostLine("OK,STOP");
+}
+
+// Ball-break safety: armed tension only (not OVERRIDE_SPOOL_IN / SET_CURRENT / calibration).
+// Encoder convention: +vel = payout, −vel = wind-in → wind-in overshoot is position below setpoint.
+static bool checkArmedWindInOvershoot(float posNow) {
+  if (!g_systemArmed || g_safetyStopEngaged || g_piEnabled) return false;
+  if (!g_setpointDefined || g_userMotionOverride) return false;
+  float pastM = g_setpointPosM - posNow;
+  return pastM > ARM_WIND_IN_OVERSHOOT_M;
+}
+
+static void markHostRxActivity(uint32_t nowMs) {
+  g_hostLastRxMs = nowMs;
+}
+
+// True when motion needs an active host (armed maintain + override hold run on-device without RX).
+static bool hostMotionRequiresAppLink() {
+  if (g_piEnabled) return true;
+  if (g_overrideSpoolHoldActive) return false;
+  if (g_userMotionOverride) return false;
+  if (!g_systemArmed && g_directMode != DIRECT_CMD_NONE) return true;
+  if (!g_systemArmed && g_motorActive) return true;
+  return false;
+}
+
+static bool systemAbortOnDisconnect() {
+  if (hostMotionRequiresAppLink()) return true;
+  if (g_systemArmed) return true;
+  if (g_motorActive) return true;
+  return false;
+}
+
+static void triggerFullSystemAbort(const char* reason) {
+  if (g_safetyStopEngaged) return;
+  g_safetyStopEngaged = true;
+  g_systemArmed = false;
+  g_piEnabled = false;
+  resetPiController();
+  g_setpointDefined = false;
+  g_setpointApproachActive = false;
+  g_setpointHoldActive = false;
+  g_armSuppressResumeOnce = true;
+  clearMotionOverrideState();
+  resetArmVelocityState();
+  hardStopMotor();
+  g_setpointStopBurstRemaining = ARM_ABORT_STOP_BURST_COUNT;
+  g_setpointStopBurstLastMs = 0;
+  updateStatusLeds();
+  sendHostFmt("ERROR,SAFETY_STOP,%s", reason);
+  sendHostLine("OK,ARM,0");
+  sendHostLine("OK,STOP");
+}
+
+static void triggerArmedWindInOvershootAbort(float posNow) {
+  if (g_safetyStopEngaged) return;
+  float sp = g_setpointPosM;
+  triggerFullSystemAbort("ARM_WIND_IN_OVERSHOOT");
+  sendHostFmt("INFO,ARM_OVERSHOOT_POS,%.5f,%.5f", posNow, sp);
+}
+
+// HOST_LINK_TIMEOUT safety disabled (was aborting during OVERRIDE_SPOOL_IN hold when the
+// central did not write to NUS RX often enough). Re-enable by restoring pollHostLinkSafety body.
+static void pollHostLinkSafety(uint32_t nowMs) {
+  (void)nowMs;
+#if 0
+  if (g_safetyStopEngaged) return;
+  if (!g_bleConnected) return;
+  if (!hostMotionRequiresAppLink()) return;
+  if (g_hostLastRxMs == 0) return;
+  if ((nowMs - g_hostLastRxMs) >= HOST_LINK_TIMEOUT_MS) {
+    triggerFullSystemAbort("HOST_LINK_TIMEOUT");
+  }
+#endif
+}
+
+static void pollArmedMaintain(uint32_t nowMs) {
+  if (!g_systemArmed || g_safetyStopEngaged || g_piEnabled) return;
+  if (g_userMotionOverride || g_setpointStopBurstRemaining > 0) return;
+  if (g_armApplyLastMs != 0 && (nowMs - g_armApplyLastMs) < ARM_APPLY_MS) return;
+  g_armApplyLastMs = nowMs;
+
+  float posNow = currentEncoderPosM();
+  if (checkArmedWindInOvershoot(posNow)) {
+    triggerArmedWindInOvershootAbort(posNow);
+    return;
+  }
+  if (!g_setpointDefined) {
+    g_setpointHoldActive = false;
+    applyArmedCurrent(posNow);
+    g_setpointApproachActive = false;
+    updateStatusLeds();
+    return;
+  }
+
+  float dist = fabsf(posNow - g_setpointPosM);
+  if (dist <= SETPOINT_REACHED_TOL_M) {
+    if (!g_setpointHoldActive) {
+      enterSetpointHold(posNow);
+    } else {
+      applyArmedCurrent(posNow);
+    }
+    return;
+  }
+
+  g_setpointHoldActive = false;
+  applyArmedCurrent(posNow);
+  g_setpointApproachActive = false;
+  updateStatusLeds();
+}
  
  static void pollSetpointStopBurst(uint32_t nowMs) {
    if (g_setpointStopBurstRemaining == 0) return;
@@ -630,7 +852,19 @@
    g_setpointStopBurstRemaining--;
  }
  
+ // While host hold is active, re-apply spool-in current (VESC does not always hold without refresh).
+ static void pollOverrideMaintain(uint32_t nowMs) {
+   if (!g_overrideSpoolHoldActive || g_safetyStopEngaged || g_piEnabled) return;
+   if (g_directMode != DIRECT_CMD_CURRENT) return;
+   static uint32_t lastMs = 0;
+   if (lastMs != 0 && (nowMs - lastMs) < 25) return;
+   lastMs = nowMs;
+   UART.setCurrent(g_directBaseCmd);
+   g_motorActive = (fabsf(g_directBaseCmd) > 1e-4f);
+ }
+
  static void pollDirectSetpointApproach(uint32_t nowMs) {
+   if (g_systemArmed) return;
    if (!g_setpointDefined || g_piEnabled || !g_setpointApproachActive) return;
    if (g_directMode == DIRECT_CMD_NONE) return;
    if (g_directApplyLastMs != 0 && (nowMs - g_directApplyLastMs) < SETPOINT_DIRECT_APPLY_MS) return;
@@ -638,33 +872,33 @@
  
    float posNow = currentEncoderPosM();
    float dist = fabsf(posNow - g_setpointPosM);
-   if (dist <= SETPOINT_REACHED_TOL_M) {
-     queueSetpointReachedStop(posNow);
-     return;
-   }
-   float scale = setpointScaleFromDistance(dist);
-   switch (g_directMode) {
+  if (dist <= SETPOINT_REACHED_TOL_M) {
+    handleSetpointProximity(posNow);
+    return;
+  }
+  switch (g_directMode) {
      case DIRECT_CMD_CURRENT:
-       UART.setCurrent(g_directBaseCmd * scale);
+       UART.setCurrent(g_directBaseCmd);
        break;
      case DIRECT_CMD_BRAKE:
-       UART.setBrakeCurrent(fabsf(g_directBaseCmd) * scale);
+       UART.setBrakeCurrent(fabsf(g_directBaseCmd));
        break;
      case DIRECT_CMD_DUTY:
-       UART.setDuty(g_directBaseCmd * scale);
+       UART.setDuty(g_directBaseCmd);
        break;
      default:
        break;
    }
  }
  
- static void triggerSafetyStop(const char* reason) {
-   if (g_safetyStopEngaged) return;
-   g_safetyStopEngaged = true;
-   g_piEnabled = false;
-   hardStopMotor();
-   sendHostFmt("ERROR,SAFETY_STOP,%s", reason);
- }
+static void triggerSafetyStop(const char* reason) {
+  if (g_safetyStopEngaged) return;
+  g_safetyStopEngaged = true;
+  g_systemArmed = false;
+  g_piEnabled = false;
+  hardStopMotor();
+  sendHostFmt("ERROR,SAFETY_STOP,%s", reason);
+}
  
  static void enforceSafetyStop() {
    if (!g_safetyStopEngaged) return;
@@ -771,11 +1005,7 @@
    // Link-loss safety: PI sends setCurrent every cycle, so the VESC's APP/UART
    // timeout never trips. If BLE drops mid-run we'd otherwise drive forever.
    if (!g_bleConnected) {
-     g_piEnabled = false;
-     UART.setCurrent(0.0f);
-     g_motorActive = false;
-     updateStatusLeds();
-     resetPiController();
+     triggerFullSystemAbort("BLE_DISCONNECTED");
      return;
    }
  
@@ -821,12 +1051,11 @@
    if (g_setpointDefined && g_setpointApproachActive) {
      float posNow = currentEncoderPosM();
      float dist = fabsf(posNow - g_setpointPosM);
-     if (dist <= SETPOINT_REACHED_TOL_M) {
-       queueSetpointReachedStop(posNow);
-       return;
-     }
-     i_cmd *= setpointScaleFromDistance(dist);
-   }
+    if (dist <= SETPOINT_REACHED_TOL_M) {
+      handleSetpointProximity(posNow);
+      return;
+    }
+  }
  
    UART.setCurrent(i_cmd);
    g_motorActive = (fabsf(i_cmd) > 1e-3f);
@@ -869,6 +1098,16 @@
      sendHostLine("PONG,Quikburst");
      return;
    }
+
+   if (cmd == "GET_STATUS") {
+     float pos = currentEncoderPosM();
+     sendHostFmt("OK,STATUS,%d,%d,%d,%.5f",
+         g_setpointDefined ? 1 : 0,
+         g_systemArmed ? 1 : 0,
+         g_safetyStopEngaged ? 1 : 0,
+         pos);
+     return;
+   }
  
    if (cmd == "SAFETY_RESET" || cmd == "CLEAR_ERROR") {
      clearSafetyStopLatch();
@@ -876,21 +1115,62 @@
      return;
    }
  
-   if (cmd == "STOP") {
-     if (g_piEnabled) {
-       g_piEnabled = false;
-       resetPiController();
-     }
-     UART.setCurrent(0.0f);
-     UART.setBrakeCurrent(0.0f);
-     g_motorActive = false;
-     g_directMode = DIRECT_CMD_NONE;
-     g_directBaseCmd = 0.0f;
-     g_setpointApproachActive = false;
-     updateStatusLeds();
-     sendHostLine("OK,STOP");
-     return;
-   }
+  if (cmd == "ARM_SUPPRESS_RESUME") {
+    g_armSuppressResumeOnce = true;
+    sendHostLine("OK,ARM_SUPPRESS_RESUME");
+    return;
+  }
+
+  if (cmd.startsWith("ARM,")) {
+    bool on = parseFloat(cmd.substring(4)) != 0.0f;
+    int comma2 = cmd.indexOf(',', 4);
+    if (comma2 > 0) {
+      float a = parseFloat(cmd.substring(comma2 + 1));
+      if (a > 0.0f) g_armHoldAmps = a;
+    }
+    if (on) {
+      g_systemArmed = true;
+      g_armSuppressResumeOnce = false;
+      resetArmVelocityState();
+      clearMotionOverrideState();
+      g_armApplyLastMs = 0;
+      pollArmedMaintain(millis());
+      sendHostFmt("OK,ARM,1,%.3f", g_armHoldAmps);
+    } else {
+      g_systemArmed = false;
+      resetArmVelocityState();
+      if (g_piEnabled) {
+        g_piEnabled = false;
+        resetPiController();
+      }
+      hardStopMotor();
+      sendHostLine("OK,ARM,0");
+    }
+    return;
+  }
+
+  if (cmd == "STOP") {
+    bool resumeArmed = g_systemArmed && !g_armSuppressResumeOnce;
+    if (g_piEnabled) {
+      g_piEnabled = false;
+      resetPiController();
+    }
+    UART.setCurrent(0.0f);
+    UART.setBrakeCurrent(0.0f);
+    g_motorActive = false;
+    g_directMode = DIRECT_CMD_NONE;
+    g_directBaseCmd = 0.0f;
+    g_setpointApproachActive = false;
+    clearMotionOverrideState();
+    updateStatusLeds();
+    g_armSuppressResumeOnce = false;
+    sendHostLine("OK,STOP");
+    if (resumeArmed) {
+      g_armApplyLastMs = 0;
+      pollArmedMaintain(millis());
+    }
+    return;
+  }
  
    if (cmd == "SETPOINT") {
      g_setpointPosM = currentEncoderPosM();
@@ -901,20 +1181,21 @@
      return;
    }
  
-   if (cmd.startsWith("OVERRIDE_SPOOL_IN,")) {
-     float duty = parseFloat(cmd.substring(18));
-     if (duty < 0.0f) duty = 0.0f;
-     if (duty > VESC_MAX_DUTY) duty = VESC_MAX_DUTY;
-     g_piEnabled = false;
-     g_directMode = DIRECT_CMD_DUTY;
-     g_directBaseCmd = duty;
-     g_setpointApproachActive = false;  // Explicit override bypasses setpoint gate and approach slowdown.
-     UART.setDuty(duty);
-     g_motorActive = (duty > 1e-5f);
-     updateStatusLeds();
-     sendHostFmt("OK,OVERRIDE_SPOOL_IN,%.4f", duty);
-     return;
-   }
+  if (cmd.startsWith("OVERRIDE_SPOOL_IN,")) {
+    float amps = parseFloat(cmd.substring(18));
+    if (amps < 0.0f) amps = 0.0f;
+    g_piEnabled = false;
+    g_directMode = DIRECT_CMD_CURRENT;
+    g_directBaseCmd = amps;
+    markUserMotionOverride();
+    g_overrideSpoolHoldActive = true;
+    g_setpointApproachActive = false;  // Explicit override bypasses setpoint proximity handling.
+    UART.setCurrent(amps);
+    g_motorActive = (amps > 1e-4f);
+    updateStatusLeds();
+    sendHostFmt("OK,OVERRIDE_SPOOL_IN,%.3f", amps);
+    return;
+  }
  
    if (cmd.startsWith("SET_CURRENT,")) {
      if (!g_setpointDefined) {
@@ -922,19 +1203,19 @@
        return;
      }
      float amps = parseFloat(cmd.substring(12));
-     float dist = fabsf(currentEncoderPosM() - g_setpointPosM);
-     if (dist <= SETPOINT_REACHED_TOL_M) {
-       queueSetpointReachedStop(currentEncoderPosM());
-       return;
-     }
-     float cmdAmps = amps * setpointScaleFromDistance(dist);
-     UART.setCurrent(cmdAmps);
-     g_motorActive = (fabsf(cmdAmps) > 1e-4f);
-     g_directMode = DIRECT_CMD_CURRENT;
-     g_directBaseCmd = amps;
-     g_setpointApproachActive = true;
-     updateStatusLeds();
-     sendHostFmt("OK,SET_CURRENT,%.3f", cmdAmps);
+    float dist = fabsf(currentEncoderPosM() - g_setpointPosM);
+    if (dist <= SETPOINT_REACHED_TOL_M) {
+      handleSetpointProximity(currentEncoderPosM());
+      return;
+    }
+    markUserMotionOverride();
+    UART.setCurrent(amps);
+    g_motorActive = (fabsf(amps) > 1e-4f);
+    g_directMode = DIRECT_CMD_CURRENT;
+    g_directBaseCmd = amps;
+    g_setpointApproachActive = true;
+    updateStatusLeds();
+    sendHostFmt("OK,SET_CURRENT,%.3f", amps);
      return;
    }
  
@@ -950,19 +1231,19 @@
      if (amps < 0.0f) {
        amps = 0.0f;
      }
-     float dist = fabsf(currentEncoderPosM() - g_setpointPosM);
-     if (dist <= SETPOINT_REACHED_TOL_M) {
-       queueSetpointReachedStop(currentEncoderPosM());
-       return;
-     }
-     float cmdBrake = amps * setpointScaleFromDistance(dist);
-     UART.setBrakeCurrent(cmdBrake);
-     g_motorActive = (cmdBrake > 1e-4f);
-     g_directMode = DIRECT_CMD_BRAKE;
-     g_directBaseCmd = amps;
-     g_setpointApproachActive = true;
-     updateStatusLeds();
-     sendHostFmt("OK,SET_BRAKE,%.3f", cmdBrake);
+    float dist = fabsf(currentEncoderPosM() - g_setpointPosM);
+    if (dist <= SETPOINT_REACHED_TOL_M) {
+      handleSetpointProximity(currentEncoderPosM());
+      return;
+    }
+    markUserMotionOverride();
+    UART.setBrakeCurrent(amps);
+    g_motorActive = (amps > 1e-4f);
+    g_directMode = DIRECT_CMD_BRAKE;
+    g_directBaseCmd = amps;
+    g_setpointApproachActive = true;
+    updateStatusLeds();
+    sendHostFmt("OK,SET_BRAKE,%.3f", amps);
      return;
    }
  
@@ -974,26 +1255,27 @@
      float duty = parseFloat(cmd.substring(9));
      if (duty < 0.0f) duty = 0.0f;
      if (duty > VESC_MAX_DUTY) duty = VESC_MAX_DUTY;
-     float dist = fabsf(currentEncoderPosM() - g_setpointPosM);
-     if (dist <= SETPOINT_REACHED_TOL_M) {
-       queueSetpointReachedStop(currentEncoderPosM());
-       return;
-     }
-     float cmdDuty = duty * setpointScaleFromDistance(dist);
-     UART.setDuty(cmdDuty);
-     g_motorActive = (cmdDuty > 1e-5f);
-     g_directMode = DIRECT_CMD_DUTY;
-     g_directBaseCmd = duty;
-     g_setpointApproachActive = true;
-     updateStatusLeds();
-     if (cmdDuty >= VESC_MAX_DUTY) {
-       triggerSafetyStop("DUTY_OVER_LIMIT");
-     }
-     sendHostFmt("OK,SET_DUTY,%.4f", cmdDuty);
+    float dist = fabsf(currentEncoderPosM() - g_setpointPosM);
+    if (dist <= SETPOINT_REACHED_TOL_M) {
+      handleSetpointProximity(currentEncoderPosM());
+      return;
+    }
+    markUserMotionOverride();
+    UART.setDuty(duty);
+    g_motorActive = (duty > 1e-5f);
+    g_directMode = DIRECT_CMD_DUTY;
+    g_directBaseCmd = duty;
+    g_setpointApproachActive = true;
+    updateStatusLeds();
+    if (duty >= VESC_MAX_DUTY) {
+      triggerSafetyStop("DUTY_OVER_LIMIT");
+    }
+    sendHostFmt("OK,SET_DUTY,%.4f", duty);
      return;
    }
  
    if (cmd == "KEEPALIVE") {
+     // Host link watchdog only (markHostRxActivity in onWrite); VESC UART keepalive is harmless at idle.
      UART.sendKeepalive();
      sendHostLine("OK,KEEPALIVE");
      return;
@@ -1072,14 +1354,20 @@
        g_motorActive = false;
        updateStatusLeds();
      }
-     g_piEnabled = on;
-     if (on) {
-       float dist = fabsf(currentEncoderPosM() - g_setpointPosM);
-       g_setpointApproachActive = (dist > SETPOINT_REACHED_TOL_M);
-     } else {
-       g_setpointApproachActive = false;
-     }
-     sendHostFmt("OK,PI_ENABLE,%d", on ? 1 : 0);
+    g_piEnabled = on;
+    if (on) {
+      markUserMotionOverride();
+      float dist = fabsf(currentEncoderPosM() - g_setpointPosM);
+      g_setpointApproachActive = (dist > SETPOINT_REACHED_TOL_M);
+    } else {
+      g_setpointApproachActive = false;
+      clearMotionOverrideState();
+      if (g_systemArmed && g_setpointDefined) {
+        g_armApplyLastMs = 0;
+        pollArmedMaintain(millis());
+      }
+    }
+    sendHostFmt("OK,PI_ENABLE,%d", on ? 1 : 0);
      return;
    }
  
@@ -1206,6 +1494,7 @@
  class QuikburstServerCallbacks : public BLEServerCallbacks {
    void onConnect(BLEServer* s, esp_ble_gatts_cb_param_t* param) override {
      g_bleConnected = true;
+     markHostRxActivity(millis());
      updateStatusLeds();
      // Ask the central for a tight connection interval (6 = 7.5 ms min, 12 = 15 ms max).
      // Each notify has to wait for the next connection event, so this directly
@@ -1216,7 +1505,11 @@
      sendHostLine("OK,BT_CONNECTED");
    }
    void onDisconnect(BLEServer*) override {
+     if (systemAbortOnDisconnect()) {
+       triggerFullSystemAbort("BLE_DISCONNECTED");
+     }
      g_bleConnected = false;
+     g_hostLastRxMs = 0;
      updateStatusLeds();
      // Defer restart to loop(): stack is still tearing down; immediate startAdvertising often fails to re-advertise.
      g_bleAdvRestartAtMs = millis() + 400;
@@ -1228,6 +1521,7 @@
      // ESP32 Arduino 3.x: getValue() returns Arduino String (not std::string).
      String val = ch->getValue();
      if (val.length() == 0) return;
+     markHostRxActivity(millis());
      for (size_t i = 0; i < val.length(); i++) {
        feedLineBuffer(g_bleCmdBuf, val[i]);
      }
@@ -1301,11 +1595,14 @@
    uint32_t now = millis();
    uint32_t nowUs = micros();
    pollEncoderStream(now);
-   pollSetpointStopBurst(now);
-   pollPiLoop(now, nowUs);     // run BEFORE TELEM so cached UART.data is fresh
-   pollDirectSetpointApproach(now);
+  pollSetpointStopBurst(now);
+  pollPiLoop(now, nowUs);     // run BEFORE TELEM so cached UART.data is fresh
+  pollDirectSetpointApproach(now);
+  pollOverrideMaintain(now);
+  pollArmedMaintain(now);
    pollTelemStream(now);
    pollSafety(now);
+   // pollHostLinkSafety(now);  // disabled — see pollHostLinkSafety()
    if (now - g_lastReadyMs >= READY_INTERVAL_MS) {
      g_lastReadyMs = now;
      sendHostLine("[READY]");

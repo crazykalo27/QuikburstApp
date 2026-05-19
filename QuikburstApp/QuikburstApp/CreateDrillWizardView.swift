@@ -131,6 +131,7 @@ struct CreateDrillWizardView: View {
             }
             }
         }
+        .supportsKeyboardDismiss()
     }
     
     private func loadTemplate(_ template: DrillTemplate) {

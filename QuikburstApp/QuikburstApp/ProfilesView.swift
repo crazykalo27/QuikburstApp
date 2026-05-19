@@ -251,6 +251,7 @@ struct ProfileEditorView: View {
                 }
             }
         }
+        .supportsKeyboardDismiss()
     }
 }
 

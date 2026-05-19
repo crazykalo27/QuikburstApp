@@ -7,11 +7,21 @@ struct BluetoothConsoleView: View {
     @State private var message: String = ""
     @State private var autoScrollToBottom: Bool = true
     
-    @FocusState private var isTextFieldFocused: Bool
-    
     var body: some View {
         VStack(spacing: 0) {
-            // Bluetooth state + scan button
+            pairingSection
+            Divider()
+            consoleSection
+            Divider()
+            inputSection
+        }
+        .navigationTitle("Bluetooth Console")
+        .navigationBarTitleDisplayMode(.inline)
+        .supportsKeyboardDismiss()
+    }
+
+    private var pairingSection: some View {
+        VStack(spacing: 0) {
             VStack(spacing: 8) {
                 HStack(spacing: 12) {
                     HStack(spacing: 6) {
@@ -94,12 +104,11 @@ struct BluetoothConsoleView: View {
                                 ) {
                                     bluetooth.connect(to: peripheral)
                                 }
-                                .disabled(isConnecting)
                             }
                         }
                     }
                     .listStyle(.insetGrouped)
-                    .frame(maxHeight: 280)
+                    .frame(minHeight: 120, maxHeight: 260)
                 }
             } else if let connected = bluetooth.connectedPeripheral {
                 VStack(alignment: .leading, spacing: 12) {
@@ -145,10 +154,11 @@ struct BluetoothConsoleView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
             }
-            
-            Divider()
-            
-            // Terminal log - scrollable area above keyboard
+        }
+        .layoutPriority(1)
+    }
+
+    private var consoleSection: some View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("Console Log")
@@ -160,26 +170,20 @@ struct BluetoothConsoleView: View {
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 12)
-                
+
                 TerminalLogView(rxLog: bluetooth.rxLog, txLog: bluetooth.txLog, autoScrollToBottom: $autoScrollToBottom)
-                    .frame(maxWidth: .infinity)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        // Dismiss keyboard when tapping on console
-                        isTextFieldFocused = false
-                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            
-            Divider()
-            
-            // Input section - fixed at bottom
+            .layoutPriority(0)
+    }
+
+    private var inputSection: some View {
             VStack(spacing: 8) {
                 HStack(spacing: 8) {
                     TextField("Type a message...", text: $message)
                         .textFieldStyle(.roundedBorder)
                         .submitLabel(.send)
-                        .focused($isTextFieldFocused)
                         .onSubmit {
                             sendMessage()
                         }
@@ -218,11 +222,8 @@ struct BluetoothConsoleView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
             .background(.ultraThinMaterial)
-        }
-        .navigationTitle("Bluetooth Console")
-        .navigationBarTitleDisplayMode(.inline)
     }
-    
+
     private func sendMessage() {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
@@ -282,26 +283,37 @@ struct BluetoothRowView: View {
     let onConnect: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading) {
-                Text(peripheral.name.isEmpty ? "(Unnamed)" : peripheral.name)
-                    .fontWeight(isConnected ? .bold : .regular)
-                Text(peripheral.id.uuidString)
-                    .font(.caption2)
+        Button(action: onConnect) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading) {
+                    Text(peripheral.name.isEmpty ? "(Unnamed)" : peripheral.name)
+                        .fontWeight(isConnected ? .bold : .regular)
+                        .foregroundStyle(.primary)
+                    Text(peripheral.id.uuidString)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text("\(peripheral.rssi) dBm")
                     .foregroundStyle(.secondary)
+                if isConnected {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                } else if isConnecting {
+                    ProgressView()
+                } else {
+                    Text("Connect")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Color.accentColor, in: Capsule())
+                }
             }
-            Spacer()
-            Text("\(peripheral.rssi) dBm")
-                .foregroundStyle(.secondary)
-            if isConnected {
-                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-            } else if isConnecting {
-                ProgressView()
-            } else {
-                Button("Connect", action: onConnect)
-            }
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
         }
-        .padding(.vertical, 2)
+        .buttonStyle(.plain)
+        .disabled(isConnected || isConnecting)
     }
 }
 

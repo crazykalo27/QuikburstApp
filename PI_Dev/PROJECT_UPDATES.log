@@ -1,2 +1,24 @@
+2026-05-19: iOS Monitor tab — charts show rolling last 30 s of ENC/TELEM (not full session buffer).
+2026-05-19: iOS calibration — GET_STATUS sync from ESP32; UI modes (pull/armed/calibrated); fixed hold button layout; Abort always available when armed; no state wipe on tab switch (listener stays, scenePhase sync).
+2026-05-19: vescNewCurrent.ino — GET_STATUS → OK,STATUS,setpoint,armed,safety,pos_m.
+2026-05-19: iOS — BLE link KEEPALIVE timer + override-hold KEEPALIVE removed; HOST_LINK_TIMEOUT UI handler commented out; override = OVERRIDE_SPOOL_IN on press, STOP on release.
+2026-05-19: vescNewCurrent.ino — HOST_LINK_TIMEOUT watchdog disabled (pollHostLinkSafety no-op); override hold not treated as host-link-dependent.
+2026-05-19: iOS hold-to-pull-in — UIKit touch-down/up button (ScrollView-safe); press → OVERRIDE_SPOOL_IN 4.5 A, release → ARM_SUPPRESS_RESUME + STOP; firmware g_overrideSpoolHoldActive + pollOverrideMaintain 25 ms until STOP.
+2026-05-19: iOS Train — library drill intents require calibration; save SessionResult + DrillRun (+ baseline) to Progress/history.
+2026-05-19: BLE link watchdog — firmware HOST_LINK_TIMEOUT 10 s; iOS + Python send quiet KEEPALIVE every 3 s while connected (no motor/arm change).
+2026-05-19: vescNewCurrent.ino — BLE link loss: no app RX during host-driven motion → full abort; immediate abort on disconnect if armed/motor active.
+2026-05-19: vescNewCurrent.ino — armed wind-in overshoot safety: >0.5 m past setpoint (ball-break) → disarm, clear setpoint, 8× STOP; inactive during OVERRIDE/calibration/no setpoint. iOS/Python handle ARM_WIND_IN_OVERSHOOT.
+2026-05-19: Quikburst iOS Train tab — Monitor tab/section available before calibration (live ENC/TELEM charts); train run controls still require calibration.
+2026-05-19: Quikburst iOS Train tab — removed auto-rewind toggle and end-of-run auto rewind (manual Rewind in Monitor unchanged).
+2026-05-19: Quikburst iOS — app-wide keyboard dismiss (tap outside, scroll, Done toolbar + UIKit accessory for decimal pad); applied on root, tabs, sheets, login.
+2026-05-19: Quikburst iOS Train tab — ball calibration sheet (video + override hold), ARM before setpoint, Stop vs Abort.
+2026-05-19: vescNewCurrent.ino — ARM allowed without setpoint; pollArmed runs pre-setpoint with velocity currents.
+2026-05-19: vescNewCurrent.ino — armed: pollArmed owns setCurrent (pollDirect skipped); separate apply timer; |vel|<0.1→4.5A deadband.
+2026-05-19: vescNewCurrent.ino — armed current uses raw encoder vel (+out / −in), not setpoint-relative sign.
+2026-05-19: vescNewCurrent.ino — armed tension velocity control: 4.5 A wind-in (3 A if >0.5 m/s toward SP), 1 A if payout ≥0.25 m/s away.
+2026-05-19: vescNewCurrent.ino — SETPOINT_REACHED_TOL_M 1.0 → 0.5 m; removed setpoint distance current scaling.
+2026-05-19: vesc_current_control.py — Stop vs Abort: Stop ends drill (ARM tension may resume); Abort disarms + 8× STOP burst.
+2026-05-19: vescNewCurrent.ino + vesc_current_control.py — system ARM mode: 4.5 A pull-in/hold at setpoint (no hard stop when armed); GUI checkbox; resume after STOP/PI off; ARM_SUPPRESS_RESUME for auto-rewind brake.
+2026-05-19: vescNewCurrent.ino + vesc_current_control.py — rewind pull-in and override spool-in use 4.5 A current (SET_CURRENT / OVERRIDE_SPOOL_IN) instead of ~0.12 duty; firmware OVERRIDE_SPOOL_IN now drives setCurrent, not setDuty.
 2026-04-30: vescCurrentIno.ino — ported PI current controller from PI_Dev/PI_ex1.ino into firmware as a fixed-Hz loop on the ESP32. New protocol: PI_ENABLE/PI_FORCE/PI_TARGET/PI_HZ/PI_GAINS/PI_PARAMS/PI_LIMITS/PI_CONFIG and a PICTRL stream (esp_ms,i_target,i_meas,i_cmd,omega,actual_hz,target_lb). Force→current conversion is one labeled line: g_piTargetAmps = g_pi.amps_per_lb * lbs (default 0.5 A/lb). PI loop owns the VESC UART read; TELEM stream reuses the cached snapshot when PI is on. Link-loss safety: PI self-disables and zeroes current if BLE drops. STOP also disables PI.
 2026-04-30: vesc_current_control.py — added Force Control panel (force lbs, Engage/Stop, loop-Hz spinbox + Actual Hz readout, editable Kt/Ke/R/L/Kp/Ki/I_max/A-per-lb/pole-pairs with one-shot Apply, live equation label). Layout cleanup: timed-run + CSV controls promoted out of the commands frame so they apply to all modes; commands frame renamed "Direct command". PICTRL parsed into a 25k-sample deque, plotted as dashed I-target / dotted I-cmd on the existing amps panel, and folded into CSV via device_ms-nearest pairing alongside ENC. CSV gains four columns: force_target_lb, i_target_a, i_cmd_a, omega_rps. PICFG echoes pull config back into the UI so the constants editor mirrors the live ESP32 state.

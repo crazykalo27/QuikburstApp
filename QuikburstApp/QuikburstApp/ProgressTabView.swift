@@ -90,6 +90,7 @@ struct ProgressTabView: View {
                 }
             }
             .drukNavigationTitle("Progress")
+            .supportsKeyboardDismiss()
             .sheet(item: $selectedResult) { result in
                 NavigationStack {
                     DrillAnalysisView(
@@ -106,6 +107,7 @@ struct ProgressTabView: View {
                         }
                     }
                 }
+                .supportsKeyboardDismiss()
             }
             .sheet(item: $selectedTemplate) { template in
                 DrillProgressDetailView(
@@ -113,6 +115,7 @@ struct ProgressTabView: View {
                     templateStore: templateStore,
                     runStore: runStore
                 )
+                .supportsKeyboardDismiss()
             }
             .sheet(item: $selectedWorkout) { workout in
                 WorkoutProgressDetailView(
@@ -120,6 +123,7 @@ struct ProgressTabView: View {
                     workoutStore: workoutStore,
                     sessionResultStore: sessionResultStore
                 )
+                .supportsKeyboardDismiss()
             }
         }
     }

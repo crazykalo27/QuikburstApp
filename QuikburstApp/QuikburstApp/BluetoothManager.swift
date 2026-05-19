@@ -62,6 +62,9 @@ final class BluetoothManager: NSObject, ObservableObject {
     private var receivedLineListeners: [UUID: (String) -> Void] = [:]
     private var lineRemainder: String = ""
     private var staleDeviceCleanupTimer: Timer?
+    // Host-link KEEPALIVE timer disabled (firmware HOST_LINK_TIMEOUT watchdog is off).
+    // private var linkKeepaliveTimer: Timer?
+    // private static let linkKeepaliveInterval: TimeInterval = 3.0
 
     override init() {
         super.init()
@@ -166,7 +169,7 @@ final class BluetoothManager: NSObject, ObservableObject {
         }
     }
 
-    func send(_ text: String) {
+    func send(_ text: String, logTransmission: Bool = true) {
         let timestamp = Date()
         queue.async { [weak self] in
             guard let self = self,
@@ -205,9 +208,23 @@ final class BluetoothManager: NSObject, ObservableObject {
             if chunkCount > 1 {
                 print("[BLE_TX] [\(timestamp)] Split into \(chunkCount) chunks (MTU: \(mtu))")
             }
-            self.updateOnMain { self.txLog.append(text) }
+            if logTransmission {
+                self.updateOnMain { self.txLog.append(text) }
+            }
         }
     }
+
+    // MARK: Host-link KEEPALIVE (disabled — matches firmware; override hold does not need periodic RX)
+    //
+    // func sendLinkKeepalive() {
+    //     send("KEEPALIVE\n", logTransmission: false)
+    // }
+    //
+    // private func startLinkKeepaliveTimer() { ... }
+    // private func stopLinkKeepaliveTimer() { ... }
+
+    private func startLinkKeepaliveTimer() {}
+    private func stopLinkKeepaliveTimer() {}
     
     // MARK: - New Protocol Command Support
     
@@ -347,6 +364,7 @@ final class BluetoothManager: NSObject, ObservableObject {
     
     private func resetStateOnDisconnect() {
         updateOnMain {
+            self.stopLinkKeepaliveTimer()
             self.connectionState = .disconnected
             self.connectedPeripheral = nil
             self.currentPeripheral = nil
@@ -623,8 +641,10 @@ extension BluetoothManager: CBCentralManagerDelegate, CBPeripheralDelegate {
             self.disconnect()
             return
         }
-        
-        // Ready for commands
+
+        updateOnMain {
+            self.startLinkKeepaliveTimer()
+        }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {

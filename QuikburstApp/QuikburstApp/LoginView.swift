@@ -7,6 +7,7 @@ struct LoginView: View {
     @State private var errorMessage: String?
 
     var body: some View {
+        NavigationStack {
         ZStack {
             // Deep blue background matching app theme
             Theme.deepBlue.ignoresSafeArea()
@@ -132,6 +133,9 @@ struct LoginView: View {
                 
                 Spacer()
             }
+        }
+        .toolbar(.hidden, for: .navigationBar)
+        .supportsKeyboardDismiss()
         }
     }
 }

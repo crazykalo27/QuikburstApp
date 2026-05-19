@@ -157,6 +157,7 @@ struct DrillTabView: View {
                     .accessibilityHint("Opens editor to create a new item")
                 }
             }
+            .supportsKeyboardDismiss()
             .alert("Delete \(selectedSegment == .drills ? "Drill" : "Workout")", isPresented: $showingDeleteConfirmation) {
                 Button("Cancel", role: .cancel) {
                     templateToDelete = nil
@@ -180,15 +181,19 @@ struct DrillTabView: View {
             }
             .sheet(isPresented: $showingCreateDrillWizard) {
                 CreateDrillWizardView(templateStore: templateStore)
+                    .supportsKeyboardDismiss()
             }
             .sheet(isPresented: $showingWorkoutBuilder) {
                 WorkoutBuilderView(workoutStore: workoutStore, templateStore: templateStore)
+                    .supportsKeyboardDismiss()
             }
             .sheet(item: $selectedTemplate) { template in
                 DrillTemplateDetailView(template: template, templateStore: templateStore)
+                    .supportsKeyboardDismiss()
             }
             .sheet(item: $selectedWorkout) { workout in
                 WorkoutDetailView(workout: workout, workoutStore: workoutStore, templateStore: templateStore)
+                    .supportsKeyboardDismiss()
             }
             .sheet(isPresented: $showingFilters) {
                 FilterSheetView(
@@ -686,6 +691,7 @@ struct FilterSheetView: View {
                 tempFavoritesOnly = favoritesOnly
             }
         }
+        .supportsKeyboardDismiss()
     }
 }
 

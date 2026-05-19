@@ -84,6 +84,7 @@ struct DrillDetailView: View {
             }
             .sheet(isPresented: $showingEditor) {
                 DrillEditorView(drillStore: drillStore, editingDrill: drill)
+                    .supportsKeyboardDismiss()
             }
         }
     }
@@ -216,6 +217,7 @@ struct WorkoutDetailView: View {
             }
             .sheet(isPresented: $showingEditor) {
                 WorkoutBuilderView(workoutStore: workoutStore, templateStore: templateStore, editingWorkout: workout)
+                    .supportsKeyboardDismiss()
             }
             .alert("Delete Workout", isPresented: $showingDeleteAlert) {
                 Button("Cancel", role: .cancel) {}
@@ -406,6 +408,7 @@ struct WorkoutDetailViewForTrain: View {
             }
             .sheet(isPresented: $showingEditor) {
                 WorkoutBuilderView(workoutStore: workoutStore, templateStore: templateStore, editingWorkout: workout)
+                    .supportsKeyboardDismiss()
             }
             .alert("Delete Workout", isPresented: $showingDeleteAlert) {
                 Button("Cancel", role: .cancel) {}

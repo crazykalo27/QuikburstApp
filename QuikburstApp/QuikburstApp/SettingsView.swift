@@ -24,6 +24,7 @@ struct SettingsView: View {
                     Text("5 seconds").tag(5)
                     Text("10 seconds").tag(10)
                 }
+                .pickerStyle(.menu)
             } header: {
                 Text("Training")
             } footer: {

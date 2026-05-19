@@ -204,11 +204,13 @@ struct DrillTemplateDetailView: View {
             }
             .sheet(isPresented: $showingEditDrill) {
                 CreateDrillWizardView(templateStore: templateStore, editingTemplate: template)
+                    .supportsKeyboardDismiss()
             }
             .sheet(isPresented: $showingAddToWorkout) {
                 // TODO: Add to workout flow
                 Text("Add to Workout")
             }
+            .supportsKeyboardDismiss()
         }
     }
     
@@ -655,7 +657,9 @@ struct DrillTemplateDetailViewForTrain: View {
             }
             .sheet(isPresented: $showingEditDrill) {
                 CreateDrillWizardView(templateStore: templateStore, editingTemplate: template)
+                    .supportsKeyboardDismiss()
             }
+            .supportsKeyboardDismiss()
         }
     }
     
